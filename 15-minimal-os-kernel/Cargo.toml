@@ -1,0 +1,45 @@
+[package]
+name = "minimal-os-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal x86_64 operating system kernel"
+
+# The crate is both a library (kernel logic, reusable/testable) and a bootable
+# binary (linked with the bootloader into a disk image). `src/main.rs` is the
+# binary entry point; `src/lib.rs` holds the kernel itself.
+[[bin]]
+name = "minimal-os-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+# Pipe the kernel's serial output (serial_println!) to the terminal when run
+# under QEMU via `cargo run` / `bootimage runner`.
+[package.metadata.bootimage]
+run-args = ["-serial", "stdio"]
+test-args = ["-serial", "stdio", "-display", "none", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
+
+[dependencies]
+# KNOWN BUILD ISSUE: `bootloader = "0.9"` uses the custom-target-JSON workflow,
+# but `.cargo/config.toml` builds for the built-in `x86_64-unknown-none` target.
+# These can disagree under `cargo bootimage`. See docs/RUNNING_PLATFORM_SPECIFIC.md
+# for the two resolution paths (custom target JSON, or upgrade to bootloader 0.11+).
+bootloader = "0.9"
+x86_64 = "0.14"
+uart_16550 = "0.2"
+pic8259 = "0.10"
+pc-keyboard = "0.6"
+spin = "0.9"
+lazy_static = { version = "1", features = ["spin_no_std"] }
+bitflags = "2"
+
+[dependencies.crossbeam-queue]
+version = "0.3"
+default-features = false
+features = ["alloc"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

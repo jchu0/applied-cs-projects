@@ -1,0 +1,211 @@
+global:
+  imagePullSecrets: []
+  environment: production
+
+nameOverride: ""
+fullnameOverride: ""
+
+# API Gateway
+gateway:
+  enabled: true
+  replicaCount: 3
+  image:
+    repository: microservice-platform/gateway
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8080
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  config:
+    logLevel: info
+    timeout: 30s
+    rateLimit:
+      enabled: true
+      requestsPerMin: 100
+      burstSize: 20
+    tracing:
+      enabled: true
+      samplingRate: 0.1
+
+# User Service
+userService:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: microservice-platform/user-service
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    grpcPort: 9090
+    httpPort: 8090
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+# Auth Service
+authService:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: microservice-platform/auth-service
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    grpcPort: 9091
+    httpPort: 8091
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+  jwt:
+    accessTokenExpiry: 15m
+    refreshTokenExpiry: 168h
+    issuer: microservice-platform
+
+# Billing Service
+billingService:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: microservice-platform/billing-service
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    grpcPort: 9092
+    httpPort: 8092
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+# Notification Service
+notificationService:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: microservice-platform/notification-service
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    grpcPort: 9093
+    httpPort: 8093
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+# Ingress
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: api.microservice-platform.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: api-gateway-tls
+      hosts:
+        - api.microservice-platform.example.com
+
+# PostgreSQL
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: ""
+    database: microservices
+  primary:
+    persistence:
+      size: 20Gi
+  metrics:
+    enabled: true
+
+# Redis
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: false
+  master:
+    persistence:
+      size: 8Gi
+  metrics:
+    enabled: true
+
+# NATS
+nats:
+  enabled: true
+  cluster:
+    enabled: false
+  natsbox:
+    enabled: false
+
+# Monitoring
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+
+# Tracing
+tracing:
+  enabled: true
+  jaeger:
+    enabled: true
+    agent:
+      host: jaeger-agent
+      port: 6831

@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  # Redis for caching and rate limiting
+  redis:
+    image: redis:7-alpine
+    container_name: advancedrag-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ChromaDB for vector storage
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: advancedrag-chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+
+  # Qdrant as alternative vector store
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: advancedrag-qdrant
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant-data:/qdrant/storage
+    profiles:
+      - qdrant
+
+  # PostgreSQL for metadata/state
+  postgres:
+    image: postgres:15-alpine
+    container_name: advancedrag-postgres
+    environment:
+      - POSTGRES_USER=rag
+      - POSTGRES_PASSWORD=rag
+      - POSTGRES_DB=advancedrag
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - full
+
+volumes:
+  redis-data:
+  chroma-data:
+  qdrant-data:
+  postgres-data:
+
+# Usage:
+#   docker-compose up -d                  # Redis + ChromaDB (minimal)
+#   docker-compose --profile qdrant up -d # Add Qdrant
+#   docker-compose --profile full up -d   # Add PostgreSQL
+#
+# ChromaDB API: http://localhost:8000
+# Qdrant API: http://localhost:6333

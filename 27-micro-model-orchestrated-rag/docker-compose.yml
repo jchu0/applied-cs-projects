@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # ChromaDB for vector storage
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: microrag-chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+
+  # Redis for caching model outputs
+  redis:
+    image: redis:7-alpine
+    container_name: microrag-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    profiles:
+      - cache
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: microrag-jaeger
+    ports:
+      - "16686:16686"  # UI
+      - "6831:6831/udp"  # Jaeger thrift
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    profiles:
+      - tracing
+
+volumes:
+  chroma-data:
+  redis-data:
+
+# Usage:
+#   docker-compose up -d                    # ChromaDB only (minimal)
+#   docker-compose --profile cache up -d    # Add Redis caching
+#   docker-compose --profile tracing up -d  # Add Jaeger tracing
+#
+# ChromaDB API: http://localhost:8000
+# Jaeger UI: http://localhost:16686

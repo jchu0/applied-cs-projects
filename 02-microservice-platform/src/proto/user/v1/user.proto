@@ -1,0 +1,181 @@
+syntax = "proto3";
+
+package user.v1;
+
+option go_package = "github.com/mlai/microservice-platform/pkg/pb/user/v1;userv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/field_mask.proto";
+import "common/v1/common.proto";
+
+// UserService provides user management operations
+service UserService {
+  // CreateUser creates a new user
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+
+  // GetUser retrieves a user by ID
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+
+  // GetUserByEmail retrieves a user by email
+  rpc GetUserByEmail(GetUserByEmailRequest) returns (GetUserByEmailResponse);
+
+  // UpdateUser updates user information
+  rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+
+  // DeleteUser soft-deletes a user
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+
+  // ListUsers lists users with pagination
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+
+  // AssignRole assigns a role to a user
+  rpc AssignRole(AssignRoleRequest) returns (AssignRoleResponse);
+
+  // RevokeRole removes a role from a user
+  rpc RevokeRole(RevokeRoleRequest) returns (RevokeRoleResponse);
+
+  // GetUserRoles gets all roles for a user
+  rpc GetUserRoles(GetUserRolesRequest) returns (GetUserRolesResponse);
+}
+
+// User represents a user entity
+message User {
+  string id = 1;
+  string tenant_id = 2;
+  string email = 3;
+  bool email_verified = 4;
+  string first_name = 5;
+  string last_name = 6;
+  string avatar_url = 7;
+  UserStatus status = 8;
+  map<string, string> metadata = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+// UserStatus represents user account status
+enum UserStatus {
+  USER_STATUS_UNSPECIFIED = 0;
+  USER_STATUS_ACTIVE = 1;
+  USER_STATUS_INACTIVE = 2;
+  USER_STATUS_SUSPENDED = 3;
+  USER_STATUS_DELETED = 4;
+}
+
+// Role represents a user role
+message Role {
+  string id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  string description = 4;
+  repeated string permissions = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// CreateUserRequest
+message CreateUserRequest {
+  string tenant_id = 1;
+  string email = 2;
+  string password = 3;
+  string first_name = 4;
+  string last_name = 5;
+  map<string, string> metadata = 6;
+}
+
+message CreateUserResponse {
+  User user = 1;
+}
+
+// GetUserRequest
+message GetUserRequest {
+  string user_id = 1;
+  string tenant_id = 2;
+}
+
+message GetUserResponse {
+  User user = 1;
+}
+
+// GetUserByEmailRequest
+message GetUserByEmailRequest {
+  string email = 1;
+  string tenant_id = 2;
+}
+
+message GetUserByEmailResponse {
+  User user = 1;
+  string password_hash = 2;  // Only for internal auth service use
+}
+
+// UpdateUserRequest
+message UpdateUserRequest {
+  string user_id = 1;
+  string tenant_id = 2;
+  string email = 3;
+  string first_name = 4;
+  string last_name = 5;
+  string avatar_url = 6;
+  UserStatus status = 7;
+  map<string, string> metadata = 8;
+  google.protobuf.FieldMask update_mask = 9;
+}
+
+message UpdateUserResponse {
+  User user = 1;
+}
+
+// DeleteUserRequest
+message DeleteUserRequest {
+  string user_id = 1;
+  string tenant_id = 2;
+}
+
+message DeleteUserResponse {
+  bool success = 1;
+}
+
+// ListUsersRequest
+message ListUsersRequest {
+  string tenant_id = 1;
+  common.v1.PaginationRequest pagination = 2;
+  UserStatus status_filter = 3;
+  string search = 4;  // Search by email, first_name, last_name
+}
+
+message ListUsersResponse {
+  repeated User users = 1;
+  common.v1.PaginationResponse pagination = 2;
+}
+
+// AssignRoleRequest
+message AssignRoleRequest {
+  string user_id = 1;
+  string role_id = 2;
+  string tenant_id = 3;
+  string granted_by = 4;
+}
+
+message AssignRoleResponse {
+  bool success = 1;
+}
+
+// RevokeRoleRequest
+message RevokeRoleRequest {
+  string user_id = 1;
+  string role_id = 2;
+  string tenant_id = 3;
+}
+
+message RevokeRoleResponse {
+  bool success = 1;
+}
+
+// GetUserRolesRequest
+message GetUserRolesRequest {
+  string user_id = 1;
+  string tenant_id = 2;
+}
+
+message GetUserRolesResponse {
+  repeated Role roles = 1;
+}

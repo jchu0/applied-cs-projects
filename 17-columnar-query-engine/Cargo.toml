@@ -1,0 +1,23 @@
+[package]
+name = "columnar-query-engine"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance columnar analytical query engine (DuckDB-lite)"
+
+[dependencies]
+thiserror = "1"
+parking_lot = "0.12"
+bitvec = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+sqlparser = "0.40"
+crossbeam-channel = "0.5"
+num_cpus = "1.16"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "benchmarks"
+harness = false

@@ -1,0 +1,128 @@
+version: '3.8'
+
+services:
+  # NameNode - metadata server
+  namenode:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hdfs-namenode
+    command: python -m hdfs.namenode --host 0.0.0.0 --port 9000
+    ports:
+      - "9000:9000"   # NameNode RPC
+      - "9870:9870"   # NameNode Web UI
+    environment:
+      - HDFS_ROLE=namenode
+      - HDFS_REPLICATION_FACTOR=3
+    volumes:
+      - namenode-data:/data/namenode
+      - ./src:/app/src
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9870/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hdfs-network
+
+  # DataNode 1
+  datanode1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hdfs-datanode1
+    command: python -m hdfs.datanode --host 0.0.0.0 --port 9001 --namenode namenode:9000
+    ports:
+      - "9001:9001"
+    environment:
+      - HDFS_ROLE=datanode
+      - HDFS_DATANODE_ID=datanode1
+    volumes:
+      - datanode1-data:/data/datanode
+      - ./src:/app/src
+    depends_on:
+      - namenode
+    networks:
+      - hdfs-network
+
+  # DataNode 2
+  datanode2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hdfs-datanode2
+    command: python -m hdfs.datanode --host 0.0.0.0 --port 9002 --namenode namenode:9000
+    ports:
+      - "9002:9002"
+    environment:
+      - HDFS_ROLE=datanode
+      - HDFS_DATANODE_ID=datanode2
+    volumes:
+      - datanode2-data:/data/datanode
+      - ./src:/app/src
+    depends_on:
+      - namenode
+    networks:
+      - hdfs-network
+
+  # DataNode 3
+  datanode3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hdfs-datanode3
+    command: python -m hdfs.datanode --host 0.0.0.0 --port 9003 --namenode namenode:9000
+    ports:
+      - "9003:9003"
+    environment:
+      - HDFS_ROLE=datanode
+      - HDFS_DATANODE_ID=datanode3
+    volumes:
+      - datanode3-data:/data/datanode
+      - ./src:/app/src
+    depends_on:
+      - namenode
+    networks:
+      - hdfs-network
+
+  # Development mode: Single-node simulation
+  hdfs-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hdfs-dev
+    command: python -m hdfs.dev_server --host 0.0.0.0 --port 9000
+    ports:
+      - "9000:9000"
+    environment:
+      - HDFS_MODE=development
+      - HDFS_SIMULATE_NODES=3
+    volumes:
+      - hdfs-dev-data:/data
+      - ./src:/app/src
+    profiles:
+      - dev
+    networks:
+      - hdfs-network
+
+networks:
+  hdfs-network:
+    driver: bridge
+
+volumes:
+  namenode-data:
+  datanode1-data:
+  datanode2-data:
+  datanode3-data:
+  hdfs-dev-data:
+
+# Usage:
+#   docker-compose up -d                # Full cluster (1 NameNode + 3 DataNodes)
+#   docker-compose --profile dev up -d  # Single-node dev mode
+#
+# NameNode Web UI: http://localhost:9870
+#
+# Client usage:
+#   python -m hdfs.client put local_file.txt /remote/path/file.txt
+#   python -m hdfs.client get /remote/path/file.txt local_file.txt
+#   python -m hdfs.client ls /

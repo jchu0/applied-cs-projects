@@ -1,0 +1,197 @@
+version: '3.8'
+
+services:
+  # PostgreSQL for User Service
+  postgres-users:
+    image: postgres:15-alpine
+    container_name: microservice-postgres-users
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: users
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-users-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL for Billing Service
+  postgres-billing:
+    image: postgres:15-alpine
+    container_name: microservice-postgres-billing
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: billing
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-billing-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL for Notification Service
+  postgres-notifications:
+    image: postgres:15-alpine
+    container_name: microservice-postgres-notifications
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: notifications
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres-notifications-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for sessions and caching
+  redis:
+    image: redis:7-alpine
+    container_name: microservice-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # NATS for message broker
+  nats:
+    image: nats:2.10-alpine
+    container_name: microservice-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"  # HTTP monitoring
+    command: "-js -m 8222"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    container_name: microservice-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # Accept model.proto
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: microservice-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # Grafana for dashboards
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: microservice-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning
+
+  # User Service
+  user-service:
+    build:
+      context: .
+      dockerfile: deployments/Dockerfile.user
+    container_name: microservice-user
+    ports:
+      - "9090:9090"
+      - "8090:8090"
+    environment:
+      SERVICE_NAME: user-service
+      SERVICE_GRPC_PORT: 9090
+      SERVICE_HTTP_PORT: 8090
+      SERVICE_LOG_LEVEL: debug
+      DATABASE_HOST: postgres-users
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_DATABASE: users
+      DATABASE_SSL_MODE: disable
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      NATS_URL: nats://nats:4222
+      TRACING_ENABLED: "true"
+      TRACING_JAEGER_URL: http://jaeger:14268/api/traces
+    depends_on:
+      postgres-users:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  # Auth Service
+  auth-service:
+    build:
+      context: .
+      dockerfile: deployments/Dockerfile.auth
+    container_name: microservice-auth
+    ports:
+      - "9091:9091"
+      - "8091:8091"
+    environment:
+      SERVICE_NAME: auth-service
+      SERVICE_GRPC_PORT: 9091
+      SERVICE_HTTP_PORT: 8091
+      SERVICE_LOG_LEVEL: debug
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_ISSUER: microservice-platform
+      JWT_AUDIENCE: microservice-platform
+      JWT_ACCESS_TOKEN_TTL: 15m
+      JWT_REFRESH_TOKEN_TTL: 168h
+      USER_SERVICE_ADDR: user-service:9090
+      TRACING_ENABLED: "true"
+      TRACING_JAEGER_URL: http://jaeger:14268/api/traces
+    depends_on:
+      redis:
+        condition: service_healthy
+      user-service:
+        condition: service_started
+
+volumes:
+  postgres-users-data:
+  postgres-billing-data:
+  postgres-notifications-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  default:
+    name: microservice-network

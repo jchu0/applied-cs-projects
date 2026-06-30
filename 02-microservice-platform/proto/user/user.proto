@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package user.v1;
+
+import "common/common.proto";
+
+option go_package = "github.com/project/microservices/proto/user/v1;userpb";
+
+service UserService {
+    // CreateUser creates a new user
+    rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+
+    // GetUser retrieves a user by ID
+    rpc GetUser(GetUserRequest) returns (GetUserResponse);
+
+    // UpdateUser updates an existing user
+    rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+
+    // DeleteUser deletes a user
+    rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+
+    // ListUsers lists users with pagination
+    rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+
+    // GetUserByEmail retrieves a user by email (used by auth service)
+    rpc GetUserByEmail(GetUserByEmailRequest) returns (GetUserByEmailResponse);
+}
+
+// User represents a user in the system
+message User {
+    string id = 1;
+    string tenant_id = 2;
+    string email = 3;
+    bool email_verified = 4;
+    string first_name = 5;
+    string last_name = 6;
+    string avatar_url = 7;
+    string status = 8;  // active, inactive, suspended
+    map<string, string> metadata = 9;
+    string created_at = 10;
+    string updated_at = 11;
+    repeated string roles = 12;
+}
+
+message CreateUserRequest {
+    string tenant_id = 1;
+    string email = 2;
+    string password = 3;
+    string first_name = 4;
+    string last_name = 5;
+    map<string, string> metadata = 6;
+}
+
+message CreateUserResponse {
+    User user = 1;
+}
+
+message GetUserRequest {
+    string user_id = 1;
+    string tenant_id = 2;
+}
+
+message GetUserResponse {
+    User user = 1;
+}
+
+message UpdateUserRequest {
+    string user_id = 1;
+    string tenant_id = 2;
+    optional string first_name = 3;
+    optional string last_name = 4;
+    optional string avatar_url = 5;
+    optional string status = 6;
+    map<string, string> metadata = 7;
+}
+
+message UpdateUserResponse {
+    User user = 1;
+}
+
+message DeleteUserRequest {
+    string user_id = 1;
+    string tenant_id = 2;
+}
+
+message DeleteUserResponse {
+    bool success = 1;
+}
+
+message ListUsersRequest {
+    string tenant_id = 1;
+    common.v1.PaginationRequest pagination = 2;
+    string status_filter = 3;
+    string search_query = 4;
+}
+
+message ListUsersResponse {
+    repeated User users = 1;
+    common.v1.PaginationResponse pagination = 2;
+}
+
+message GetUserByEmailRequest {
+    string email = 1;
+    string tenant_id = 2;
+}
+
+message GetUserByEmailResponse {
+    User user = 1;
+    string password_hash = 2;  // Only for internal auth service use
+}

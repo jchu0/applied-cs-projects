@@ -1,0 +1,22 @@
+[package]
+name = "long-context-attention"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance attention kernel library for transformers supporting long sequences"
+
+[dependencies]
+thiserror = "1"
+rand = "0.8"
+rayon = "1"
+num-traits = "0.2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+ndarray = "0.16"
+ndarray-rand = "0.15"
+approx = "0.5"
+
+[[bench]]
+name = "attention"
+harness = false

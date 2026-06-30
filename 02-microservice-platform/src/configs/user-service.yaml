@@ -1,0 +1,40 @@
+service:
+  name: user-service
+  environment: development
+  grpc_port: 9090
+  http_port: 8090
+  log_level: debug
+  timeout: 30s
+
+database:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: postgres
+  database: users
+  ssl_mode: disable
+  max_conns: 25
+  min_conns: 5
+  max_conn_lifetime: 5m
+  max_conn_idle_time: 1m
+
+redis:
+  host: localhost
+  port: 6379
+  password: ""
+  db: 0
+
+nats:
+  url: nats://localhost:4222
+  cluster_id: microservice-cluster
+  client_id: user-service
+
+tracing:
+  enabled: true
+  jaeger_url: http://localhost:14268/api/traces
+  sampling_rate: 1.0
+
+metrics:
+  enabled: true
+  port: 8090
+  path: /metrics

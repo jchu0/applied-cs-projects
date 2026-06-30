@@ -1,0 +1,137 @@
+syntax = "proto3";
+
+package auth.v1;
+
+option go_package = "github.com/project/microservices/proto/auth/v1;authpb";
+
+service AuthService {
+    // Login authenticates a user and returns tokens
+    rpc Login(LoginRequest) returns (LoginResponse);
+
+    // Logout invalidates the current session
+    rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+    // RefreshToken exchanges a refresh token for new tokens
+    rpc RefreshToken(RefreshTokenRequest) returns (TokenResponse);
+
+    // ValidateToken validates an access token and returns claims
+    rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+
+    // InitiateMFA starts MFA verification
+    rpc InitiateMFA(InitiateMFARequest) returns (MFAChallenge);
+
+    // VerifyMFA completes MFA verification
+    rpc VerifyMFA(VerifyMFARequest) returns (TokenResponse);
+
+    // Register creates a new user account
+    rpc Register(RegisterRequest) returns (RegisterResponse);
+}
+
+message LoginRequest {
+    string email = 1;
+    string password = 2;
+    string tenant_id = 3;
+    map<string, string> metadata = 4;
+}
+
+message LoginResponse {
+    TokenResponse tokens = 1;
+    UserInfo user = 2;
+    bool mfa_required = 3;
+    string mfa_token = 4;  // Temporary token for MFA flow
+}
+
+message LogoutRequest {
+    string access_token = 1;
+    string session_id = 2;
+}
+
+message LogoutResponse {
+    bool success = 1;
+}
+
+message RefreshTokenRequest {
+    string refresh_token = 1;
+}
+
+message TokenResponse {
+    string access_token = 1;
+    string refresh_token = 2;
+    int64 expires_in = 3;
+    string token_type = 4;
+    repeated string scopes = 5;
+}
+
+message ValidateTokenRequest {
+    string token = 1;
+}
+
+message ValidateTokenResponse {
+    bool valid = 1;
+    TokenClaims claims = 2;
+    string error_message = 3;
+}
+
+message TokenClaims {
+    string user_id = 1;
+    string tenant_id = 2;
+    string email = 3;
+    repeated string roles = 4;
+    repeated string permissions = 5;
+    string session_id = 6;
+    string token_type = 7;
+    int64 issued_at = 8;
+    int64 expires_at = 9;
+}
+
+message UserInfo {
+    string id = 1;
+    string email = 2;
+    string first_name = 3;
+    string last_name = 4;
+    string avatar_url = 5;
+    repeated string roles = 6;
+}
+
+message InitiateMFARequest {
+    string mfa_token = 1;
+    string method = 2;  // totp, sms, email
+}
+
+message MFAChallenge {
+    string challenge_id = 1;
+    string method = 2;
+    string hint = 3;  // e.g., last 4 digits of phone
+    int64 expires_at = 4;
+}
+
+message VerifyMFARequest {
+    string challenge_id = 1;
+    string code = 2;
+}
+
+message RegisterRequest {
+    string email = 1;
+    string password = 2;
+    string tenant_id = 3;
+    string first_name = 4;
+    string last_name = 5;
+    map<string, string> metadata = 6;
+}
+
+message RegisterResponse {
+    TokenResponse tokens = 1;
+    UserInfo user = 2;
+}
+
+// Session represents a user session
+message Session {
+    string id = 1;
+    string user_id = 2;
+    string tenant_id = 3;
+    string ip_address = 4;
+    string user_agent = 5;
+    string created_at = 6;
+    string last_activity = 7;
+    string expires_at = 8;
+}

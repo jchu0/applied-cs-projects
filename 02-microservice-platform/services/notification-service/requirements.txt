@@ -1,0 +1,16 @@
+grpcio==1.60.0
+grpcio-tools==1.60.0
+protobuf==4.25.1
+nats-py==2.6.0
+redis==5.0.1
+sendgrid==6.11.0
+jinja2==3.1.2
+pydantic==2.5.2
+pydantic-settings==2.1.0
+opentelemetry-api==1.21.0
+opentelemetry-sdk==1.21.0
+opentelemetry-exporter-jaeger==1.21.0
+opentelemetry-instrumentation-grpc==0.42b0
+aiohttp==3.9.1
+asyncio==3.4.3
+python-json-logger==2.0.7

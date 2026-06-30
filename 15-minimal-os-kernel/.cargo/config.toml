@@ -1,0 +1,17 @@
+# Build configuration for the bare-metal kernel.
+#
+# We compile for the built-in `x86_64-unknown-none` target (bare metal: no OS,
+# soft-float, red-zone disabled — exactly what a kernel needs). `build-std`
+# recompiles core/alloc/compiler_builtins for that target, since no prebuilt
+# std exists for it. `cargo run` is wired to boot the resulting image in QEMU
+# via the `bootimage` tool (`cargo install bootimage`).
+
+[build]
+target = "x86_64-unknown-none"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-unknown-none]
+runner = "bootimage runner"

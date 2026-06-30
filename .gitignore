@@ -1,0 +1,22 @@
+# Build / dependency artifacts
+target/
+**/target/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+node_modules/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# Development tracker / process files — kept locally, not committed
+PROGRESS.md
+PROJECTS_STATUS.md
+IMPLEMENTATION_PLAN.md
+audit/

@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  # Redis for Celery task queue
+  redis:
+    image: redis:7-alpine
+    container_name: aiworkflow-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # PostgreSQL for workflow state and history
+  postgres:
+    image: postgres:15-alpine
+    container_name: aiworkflow-postgres
+    environment:
+      - POSTGRES_USER=workflow
+      - POSTGRES_PASSWORD=workflow
+      - POSTGRES_DB=aiworkflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Celery worker for task execution
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: aiworkflow-celery-worker
+    command: celery -A aiworkflow.tasks worker --loglevel=info
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DATABASE_URL=postgresql://workflow:workflow@postgres:5432/aiworkflow
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./src:/app/src
+    profiles:
+      - worker
+
+  # Flower for Celery monitoring
+  flower:
+    image: mher/flower:latest
+    container_name: aiworkflow-flower
+    command: celery --broker=redis://redis:6379/0 flower --port=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    profiles:
+      - monitoring
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aiworkflow-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    profiles:
+      - monitoring
+
+volumes:
+  redis-data:
+  postgres-data:
+
+# Usage:
+#   docker-compose up -d                       # Redis + PostgreSQL (core)
+#   docker-compose --profile worker up -d      # Add Celery worker
+#   docker-compose --profile monitoring up -d  # Add Flower + Prometheus
+#
+# Flower UI: http://localhost:5555
+# Prometheus: http://localhost:9090

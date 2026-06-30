@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package common.v1;
+
+option go_package = "github.com/project/microservices/proto/common/v1;commonpb";
+
+// TenantContext carries tenant and user context across services
+message TenantContext {
+    string tenant_id = 1;
+    string user_id = 2;
+    string trace_id = 3;
+    string request_id = 4;
+    map<string, string> metadata = 5;
+}
+
+// PaginationRequest for list operations
+message PaginationRequest {
+    int32 page_size = 1;
+    string page_token = 2;
+}
+
+// PaginationResponse for list operations
+message PaginationResponse {
+    string next_page_token = 1;
+    int32 total_count = 2;
+}
+
+// Timestamp message
+message Timestamp {
+    int64 seconds = 1;
+    int32 nanos = 2;
+}
+
+// Empty message for operations with no input/output
+message Empty {}
+
+// ErrorDetail provides structured error information
+message ErrorDetail {
+    string code = 1;
+    string message = 2;
+    map<string, string> metadata = 3;
+}

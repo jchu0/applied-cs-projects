@@ -1,0 +1,190 @@
+syntax = "proto3";
+
+package auth.v1;
+
+option go_package = "github.com/mlai/microservice-platform/pkg/pb/auth/v1;authv1";
+
+import "google/protobuf/timestamp.proto";
+
+// AuthService provides authentication operations
+service AuthService {
+  // Login authenticates a user and returns tokens
+  rpc Login(LoginRequest) returns (LoginResponse);
+
+  // Logout invalidates the current session
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+  // RefreshToken exchanges a refresh token for new tokens
+  rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
+
+  // ValidateToken validates an access token and returns claims
+  rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+
+  // RevokeToken revokes a specific token
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+
+  // ChangePassword changes the user's password
+  rpc ChangePassword(ChangePasswordRequest) returns (ChangePasswordResponse);
+
+  // ResetPassword initiates password reset
+  rpc ResetPassword(ResetPasswordRequest) returns (ResetPasswordResponse);
+
+  // ConfirmResetPassword completes password reset with token
+  rpc ConfirmResetPassword(ConfirmResetPasswordRequest) returns (ConfirmResetPasswordResponse);
+
+  // GetActiveSessions returns all active sessions for a user
+  rpc GetActiveSessions(GetActiveSessionsRequest) returns (GetActiveSessionsResponse);
+
+  // TerminateSession terminates a specific session
+  rpc TerminateSession(TerminateSessionRequest) returns (TerminateSessionResponse);
+}
+
+// LoginRequest
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+  string tenant_id = 3;
+  map<string, string> device_info = 4;  // user_agent, ip, etc.
+}
+
+message LoginResponse {
+  string access_token = 1;
+  string refresh_token = 2;
+  int64 expires_in = 3;          // seconds until access token expires
+  string token_type = 4;         // "Bearer"
+  repeated string scopes = 5;
+  string session_id = 6;
+  User user = 7;
+}
+
+// User information returned on login
+message User {
+  string id = 1;
+  string email = 2;
+  string first_name = 3;
+  string last_name = 4;
+  string avatar_url = 5;
+  repeated string roles = 6;
+  repeated string permissions = 7;
+}
+
+// LogoutRequest
+message LogoutRequest {
+  string session_id = 1;
+  string access_token = 2;
+  bool logout_all_sessions = 3;  // Logout from all devices
+}
+
+message LogoutResponse {
+  bool success = 1;
+}
+
+// RefreshTokenRequest
+message RefreshTokenRequest {
+  string refresh_token = 1;
+}
+
+message RefreshTokenResponse {
+  string access_token = 1;
+  string refresh_token = 2;
+  int64 expires_in = 3;
+  string token_type = 4;
+}
+
+// ValidateTokenRequest
+message ValidateTokenRequest {
+  string access_token = 1;
+}
+
+message ValidateTokenResponse {
+  bool valid = 1;
+  TokenClaims claims = 2;
+}
+
+// TokenClaims represents the claims in a JWT
+message TokenClaims {
+  string user_id = 1;
+  string tenant_id = 2;
+  string email = 3;
+  repeated string roles = 4;
+  repeated string permissions = 5;
+  string session_id = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  google.protobuf.Timestamp issued_at = 8;
+}
+
+// RevokeTokenRequest
+message RevokeTokenRequest {
+  string token = 1;
+  string token_type = 2;  // "access" or "refresh"
+}
+
+message RevokeTokenResponse {
+  bool success = 1;
+}
+
+// ChangePasswordRequest
+message ChangePasswordRequest {
+  string user_id = 1;
+  string tenant_id = 2;
+  string current_password = 3;
+  string new_password = 4;
+}
+
+message ChangePasswordResponse {
+  bool success = 1;
+}
+
+// ResetPasswordRequest
+message ResetPasswordRequest {
+  string email = 1;
+  string tenant_id = 2;
+}
+
+message ResetPasswordResponse {
+  bool success = 1;
+  string message = 2;  // "Reset email sent if account exists"
+}
+
+// ConfirmResetPasswordRequest
+message ConfirmResetPasswordRequest {
+  string token = 1;
+  string new_password = 2;
+}
+
+message ConfirmResetPasswordResponse {
+  bool success = 1;
+}
+
+// Session represents an active user session
+message Session {
+  string id = 1;
+  string user_id = 2;
+  string device_info = 3;
+  string ip_address = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp last_active_at = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  bool is_current = 8;
+}
+
+// GetActiveSessionsRequest
+message GetActiveSessionsRequest {
+  string user_id = 1;
+  string tenant_id = 2;
+}
+
+message GetActiveSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+// TerminateSessionRequest
+message TerminateSessionRequest {
+  string session_id = 1;
+  string user_id = 2;
+  string tenant_id = 3;
+}
+
+message TerminateSessionResponse {
+  bool success = 1;
+}

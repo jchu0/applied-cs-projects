@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package common.v1;
+
+option go_package = "github.com/mlai/microservice-platform/pkg/pb/common/v1;commonv1";
+
+import "google/protobuf/timestamp.proto";
+
+// TenantContext carries tenant information across service calls
+message TenantContext {
+  string tenant_id = 1;
+  string user_id = 2;
+  string trace_id = 3;
+  string request_id = 4;
+  map<string, string> metadata = 5;
+}
+
+// PaginationRequest contains pagination parameters
+message PaginationRequest {
+  int32 page_size = 1;      // Number of items per page (max 100)
+  string page_token = 2;     // Token for next page
+}
+
+// PaginationResponse contains pagination metadata
+message PaginationResponse {
+  string next_page_token = 1;  // Token for next page (empty if last page)
+  int32 total_count = 2;       // Total number of items
+  bool has_more = 3;           // Whether there are more items
+}
+
+// SortOrder specifies sort direction
+enum SortOrder {
+  SORT_ORDER_UNSPECIFIED = 0;
+  SORT_ORDER_ASC = 1;
+  SORT_ORDER_DESC = 2;
+}
+
+// HealthCheckRequest for health checks
+message HealthCheckRequest {
+  string service = 1;
+}
+
+// HealthCheckResponse for health check results
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+    SERVICE_UNKNOWN = 3;
+  }
+  ServingStatus status = 1;
+  string message = 2;
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+// ErrorDetail provides detailed error information
+message ErrorDetail {
+  string code = 1;           // Machine-readable error code
+  string message = 2;        // Human-readable message
+  string field = 3;          // Field that caused the error (for validation)
+  map<string, string> metadata = 4;
+}
+
+// Audit information for tracking changes
+message AuditInfo {
+  string created_by = 1;
+  google.protobuf.Timestamp created_at = 2;
+  string updated_by = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}

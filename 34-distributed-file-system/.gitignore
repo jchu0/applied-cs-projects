@@ -1,0 +1,6 @@
+# Test artifacts
+test-dn/
+test_data/
+*.pyc
+__pycache__/
+.pytest_cache/

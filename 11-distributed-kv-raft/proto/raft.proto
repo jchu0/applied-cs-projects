@@ -1,0 +1,155 @@
+syntax = "proto3";
+
+package raft;
+
+// Raft consensus RPC service
+service RaftService {
+    // RequestVote RPC - used during leader elections
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+
+    // AppendEntries RPC - used for log replication and heartbeats
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+    // InstallSnapshot RPC - used to send snapshots to slow followers
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// Client-facing KV service
+service KVService {
+    // Execute a client operation (Get, Put, Delete)
+    rpc Execute(ClientRequest) returns (ClientResponse);
+}
+
+// RequestVote RPC request
+message RequestVoteRequest {
+    // Candidate's term
+    uint64 term = 1;
+    // Candidate requesting vote
+    uint64 candidate_id = 2;
+    // Index of candidate's last log entry
+    uint64 last_log_index = 3;
+    // Term of candidate's last log entry
+    uint64 last_log_term = 4;
+}
+
+// RequestVote RPC response
+message RequestVoteResponse {
+    // Current term for candidate to update itself
+    uint64 term = 1;
+    // True if candidate received vote
+    bool vote_granted = 2;
+}
+
+// AppendEntries RPC request
+message AppendEntriesRequest {
+    // Leader's term
+    uint64 term = 1;
+    // Leader's ID
+    uint64 leader_id = 2;
+    // Index of log entry immediately preceding new ones
+    uint64 prev_log_index = 3;
+    // Term of prev_log_index entry
+    uint64 prev_log_term = 4;
+    // Log entries to store (empty for heartbeat)
+    repeated LogEntry entries = 5;
+    // Leader's commit index
+    uint64 leader_commit = 6;
+}
+
+// AppendEntries RPC response
+message AppendEntriesResponse {
+    // Current term for leader to update itself
+    uint64 term = 1;
+    // True if follower contained entry matching prev_log_index and prev_log_term
+    bool success = 2;
+    // Optimization: index of conflicting entry (for faster log catchup)
+    optional uint64 conflict_index = 3;
+    // Optimization: term of conflicting entry
+    optional uint64 conflict_term = 4;
+}
+
+// InstallSnapshot RPC request
+message InstallSnapshotRequest {
+    // Leader's term
+    uint64 term = 1;
+    // Leader's ID
+    uint64 leader_id = 2;
+    // Snapshot replaces all entries up through and including this index
+    uint64 last_included_index = 3;
+    // Term of last_included_index
+    uint64 last_included_term = 4;
+    // Byte offset where chunk is positioned in the snapshot file
+    uint64 offset = 5;
+    // Raw bytes of the snapshot chunk
+    bytes data = 6;
+    // True if this is the last chunk
+    bool done = 7;
+}
+
+// InstallSnapshot RPC response
+message InstallSnapshotResponse {
+    // Current term for leader to update itself
+    uint64 term = 1;
+}
+
+// A single entry in the Raft log
+message LogEntry {
+    // Term when entry was received by leader
+    uint64 term = 1;
+    // Position in log
+    uint64 index = 2;
+    // The serialized command (bincode-encoded)
+    bytes command = 3;
+    // Type of this entry
+    EntryType entry_type = 4;
+}
+
+// Type of log entry
+enum EntryType {
+    ENTRY_TYPE_COMMAND = 0;
+    ENTRY_TYPE_CONFIGURATION = 1;
+    ENTRY_TYPE_NO_OP = 2;
+}
+
+// Client request to the Raft cluster
+message ClientRequest {
+    oneof request {
+        GetRequest get = 1;
+        PutRequest put = 2;
+        DeleteRequest delete = 3;
+    }
+}
+
+message GetRequest {
+    bytes key = 1;
+}
+
+message PutRequest {
+    bytes key = 1;
+    bytes value = 2;
+}
+
+message DeleteRequest {
+    bytes key = 1;
+}
+
+// Client response from the Raft cluster
+message ClientResponse {
+    oneof response {
+        SuccessResponse success = 1;
+        NotLeaderResponse not_leader = 2;
+        ErrorResponse error = 3;
+    }
+}
+
+message SuccessResponse {
+    optional bytes value = 1;
+}
+
+message NotLeaderResponse {
+    optional uint64 leader_hint = 1;
+}
+
+message ErrorResponse {
+    string message = 1;
+}

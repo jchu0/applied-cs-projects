@@ -1,0 +1,26 @@
+[package]
+name = "async-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "A custom async runtime implementation (Tokio-like)"
+
+[dependencies]
+libc = "0.2"
+crossbeam-deque = "0.8"
+crossbeam-queue = "0.3"
+parking_lot = "0.12"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[lib]
+name = "async_runtime"
+path = "src/lib.rs"
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1

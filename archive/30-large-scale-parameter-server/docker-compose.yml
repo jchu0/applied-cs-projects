@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  # Redis for parameter storage and caching
+  redis:
+    image: redis:7-alpine
+    container_name: paramserver-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Etcd for distributed coordination
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.11
+    container_name: paramserver-etcd
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    environment:
+      - ETCD_NAME=etcd0
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd:2380
+      - ETCD_INITIAL_CLUSTER=etcd0=http://etcd:2380
+      - ETCD_INITIAL_CLUSTER_TOKEN=paramserver-cluster
+      - ETCD_INITIAL_CLUSTER_STATE=new
+    volumes:
+      - etcd-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL for metadata
+  postgres:
+    image: postgres:15-alpine
+    container_name: paramserver-postgres
+    environment:
+      - POSTGRES_USER=paramserver
+      - POSTGRES_PASSWORD=paramserver
+      - POSTGRES_DB=paramserver
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paramserver"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Zookeeper for additional coordination (optional)
+  zookeeper:
+    image: zookeeper:3.9
+    container_name: paramserver-zookeeper
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/data
+    profiles:
+      - zookeeper
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: paramserver-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    profiles:
+      - monitoring
+
+  # Grafana for dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: paramserver-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+
+volumes:
+  redis-data:
+  etcd-data:
+  postgres-data:
+  zookeeper-data:
+  grafana-data:
+
+# Usage:
+#   docker-compose up -d                       # Redis + Etcd + PostgreSQL (core)
+#   docker-compose --profile zookeeper up -d   # Add Zookeeper
+#   docker-compose --profile monitoring up -d  # Add Prometheus + Grafana
+#
+# Etcd: http://localhost:2379
+# Grafana: http://localhost:3000 (admin/admin)

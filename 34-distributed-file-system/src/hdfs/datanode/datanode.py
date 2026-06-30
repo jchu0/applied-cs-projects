@@ -1,0 +1,542 @@
+"""DataNode implementation for HDFS."""
+
+import asyncio
+import os
+import time
+import logging
+import hashlib
+from typing import Dict, List, Optional, Set
+from pathlib import Path
+
+from ..common.types import (
+    BlockID, NodeID, Block, generate_node_id
+)
+from ..common.protocol import (
+    Message, MessageType, serialize_message, deserialize_message,
+    BlockNotFoundError
+)
+
+logger = logging.getLogger(__name__)
+
+
+class DataNode:
+    """
+    DataNode stores and serves data blocks.
+
+    Responsibilities:
+    - Store block data on local disk
+    - Serve read requests from clients
+    - Accept write requests from clients
+    - Report blocks to NameNode
+    - Execute commands from NameNode
+    """
+
+    def __init__(
+        self,
+        node_id: Optional[NodeID] = None,
+        data_dir: str = "/tmp/hdfs/datanode",
+        namenode_host: str = "localhost",
+        namenode_port: int = 9000,
+        host: str = "localhost",
+        port: int = 50010,
+        capacity: int = 100 * 1024 * 1024 * 1024,  # 100GB default
+        max_bandwidth: int = 0  # 0 = unlimited
+    ):
+        self._data_dir_path = Path(data_dir)
+        self.data_dir = str(data_dir)  # Keep as string for compatibility
+        self.namenode_host = namenode_host
+        self.namenode_port = namenode_port
+        self.node_id = node_id or generate_node_id()
+        self.host = host
+        self.port = port
+        self.capacity = capacity
+        self.max_bandwidth = max_bandwidth
+
+        # Block storage
+        self._blocks: Dict[BlockID, int] = {}  # block_id -> size
+        self._block_checksums: Dict[BlockID, str] = {}
+
+        # State
+        self._registered = False
+        self._running = False
+
+        # Create data directory
+        self._data_dir_path.mkdir(parents=True, exist_ok=True)
+        self._blocks_dir = self._data_dir_path / "blocks"
+        self._blocks_dir.mkdir(exist_ok=True)
+
+        # Scan existing blocks
+        self._scan_blocks()
+
+    def _scan_blocks(self) -> None:
+        """Scan data directory for existing blocks."""
+        for block_file in self._blocks_dir.glob("blk_*"):
+            block_id = block_file.stem
+            size = block_file.stat().st_size
+            self._blocks[block_id] = size
+
+            # Compute checksum
+            with open(block_file, 'rb') as f:
+                checksum = hashlib.md5(f.read()).hexdigest()
+            self._block_checksums[block_id] = checksum
+
+        logger.info(f"Scanned {len(self._blocks)} existing blocks")
+
+    def _get_block_path(self, block_id: BlockID) -> Path:
+        """Get filesystem path for block."""
+        # Store in blocks subdirectory (block_id already has blk_ prefix)
+        return self._blocks_dir / block_id
+
+    @property
+    def used_space(self) -> int:
+        """Get used storage space."""
+        return sum(self._blocks.values())
+
+    @property
+    def remaining_space(self) -> int:
+        """Get remaining storage space."""
+        return max(0, self.capacity - self.used_space)
+
+    # Block operations
+
+    def write_block(self, block_id: BlockID, data: bytes) -> int:
+        """Write a block to storage."""
+        block_path = self._get_block_path(block_id)
+
+        # Write data
+        with open(block_path, 'wb') as f:
+            f.write(data)
+
+        size = len(data)
+        self._blocks[block_id] = size
+        self._block_checksums[block_id] = hashlib.md5(data).hexdigest()
+
+        logger.info(f"Wrote block {block_id}, size: {size}")
+        return size
+
+    def read_block(self, block_id: BlockID, offset: int = 0, length: int = -1) -> bytes:
+        """Read a block from storage."""
+        if block_id not in self._blocks:
+            raise BlockNotFoundError(f"Block not found: {block_id}")
+
+        block_path = self._get_block_path(block_id)
+
+        with open(block_path, 'rb') as f:
+            if offset > 0:
+                f.seek(offset)
+            if length > 0:
+                data = f.read(length)
+            else:
+                data = f.read()
+
+        return data
+
+    def delete_block(self, block_id: BlockID) -> bool:
+        """Delete a block from storage."""
+        if block_id not in self._blocks:
+            return False
+
+        block_path = self._get_block_path(block_id)
+        if block_path.exists():
+            block_path.unlink()
+
+        del self._blocks[block_id]
+        if block_id in self._block_checksums:
+            del self._block_checksums[block_id]
+
+        logger.info(f"Deleted block {block_id}")
+        return True
+
+    def verify_block(self, block_id: BlockID) -> bool:
+        """Verify block checksum."""
+        if block_id not in self._blocks:
+            return False
+
+        data = self.read_block(block_id)
+        checksum = hashlib.md5(data).hexdigest()
+        expected = self._block_checksums.get(block_id)
+
+        return checksum == expected
+
+    def get_block_ids(self) -> List[BlockID]:
+        """Get list of all block IDs."""
+        return list(self._blocks.keys())
+
+    # Compatibility aliases for test suite
+
+    def store_block(self, block_id: BlockID, data: bytes) -> int:
+        """Store a block (alias for write_block)."""
+        return self.write_block(block_id, data)
+
+    def retrieve_block(self, block_id: BlockID, offset: int = 0, length: int = -1) -> bytes:
+        """Retrieve a block (alias for read_block)."""
+        return self.read_block(block_id, offset, length)
+
+    def get_block_report(self) -> List[BlockID]:
+        """Get block report (alias for get_block_ids)."""
+        return self.get_block_ids()
+
+    def get_storage_info(self) -> dict:
+        """Get storage information."""
+        return {
+            "node_id": self.node_id,
+            "capacity": self.capacity,
+            "used": self.used_space,
+            "remaining": self.remaining_space,
+            "block_count": len(self._blocks)
+        }
+
+    # Additional methods for test compatibility
+
+    def scan_blocks(self) -> List[BlockID]:
+        """Scan all blocks and return list of corrupted block IDs."""
+        corrupted = []
+        for block_id in list(self._blocks.keys()):
+            if not self.verify_block(block_id):
+                corrupted.append(block_id)
+        return corrupted
+
+    def recover_blocks(self) -> None:
+        """Recover blocks from storage after restart."""
+        # Re-scan the blocks directory to ensure state is consistent
+        self._scan_blocks()
+
+    def store_block_pipeline(
+        self,
+        block_id: BlockID,
+        data: bytes,
+        downstream_nodes: List = None
+    ) -> int:
+        """Store block with pipeline replication to downstream nodes."""
+        # Store locally first
+        size = self.write_block(block_id, data)
+
+        # Forward to downstream nodes
+        if downstream_nodes:
+            self._forward_to_downstream(block_id, data, downstream_nodes)
+
+        return size
+
+    def _forward_to_downstream(
+        self,
+        block_id: BlockID,
+        data: bytes,
+        downstream_nodes: List
+    ) -> None:
+        """Forward block data to downstream nodes in the pipeline."""
+        for node in downstream_nodes:
+            try:
+                if hasattr(node, 'store_block'):
+                    node.store_block(block_id, data)
+            except Exception as e:
+                logger.warning(f"Failed to forward to downstream: {e}")
+
+    def store_block_throttled(self, block_id: BlockID, data: bytes) -> int:
+        """Store block with bandwidth throttling."""
+        import time
+        bandwidth = self.max_bandwidth if self.max_bandwidth > 0 else 1024 * 1024
+        total_size = len(data)
+
+        # Calculate how long the write should take at the given bandwidth
+        expected_time = total_size / bandwidth
+
+        start_time = time.time()
+
+        # Write the data
+        block_path = self._get_block_path(block_id)
+        with open(block_path, 'wb') as f:
+            f.write(data)
+
+        # Sleep for the remaining time to simulate throttled bandwidth
+        elapsed = time.time() - start_time
+        if elapsed < expected_time:
+            time.sleep(expected_time - elapsed)
+
+        # Update internal state
+        self._blocks[block_id] = total_size
+        self._block_checksums[block_id] = hashlib.md5(data).hexdigest()
+
+        return total_size
+
+    # NameNode communication
+
+    async def register_with_namenode(self) -> bool:
+        """Register with the NameNode."""
+        try:
+            reader, writer = await asyncio.open_connection(
+                self.namenode_host, self.namenode_port
+            )
+
+            message = Message(MessageType.REGISTER_DATANODE, {
+                "node_id": self.node_id,
+                "host": self.host,
+                "port": self.port,
+                "capacity": self.capacity
+            })
+
+            data = serialize_message(message)
+            writer.write(len(data).to_bytes(4, 'big'))
+            writer.write(data)
+            await writer.drain()
+
+            # Read response
+            length_data = await reader.read(4)
+            length = int.from_bytes(length_data, 'big')
+            response_data = await reader.read(length)
+            response = deserialize_message(response_data)
+
+            writer.close()
+            await writer.wait_closed()
+
+            self._registered = response.msg_type == MessageType.SUCCESS
+            logger.info(f"Registration {'successful' if self._registered else 'failed'}")
+            return self._registered
+
+        except Exception as e:
+            logger.error(f"Failed to register with NameNode: {e}")
+            return False
+
+    async def send_heartbeat(self) -> List[Dict]:
+        """Send heartbeat to NameNode."""
+        try:
+            reader, writer = await asyncio.open_connection(
+                self.namenode_host, self.namenode_port
+            )
+
+            message = Message(MessageType.HEARTBEAT, {
+                "node_id": self.node_id,
+                "used": self.used_space,
+                "remaining": self.remaining_space
+            })
+
+            data = serialize_message(message)
+            writer.write(len(data).to_bytes(4, 'big'))
+            writer.write(data)
+            await writer.drain()
+
+            # Read response
+            length_data = await reader.read(4)
+            length = int.from_bytes(length_data, 'big')
+            response_data = await reader.read(length)
+            response = deserialize_message(response_data)
+
+            writer.close()
+            await writer.wait_closed()
+
+            if response.msg_type == MessageType.SUCCESS:
+                return response.payload.get("commands", [])
+            return []
+
+        except Exception as e:
+            logger.error(f"Failed to send heartbeat: {e}")
+            return []
+
+    async def send_block_report(self) -> bool:
+        """Send block report to NameNode."""
+        try:
+            reader, writer = await asyncio.open_connection(
+                self.namenode_host, self.namenode_port
+            )
+
+            message = Message(MessageType.BLOCK_REPORT, {
+                "node_id": self.node_id,
+                "blocks": self.get_block_ids(),
+                "timestamp": time.time()
+            })
+
+            data = serialize_message(message)
+            writer.write(len(data).to_bytes(4, 'big'))
+            writer.write(data)
+            await writer.drain()
+
+            # Read response
+            length_data = await reader.read(4)
+            length = int.from_bytes(length_data, 'big')
+            response_data = await reader.read(length)
+            response = deserialize_message(response_data)
+
+            writer.close()
+            await writer.wait_closed()
+
+            return response.msg_type == MessageType.SUCCESS
+
+        except Exception as e:
+            logger.error(f"Failed to send block report: {e}")
+            return False
+
+    async def report_block_received(self, block_id: BlockID, size: int) -> bool:
+        """Report that a block was received."""
+        try:
+            reader, writer = await asyncio.open_connection(
+                self.namenode_host, self.namenode_port
+            )
+
+            message = Message(MessageType.BLOCK_RECEIVED, {
+                "node_id": self.node_id,
+                "block_id": block_id,
+                "size": size
+            })
+
+            data = serialize_message(message)
+            writer.write(len(data).to_bytes(4, 'big'))
+            writer.write(data)
+            await writer.drain()
+
+            # Read response
+            length_data = await reader.read(4)
+            length = int.from_bytes(length_data, 'big')
+            response_data = await reader.read(length)
+            response = deserialize_message(response_data)
+
+            writer.close()
+            await writer.wait_closed()
+
+            return response.msg_type == MessageType.SUCCESS
+
+        except Exception as e:
+            logger.error(f"Failed to report block received: {e}")
+            return False
+
+    async def execute_command(self, command: Dict) -> None:
+        """Execute a command from NameNode."""
+        cmd_type = command.get("type")
+
+        if cmd_type == "delete":
+            for block_id in command.get("block_ids", []):
+                self.delete_block(block_id)
+
+        elif cmd_type == "replicate":
+            block_id = command.get("block_id")
+            targets = command.get("targets", [])
+            # Would copy block to targets
+            logger.info(f"Replicating {block_id} to {targets}")
+
+        elif cmd_type == "re-register":
+            await self.register_with_namenode()
+
+    # Background tasks
+
+    async def heartbeat_loop(self, interval: float = 3.0):
+        """Send periodic heartbeats to NameNode."""
+        while self._running:
+            commands = await self.send_heartbeat()
+            for cmd in commands:
+                await self.execute_command(cmd)
+            await asyncio.sleep(interval)
+
+    async def block_report_loop(self, interval: float = 3600.0):
+        """Send periodic block reports to NameNode."""
+        while self._running:
+            await self.send_block_report()
+            await asyncio.sleep(interval)
+
+
+class DataNodeServer:
+    """Async server for DataNode data transfer."""
+
+    def __init__(self, datanode: DataNode):
+        self.datanode = datanode
+        self._server = None
+
+    async def start(self):
+        """Start the DataNode server."""
+        self._server = await asyncio.start_server(
+            self._handle_client,
+            self.datanode.host,
+            self.datanode.port
+        )
+        self.datanode._running = True
+
+        # Register with NameNode
+        await self.datanode.register_with_namenode()
+
+        # Send initial block report
+        await self.datanode.send_block_report()
+
+        # Start background tasks
+        asyncio.create_task(self.datanode.heartbeat_loop())
+        asyncio.create_task(self.datanode.block_report_loop())
+
+        logger.info(f"DataNode server started on {self.datanode.host}:{self.datanode.port}")
+
+    async def stop(self):
+        """Stop the server."""
+        self.datanode._running = False
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+
+    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle client connection for data transfer."""
+        try:
+            # Read message length
+            length_data = await reader.read(4)
+            if not length_data:
+                return
+
+            length = int.from_bytes(length_data, 'big')
+            data = await reader.read(length)
+
+            message = deserialize_message(data)
+            response = await self._process_message(message, reader, writer)
+
+            # Send response
+            response_data = serialize_message(response)
+            writer.write(len(response_data).to_bytes(4, 'big'))
+            writer.write(response_data)
+            await writer.drain()
+
+        except Exception as e:
+            logger.error(f"Error handling client: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def _process_message(
+        self,
+        message: Message,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter
+    ) -> Message:
+        """Process incoming message."""
+        try:
+            if message.msg_type == MessageType.READ_BLOCK:
+                block_id = message.payload["block_id"]
+                offset = message.payload.get("offset", 0)
+                length = message.payload.get("length", -1)
+
+                data = self.datanode.read_block(block_id, offset, length)
+
+                return Message(MessageType.SUCCESS, {
+                    "block_id": block_id,
+                    "size": len(data),
+                    "data": data.hex()  # Encode as hex for JSON
+                })
+
+            elif message.msg_type == MessageType.WRITE_BLOCK:
+                block_id = message.payload["block_id"]
+                data = bytes.fromhex(message.payload["data"])
+
+                size = self.datanode.write_block(block_id, data)
+
+                # Report to NameNode
+                await self.datanode.report_block_received(block_id, size)
+
+                return Message(MessageType.SUCCESS, {
+                    "block_id": block_id,
+                    "size": size
+                })
+
+            elif message.msg_type == MessageType.DELETE_BLOCK:
+                block_id = message.payload["block_id"]
+                success = self.datanode.delete_block(block_id)
+
+                return Message(MessageType.SUCCESS, {"deleted": success})
+
+            else:
+                return Message(MessageType.ERROR, {
+                    "error": f"Unknown message type: {message.msg_type}"
+                })
+
+        except Exception as e:
+            return Message(MessageType.ERROR, {"error": str(e)})

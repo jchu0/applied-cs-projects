@@ -1,0 +1,18 @@
+[package]
+name = "py-compiler"
+version = "0.1.0"
+edition = "2021"
+description = "Compiler/Interpreter for Python subset with lexer, parser, bytecode compiler, and VM"
+
+[dependencies]
+thiserror = "1"
+logos = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "benchmarks"
+harness = false

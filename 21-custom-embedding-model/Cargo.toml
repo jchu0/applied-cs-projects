@@ -1,0 +1,22 @@
+[package]
+name = "custom-embedding-model"
+version = "0.1.0"
+edition = "2021"
+description = "Custom embedding model training with contrastive learning and hard negative mining"
+
+[dependencies]
+thiserror = "1"
+rand = "0.8"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+num-traits = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "embedding_benchmarks"
+harness = false

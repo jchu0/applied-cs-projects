@@ -1,0 +1,32 @@
+[package]
+name = "service-mesh"
+version = "0.1.0"
+edition = "2021"
+description = "Service mesh with sidecar proxy, mTLS, and traffic management"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "0.14", features = ["full"] }
+tonic = "0.9"
+tokio-rustls = "0.24"
+rustls = "0.21"
+rcgen = "0.11"
+x509-parser = "0.15"
+rustls-pemfile = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+dashmap = "5"
+rand = "0.8"
+bytes = "1"
+base64 = "0.21"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = "0.5"
+proptest = "1.2"
+tokio-test = "0.4"
+mockall = "0.11"

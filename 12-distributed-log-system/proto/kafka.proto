@@ -1,0 +1,479 @@
+syntax = "proto3";
+
+package kafka;
+
+// Kafka-lite Broker Service
+service BrokerService {
+    // Produce records to a topic partition
+    rpc Produce(ProduceRequest) returns (ProduceResponse);
+
+    // Fetch records from topic partitions
+    rpc Fetch(FetchRequest) returns (FetchResponse);
+
+    // Get topic/partition metadata
+    rpc Metadata(MetadataRequest) returns (MetadataResponse);
+
+    // List available offsets for partitions
+    rpc ListOffsets(ListOffsetsRequest) returns (ListOffsetsResponse);
+}
+
+// Consumer Group Coordinator Service
+service GroupCoordinatorService {
+    // Join a consumer group
+    rpc JoinGroup(JoinGroupRequest) returns (JoinGroupResponse);
+
+    // Sync group assignments
+    rpc SyncGroup(SyncGroupRequest) returns (SyncGroupResponse);
+
+    // Send heartbeat
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+    // Leave the group
+    rpc LeaveGroup(LeaveGroupRequest) returns (LeaveGroupResponse);
+
+    // Commit offsets
+    rpc OffsetCommit(OffsetCommitRequest) returns (OffsetCommitResponse);
+
+    // Fetch committed offsets
+    rpc OffsetFetch(OffsetFetchRequest) returns (OffsetFetchResponse);
+}
+
+// Inter-Broker Replication Service
+service ReplicationService {
+    // Follower fetches from leader
+    rpc ReplicaFetch(ReplicaFetchRequest) returns (ReplicaFetchResponse);
+
+    // Controller commands
+    rpc LeaderAndIsr(LeaderAndIsrRequest) returns (LeaderAndIsrResponse);
+
+    // Update metadata
+    rpc UpdateMetadata(UpdateMetadataRequest) returns (UpdateMetadataResponse);
+}
+
+// ============================================================================
+// Produce API
+// ============================================================================
+
+message ProduceRequest {
+    optional string transactional_id = 1;
+    int32 acks = 2;
+    uint32 timeout_ms = 3;
+    repeated TopicProduceData topic_data = 4;
+    // Idempotent producer fields
+    int64 producer_id = 5;
+    int32 producer_epoch = 6;
+}
+
+message TopicProduceData {
+    string topic = 1;
+    repeated PartitionProduceData partition_data = 2;
+}
+
+message PartitionProduceData {
+    uint32 partition = 1;
+    RecordBatch records = 2;
+    // Idempotent sequence tracking
+    uint32 first_sequence = 3;
+}
+
+message ProduceResponse {
+    repeated TopicProduceResponse responses = 1;
+    uint32 throttle_time_ms = 2;
+}
+
+message TopicProduceResponse {
+    string topic = 1;
+    repeated PartitionProduceResponse partition_responses = 2;
+}
+
+message PartitionProduceResponse {
+    uint32 partition = 1;
+    int32 error_code = 2;
+    uint64 base_offset = 3;
+    int64 log_append_time = 4;
+}
+
+// ============================================================================
+// Fetch API
+// ============================================================================
+
+message FetchRequest {
+    int32 replica_id = 1;  // -1 for consumers
+    uint32 max_wait_ms = 2;
+    uint32 min_bytes = 3;
+    uint32 max_bytes = 4;
+    int32 isolation_level = 5;
+    int32 session_id = 6;
+    int32 session_epoch = 7;
+    repeated FetchTopic topics = 8;
+}
+
+message FetchTopic {
+    string topic = 1;
+    repeated FetchPartition partitions = 2;
+}
+
+message FetchPartition {
+    uint32 partition = 1;
+    uint64 fetch_offset = 2;
+    uint32 max_bytes = 3;
+}
+
+message FetchResponse {
+    uint32 throttle_time_ms = 1;
+    int32 error_code = 2;
+    int32 session_id = 3;
+    repeated FetchTopicResponse responses = 4;
+}
+
+message FetchTopicResponse {
+    string topic = 1;
+    repeated FetchPartitionResponse partitions = 2;
+}
+
+message FetchPartitionResponse {
+    uint32 partition = 1;
+    int32 error_code = 2;
+    uint64 high_watermark = 3;
+    uint64 last_stable_offset = 4;
+    uint64 log_start_offset = 5;
+    repeated RecordBatch record_batches = 6;
+}
+
+// ============================================================================
+// Metadata API
+// ============================================================================
+
+message MetadataRequest {
+    repeated string topics = 1;  // Empty for all topics
+    bool allow_auto_topic_creation = 2;
+}
+
+message MetadataResponse {
+    uint32 throttle_time_ms = 1;
+    repeated BrokerMetadata brokers = 2;
+    optional string cluster_id = 3;
+    int32 controller_id = 4;
+    repeated TopicMetadata topics = 5;
+}
+
+message BrokerMetadata {
+    int32 node_id = 1;
+    string host = 2;
+    uint32 port = 3;
+    optional string rack = 4;
+}
+
+message TopicMetadata {
+    int32 error_code = 1;
+    string name = 2;
+    bool is_internal = 3;
+    repeated PartitionMetadata partitions = 4;
+}
+
+message PartitionMetadata {
+    int32 error_code = 1;
+    uint32 partition = 2;
+    int32 leader = 3;
+    int32 leader_epoch = 4;
+    repeated int32 replicas = 5;
+    repeated int32 isr = 6;
+}
+
+// ============================================================================
+// ListOffsets API
+// ============================================================================
+
+message ListOffsetsRequest {
+    int32 replica_id = 1;
+    int32 isolation_level = 2;
+    repeated ListOffsetsTopic topics = 3;
+}
+
+message ListOffsetsTopic {
+    string topic = 1;
+    repeated ListOffsetsPartition partitions = 2;
+}
+
+message ListOffsetsPartition {
+    uint32 partition = 1;
+    int64 timestamp = 2;  // -1 for latest, -2 for earliest
+}
+
+message ListOffsetsResponse {
+    uint32 throttle_time_ms = 1;
+    repeated ListOffsetsTopicResponse topics = 2;
+}
+
+message ListOffsetsTopicResponse {
+    string topic = 1;
+    repeated ListOffsetsPartitionResponse partitions = 2;
+}
+
+message ListOffsetsPartitionResponse {
+    uint32 partition = 1;
+    int32 error_code = 2;
+    int64 timestamp = 3;
+    uint64 offset = 4;
+}
+
+// ============================================================================
+// Consumer Group API
+// ============================================================================
+
+message JoinGroupRequest {
+    string group_id = 1;
+    uint32 session_timeout_ms = 2;
+    uint32 rebalance_timeout_ms = 3;
+    string member_id = 4;
+    string protocol_type = 5;
+    repeated JoinGroupProtocol protocols = 6;
+}
+
+message JoinGroupProtocol {
+    string name = 1;
+    bytes metadata = 2;
+}
+
+message JoinGroupResponse {
+    uint32 throttle_time_ms = 1;
+    int32 error_code = 2;
+    int32 generation_id = 3;
+    string protocol_name = 4;
+    string leader = 5;
+    string member_id = 6;
+    repeated JoinGroupMember members = 7;
+}
+
+message JoinGroupMember {
+    string member_id = 1;
+    bytes metadata = 2;
+}
+
+message SyncGroupRequest {
+    string group_id = 1;
+    int32 generation_id = 2;
+    string member_id = 3;
+    repeated SyncGroupAssignment assignments = 4;
+}
+
+message SyncGroupAssignment {
+    string member_id = 1;
+    bytes assignment = 2;
+}
+
+message SyncGroupResponse {
+    uint32 throttle_time_ms = 1;
+    int32 error_code = 2;
+    bytes assignment = 3;
+}
+
+message HeartbeatRequest {
+    string group_id = 1;
+    int32 generation_id = 2;
+    string member_id = 3;
+}
+
+message HeartbeatResponse {
+    uint32 throttle_time_ms = 1;
+    int32 error_code = 2;
+}
+
+message LeaveGroupRequest {
+    string group_id = 1;
+    string member_id = 2;
+}
+
+message LeaveGroupResponse {
+    uint32 throttle_time_ms = 1;
+    int32 error_code = 2;
+}
+
+// ============================================================================
+// Offset Management API
+// ============================================================================
+
+message OffsetCommitRequest {
+    string group_id = 1;
+    int32 generation_id = 2;
+    string member_id = 3;
+    repeated OffsetCommitTopic topics = 4;
+}
+
+message OffsetCommitTopic {
+    string topic = 1;
+    repeated OffsetCommitPartition partitions = 2;
+}
+
+message OffsetCommitPartition {
+    uint32 partition = 1;
+    uint64 offset = 2;
+    string metadata = 3;
+}
+
+message OffsetCommitResponse {
+    uint32 throttle_time_ms = 1;
+    repeated OffsetCommitTopicResponse topics = 2;
+}
+
+message OffsetCommitTopicResponse {
+    string topic = 1;
+    repeated OffsetCommitPartitionResponse partitions = 2;
+}
+
+message OffsetCommitPartitionResponse {
+    uint32 partition = 1;
+    int32 error_code = 2;
+}
+
+message OffsetFetchRequest {
+    string group_id = 1;
+    repeated OffsetFetchTopic topics = 2;
+}
+
+message OffsetFetchTopic {
+    string topic = 1;
+    repeated uint32 partitions = 2;
+}
+
+message OffsetFetchResponse {
+    uint32 throttle_time_ms = 1;
+    repeated OffsetFetchTopicResponse topics = 2;
+    int32 error_code = 3;
+}
+
+message OffsetFetchTopicResponse {
+    string topic = 1;
+    repeated OffsetFetchPartitionResponse partitions = 2;
+}
+
+message OffsetFetchPartitionResponse {
+    uint32 partition = 1;
+    uint64 offset = 2;
+    string metadata = 3;
+    int32 error_code = 4;
+}
+
+// ============================================================================
+// Replication API
+// ============================================================================
+
+message ReplicaFetchRequest {
+    int32 replica_id = 1;
+    uint32 max_wait_ms = 2;
+    uint32 min_bytes = 3;
+    repeated ReplicaFetchTopic topics = 4;
+}
+
+message ReplicaFetchTopic {
+    string topic = 1;
+    repeated ReplicaFetchPartition partitions = 2;
+}
+
+message ReplicaFetchPartition {
+    uint32 partition = 1;
+    uint64 fetch_offset = 2;
+    int32 leader_epoch = 3;
+}
+
+message ReplicaFetchResponse {
+    uint32 throttle_time_ms = 1;
+    int32 error_code = 2;
+    repeated ReplicaFetchTopicResponse responses = 3;
+}
+
+message ReplicaFetchTopicResponse {
+    string topic = 1;
+    repeated ReplicaFetchPartitionResponse partitions = 2;
+}
+
+message ReplicaFetchPartitionResponse {
+    uint32 partition = 1;
+    int32 error_code = 2;
+    uint64 high_watermark = 3;
+    int32 leader_epoch = 4;
+    uint64 log_start_offset = 5;
+    repeated RecordBatch record_batches = 6;
+}
+
+message LeaderAndIsrRequest {
+    int32 controller_id = 1;
+    int32 controller_epoch = 2;
+    repeated PartitionLeaderAndIsr partition_states = 3;
+    repeated LiveBroker live_brokers = 4;
+}
+
+message PartitionLeaderAndIsr {
+    string topic = 1;
+    uint32 partition = 2;
+    int32 leader = 3;
+    int32 leader_epoch = 4;
+    repeated int32 isr = 5;
+    repeated int32 replicas = 6;
+}
+
+message LiveBroker {
+    int32 id = 1;
+    string host = 2;
+    uint32 port = 3;
+}
+
+message LeaderAndIsrResponse {
+    int32 error_code = 1;
+    repeated PartitionLeaderAndIsrResponse partitions = 2;
+}
+
+message PartitionLeaderAndIsrResponse {
+    string topic = 1;
+    uint32 partition = 2;
+    int32 error_code = 3;
+}
+
+message UpdateMetadataRequest {
+    int32 controller_id = 1;
+    int32 controller_epoch = 2;
+    repeated PartitionMetadataUpdate partition_states = 3;
+    repeated LiveBroker live_brokers = 4;
+}
+
+message PartitionMetadataUpdate {
+    string topic = 1;
+    uint32 partition = 2;
+    int32 leader = 3;
+    int32 leader_epoch = 4;
+    repeated int32 isr = 5;
+    repeated int32 replicas = 6;
+}
+
+message UpdateMetadataResponse {
+    int32 error_code = 1;
+}
+
+// ============================================================================
+// Common Types
+// ============================================================================
+
+message RecordBatch {
+    int64 base_offset = 1;
+    int32 partition_leader_epoch = 2;
+    int64 first_timestamp = 3;
+    int64 max_timestamp = 4;
+    int64 producer_id = 5;
+    int32 producer_epoch = 6;
+    int32 first_sequence = 7;
+    repeated Record records = 8;
+}
+
+message Record {
+    int32 attributes = 1;
+    int64 timestamp_delta = 2;
+    int32 offset_delta = 3;
+    optional bytes key = 4;
+    optional bytes value = 5;
+    repeated Header headers = 6;
+}
+
+message Header {
+    string key = 1;
+    bytes value = 2;
+}

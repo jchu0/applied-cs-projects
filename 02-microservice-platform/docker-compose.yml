@@ -1,0 +1,341 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database for User Service
+  postgres-user:
+    image: postgres:15-alpine
+    container_name: microservices-postgres-user
+    environment:
+      POSTGRES_USER: userservice
+      POSTGRES_PASSWORD: userservice_pass
+      POSTGRES_DB: users
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-user-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U userservice -d users"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL database for Auth Service
+  postgres-auth:
+    image: postgres:15-alpine
+    container_name: microservices-postgres-auth
+    environment:
+      POSTGRES_USER: authservice
+      POSTGRES_PASSWORD: authservice_pass
+      POSTGRES_DB: auth
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-auth-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authservice -d auth"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL database for Billing Service
+  postgres-billing:
+    image: postgres:15-alpine
+    container_name: microservices-postgres-billing
+    environment:
+      POSTGRES_USER: billingservice
+      POSTGRES_PASSWORD: billingservice_pass
+      POSTGRES_DB: billing
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres-billing-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U billingservice -d billing"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for sessions and caching
+  redis:
+    image: redis:7-alpine
+    container_name: microservices-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # NATS message broker
+  nats:
+    image: nats:2.10-alpine
+    container_name: microservices-nats
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP management
+      - "6222:6222"   # Cluster routing
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    container_name: microservices-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "5775:5775/udp"   # Agent zipkin.thrift
+      - "6831:6831/udp"   # Agent jaeger.thrift
+      - "6832:6832/udp"   # Agent jaeger.thrift binary
+      - "5778:5778"       # Agent configs
+      - "16686:16686"     # Query UI
+      - "14268:14268"     # Collector HTTP
+      - "14250:14250"     # Collector gRPC
+      - "4317:4317"       # OTLP gRPC
+      - "4318:4318"       # OTLP HTTP
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:16686"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: microservices-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/docker/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Grafana for dashboards
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: microservices-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: false
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # User Service
+  user-service:
+    build:
+      context: ./services/user-service
+      dockerfile: Dockerfile
+    container_name: microservices-user
+    ports:
+      - "8081:8080"   # HTTP
+      - "9091:9090"   # gRPC
+    environment:
+      DATABASE_URL: postgres://userservice:userservice_pass@postgres-user:5432/users?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+      JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+      SERVICE_NAME: user-service
+      GRPC_PORT: 9090
+      HTTP_PORT: 8080
+    depends_on:
+      postgres-user:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    profiles:
+      - services
+
+  # Auth Service
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: microservices-auth
+    ports:
+      - "8082:8080"   # HTTP
+      - "9092:9090"   # gRPC
+    environment:
+      DATABASE_URL: postgres://authservice:authservice_pass@postgres-auth:5432/auth?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+      JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+      USER_SERVICE_ADDR: user-service:9090
+      SERVICE_NAME: auth-service
+      GRPC_PORT: 9090
+      HTTP_PORT: 8080
+      JWT_PRIVATE_KEY_PATH: /app/keys/private.pem
+      JWT_PUBLIC_KEY_PATH: /app/keys/public.pem
+      JWT_ISSUER: microservices-platform
+      JWT_AUDIENCE: microservices-api
+    depends_on:
+      postgres-auth:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    profiles:
+      - services
+
+  # Billing Service
+  billing-service:
+    build:
+      context: ./services/billing-service
+      dockerfile: Dockerfile
+    container_name: microservices-billing
+    ports:
+      - "8083:8080"   # HTTP
+      - "9093:9090"   # gRPC
+    environment:
+      DATABASE_URL: postgres://billingservice:billingservice_pass@postgres-billing:5432/billing?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+      JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-sk_test_placeholder}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_placeholder}
+      SERVICE_NAME: billing-service
+      GRPC_PORT: 9090
+      HTTP_PORT: 8080
+    depends_on:
+      postgres-billing:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    profiles:
+      - services
+
+  # Notification Service (Python)
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    container_name: microservices-notification
+    ports:
+      - "8084:8080"   # HTTP
+      - "9094:9090"   # gRPC
+    environment:
+      NATS_URL: nats://nats:4222
+      REDIS_URL: redis://redis:6379
+      JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-placeholder}
+      SERVICE_NAME: notification-service
+      GRPC_PORT: 9090
+      HTTP_PORT: 8080
+    depends_on:
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    profiles:
+      - services
+
+  # Kong API Gateway Database
+  kong-database:
+    image: postgres:15-alpine
+    container_name: microservices-kong-db
+    environment:
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kong
+      POSTGRES_DB: kong
+    volumes:
+      - kong-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kong -d kong"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kong migrations
+  kong-migrations:
+    image: kong:3.5
+    container_name: microservices-kong-migrations
+    command: kong migrations bootstrap
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-database
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong
+      KONG_PG_DATABASE: kong
+    depends_on:
+      kong-database:
+        condition: service_healthy
+    restart: on-failure
+
+  # Kong API Gateway
+  kong:
+    image: kong:3.5
+    container_name: microservices-kong
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: kong-database
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kong
+      KONG_PG_DATABASE: kong
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_ADMIN_GUI_URL: http://localhost:8002
+      KONG_PROXY_LISTEN: 0.0.0.0:8000, 0.0.0.0:8443 ssl
+    ports:
+      - "8000:8000"   # Proxy HTTP
+      - "8443:8443"   # Proxy HTTPS
+      - "8001:8001"   # Admin API
+      - "8002:8002"   # Admin GUI
+    depends_on:
+      kong-database:
+        condition: service_healthy
+      kong-migrations:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+volumes:
+  postgres-user-data:
+  postgres-auth-data:
+  postgres-billing-data:
+  kong-data:
+  redis-data:
+  nats-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  default:
+    name: microservices-network

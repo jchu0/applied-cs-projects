@@ -1,0 +1,6 @@
+# Building a freestanding kernel needs the nightly toolchain: the kernel uses
+# unstable features (abi_x86_interrupt, alloc_error_handler, naked_functions)
+# and `-Z build-std`, and `bootimage` needs the llvm-tools.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools-preview"]

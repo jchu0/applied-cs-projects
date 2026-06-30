@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: microservice-platform
+  labels:
+    app.kubernetes.io/name: microservice-platform
+    app.kubernetes.io/component: namespace
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: microservice-sa
+  namespace: microservice-platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: microservice-role
+  namespace: microservice-platform
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: microservice-rolebinding
+  namespace: microservice-platform
+subjects:
+  - kind: ServiceAccount
+    name: microservice-sa
+    namespace: microservice-platform
+roleRef:
+  kind: Role
+  name: microservice-role
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,17 @@
+[package]
+name = "gpu-gemm-optimization"
+version = "0.1.0"
+edition = "2021"
+description = "GPU GEMM kernel optimization patterns (CPU simulation for concepts)"
+
+[dependencies]
+rayon = "1"
+rand = "0.8"
+thiserror = "1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "gemm_benchmarks"
+harness = false

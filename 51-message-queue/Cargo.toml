@@ -1,0 +1,73 @@
+[package]
+name = "message-queue"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance message queue with persistence and consumer groups"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mq-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "sync", "time", "fs", "io-util"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+bytes = { version = "1", features = ["serde"] }
+
+# IDs and hashing
+uuid = { version = "1", features = ["v4", "serde"] }
+crc32fast = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Compression
+lz4_flex = "0.11"
+flate2 = "1"
+snap = "1"
+
+# Concurrency
+parking_lot = "0.12"
+crossbeam = "0.8"
+dashmap = "5"
+
+# Memory mapping
+memmap2 = "0.9"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1.0.149"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = "0.5"
+proptest = "1"
+tokio-test = "0.4"
+rand = "0.8"
+fake = "2"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+lto = true
+codegen-units = 1

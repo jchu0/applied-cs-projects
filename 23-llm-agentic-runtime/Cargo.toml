@@ -1,0 +1,26 @@
+[package]
+name = "llm-agentic-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Production-grade agent runtime for LLM-powered autonomous systems"
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+# Raw-HTTP Anthropic client (Rust has no official SDK). rustls avoids a system
+# OpenSSL dependency.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# HTTP server for the REST API.
+axum = "0.7"
+
+[dev-dependencies]
+tempfile = "3.24.0"
+tokio-test = "0.4"
+futures = "0.3"
+tower = { version = "0.5", features = ["util"] }

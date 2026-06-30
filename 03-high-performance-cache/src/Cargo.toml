@@ -1,0 +1,67 @@
+[package]
+name = "redis-lite"
+version = "0.1.0"
+edition = "2021"
+authors = ["ML AI Platform Team"]
+description = "A high-performance Redis-compatible caching layer"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+mio = { version = "0.8", features = ["os-poll", "net"] }
+
+# Serialization
+bytes = "1.5"
+
+# Utilities
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Performance
+parking_lot = "0.12"
+dashmap = "5.5"
+crossbeam = "0.8"
+
+# Random for skip list
+rand = "0.8"
+
+# Time handling
+chrono = "0.4"
+
+# Configuration
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Hashing
+seahash = "4.1"
+crc = "3.0"
+sha1 = "0.10"
+hex = "0.4"
+
+# TLS
+rustls = "0.23"
+rustls-pemfile = "2.1"
+
+[lib]
+name = "redis_lite"
+path = "lib.rs"
+
+[[bin]]
+name = "redis-lite"
+path = "bin/main.rs"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug = true

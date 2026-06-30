@@ -1,0 +1,269 @@
+syntax = "proto3";
+
+package notification.v1;
+
+option go_package = "github.com/mlai/microservice-platform/pkg/pb/notification/v1;notificationv1";
+
+import "google/protobuf/timestamp.proto";
+import "common/v1/common.proto";
+
+// NotificationService provides notification delivery
+service NotificationService {
+  // SendNotification sends a notification
+  rpc SendNotification(SendNotificationRequest) returns (SendNotificationResponse);
+
+  // SendBulkNotification sends notifications to multiple recipients
+  rpc SendBulkNotification(SendBulkNotificationRequest) returns (SendBulkNotificationResponse);
+
+  // GetNotification retrieves notification status
+  rpc GetNotification(GetNotificationRequest) returns (GetNotificationResponse);
+
+  // ListNotifications lists notifications for a recipient
+  rpc ListNotifications(ListNotificationsRequest) returns (ListNotificationsResponse);
+
+  // CreateTemplate creates a notification template
+  rpc CreateTemplate(CreateTemplateRequest) returns (CreateTemplateResponse);
+
+  // GetTemplate retrieves a template
+  rpc GetTemplate(GetTemplateRequest) returns (GetTemplateResponse);
+
+  // UpdateTemplate updates a template
+  rpc UpdateTemplate(UpdateTemplateRequest) returns (UpdateTemplateResponse);
+
+  // DeleteTemplate deletes a template
+  rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
+
+  // ListTemplates lists all templates
+  rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
+
+  // UpdatePreferences updates user notification preferences
+  rpc UpdatePreferences(UpdatePreferencesRequest) returns (UpdatePreferencesResponse);
+
+  // GetPreferences retrieves user notification preferences
+  rpc GetPreferences(GetPreferencesRequest) returns (GetPreferencesResponse);
+}
+
+// Channel types for notifications
+enum Channel {
+  CHANNEL_UNSPECIFIED = 0;
+  CHANNEL_EMAIL = 1;
+  CHANNEL_SMS = 2;
+  CHANNEL_PUSH = 3;
+  CHANNEL_WEBHOOK = 4;
+  CHANNEL_IN_APP = 5;
+}
+
+// DeliveryStatus for notifications
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  DELIVERY_STATUS_PENDING = 1;
+  DELIVERY_STATUS_SENT = 2;
+  DELIVERY_STATUS_DELIVERED = 3;
+  DELIVERY_STATUS_FAILED = 4;
+  DELIVERY_STATUS_BOUNCED = 5;
+  DELIVERY_STATUS_OPENED = 6;
+  DELIVERY_STATUS_CLICKED = 7;
+}
+
+// Priority levels
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW = 1;
+  PRIORITY_NORMAL = 2;
+  PRIORITY_HIGH = 3;
+  PRIORITY_URGENT = 4;
+}
+
+// Notification represents a notification
+message Notification {
+  string id = 1;
+  string tenant_id = 2;
+  string recipient_id = 3;
+  string template_id = 4;
+  Channel channel = 5;
+  string subject = 6;
+  string content = 7;
+  DeliveryStatus status = 8;
+  Priority priority = 9;
+  map<string, string> variables = 10;
+  map<string, string> metadata = 11;
+  google.protobuf.Timestamp scheduled_at = 12;
+  google.protobuf.Timestamp sent_at = 13;
+  google.protobuf.Timestamp delivered_at = 14;
+  google.protobuf.Timestamp created_at = 15;
+  string error_message = 16;
+}
+
+// Template represents a notification template
+message Template {
+  string id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  string description = 4;
+  Channel channel = 5;
+  string subject_template = 6;
+  string content_template = 7;
+  repeated string variables = 8;  // Required variables
+  bool is_active = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+// NotificationPreferences for a user
+message NotificationPreferences {
+  string user_id = 1;
+  string tenant_id = 2;
+  bool email_enabled = 3;
+  bool sms_enabled = 4;
+  bool push_enabled = 5;
+  bool in_app_enabled = 6;
+  repeated string unsubscribed_categories = 7;
+  map<string, bool> channel_preferences = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+// Request/Response messages
+
+message SendNotificationRequest {
+  string tenant_id = 1;
+  string recipient_id = 2;
+  Channel channel = 3;
+  oneof content_source {
+    string template_id = 4;
+    DirectContent direct = 5;
+  }
+  map<string, string> variables = 6;
+  Priority priority = 7;
+  google.protobuf.Timestamp scheduled_at = 8;
+  map<string, string> metadata = 9;
+}
+
+message DirectContent {
+  string subject = 1;
+  string body = 2;
+}
+
+message SendNotificationResponse {
+  string notification_id = 1;
+  DeliveryStatus status = 2;
+}
+
+message SendBulkNotificationRequest {
+  string tenant_id = 1;
+  repeated string recipient_ids = 2;
+  Channel channel = 3;
+  string template_id = 4;
+  map<string, string> variables = 5;
+  Priority priority = 6;
+  google.protobuf.Timestamp scheduled_at = 7;
+}
+
+message SendBulkNotificationResponse {
+  int32 queued_count = 1;
+  int32 failed_count = 2;
+  repeated string failed_recipients = 3;
+}
+
+message GetNotificationRequest {
+  string tenant_id = 1;
+  string notification_id = 2;
+}
+
+message GetNotificationResponse {
+  Notification notification = 1;
+}
+
+message ListNotificationsRequest {
+  string tenant_id = 1;
+  string recipient_id = 2;
+  common.v1.PaginationRequest pagination = 3;
+  Channel channel_filter = 4;
+  DeliveryStatus status_filter = 5;
+}
+
+message ListNotificationsResponse {
+  repeated Notification notifications = 1;
+  common.v1.PaginationResponse pagination = 2;
+}
+
+message CreateTemplateRequest {
+  string tenant_id = 1;
+  string name = 2;
+  string description = 3;
+  Channel channel = 4;
+  string subject_template = 5;
+  string content_template = 6;
+  repeated string variables = 7;
+}
+
+message CreateTemplateResponse {
+  Template template = 1;
+}
+
+message GetTemplateRequest {
+  string tenant_id = 1;
+  string template_id = 2;
+}
+
+message GetTemplateResponse {
+  Template template = 1;
+}
+
+message UpdateTemplateRequest {
+  string tenant_id = 1;
+  string template_id = 2;
+  string name = 3;
+  string description = 4;
+  string subject_template = 5;
+  string content_template = 6;
+  repeated string variables = 7;
+  bool is_active = 8;
+}
+
+message UpdateTemplateResponse {
+  Template template = 1;
+}
+
+message DeleteTemplateRequest {
+  string tenant_id = 1;
+  string template_id = 2;
+}
+
+message DeleteTemplateResponse {
+  bool success = 1;
+}
+
+message ListTemplatesRequest {
+  string tenant_id = 1;
+  common.v1.PaginationRequest pagination = 2;
+  Channel channel_filter = 3;
+  bool active_only = 4;
+}
+
+message ListTemplatesResponse {
+  repeated Template templates = 1;
+  common.v1.PaginationResponse pagination = 2;
+}
+
+message UpdatePreferencesRequest {
+  string tenant_id = 1;
+  string user_id = 2;
+  bool email_enabled = 3;
+  bool sms_enabled = 4;
+  bool push_enabled = 5;
+  bool in_app_enabled = 6;
+  repeated string unsubscribed_categories = 7;
+}
+
+message UpdatePreferencesResponse {
+  NotificationPreferences preferences = 1;
+}
+
+message GetPreferencesRequest {
+  string tenant_id = 1;
+  string user_id = 2;
+}
+
+message GetPreferencesResponse {
+  NotificationPreferences preferences = 1;
+}

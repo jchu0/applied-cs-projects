@@ -1,0 +1,36 @@
+[package]
+name = "distributed-log-system"
+version = "0.1.0"
+edition = "2021"
+description = "High-throughput distributed commit log system (Kafka-lite)"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+memmap2 = "0.5"
+crc32fast = "1"
+lz4 = "1"
+dashmap = "5"
+crossbeam = "0.8"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+rand = "0.8"
+bytemuck = { version = "1", features = ["derive"] }
+tonic = "0.9"
+prost = "0.11"
+async-trait = "0.1"
+
+[build-dependencies]
+tonic-build = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "kafka_benchmarks"
+harness = false

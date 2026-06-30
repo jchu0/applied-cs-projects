@@ -1,0 +1,160 @@
+syntax = "proto3";
+
+package notification.v1;
+
+import "common/common.proto";
+
+option go_package = "github.com/project/microservices/proto/notification/v1;notificationpb";
+
+service NotificationService {
+    // Send sends a notification
+    rpc Send(SendRequest) returns (SendResponse);
+
+    // SendBatch sends multiple notifications
+    rpc SendBatch(SendBatchRequest) returns (SendBatchResponse);
+
+    // GetNotification retrieves notification status
+    rpc GetNotification(GetNotificationRequest) returns (GetNotificationResponse);
+
+    // ListNotifications lists notifications for a user
+    rpc ListNotifications(ListNotificationsRequest) returns (ListNotificationsResponse);
+
+    // UpdatePreferences updates user notification preferences
+    rpc UpdatePreferences(UpdatePreferencesRequest) returns (UpdatePreferencesResponse);
+
+    // GetPreferences retrieves user notification preferences
+    rpc GetPreferences(GetPreferencesRequest) returns (GetPreferencesResponse);
+}
+
+// Channel represents notification delivery channel
+enum Channel {
+    CHANNEL_UNSPECIFIED = 0;
+    CHANNEL_EMAIL = 1;
+    CHANNEL_SMS = 2;
+    CHANNEL_PUSH = 3;
+    CHANNEL_WEBHOOK = 4;
+    CHANNEL_IN_APP = 5;
+}
+
+// DeliveryStatus represents notification delivery status
+enum DeliveryStatus {
+    DELIVERY_STATUS_UNSPECIFIED = 0;
+    DELIVERY_STATUS_PENDING = 1;
+    DELIVERY_STATUS_SENT = 2;
+    DELIVERY_STATUS_DELIVERED = 3;
+    DELIVERY_STATUS_FAILED = 4;
+    DELIVERY_STATUS_BOUNCED = 5;
+    DELIVERY_STATUS_OPTED_OUT = 6;
+}
+
+// Notification represents a notification
+message Notification {
+    string id = 1;
+    string tenant_id = 2;
+    string recipient_id = 3;
+    string template_id = 4;
+    Channel channel = 5;
+    DeliveryStatus status = 6;
+    map<string, string> variables = 7;
+    int32 priority = 8;
+    string scheduled_at = 9;
+    string sent_at = 10;
+    string delivered_at = 11;
+    string error_message = 12;
+    map<string, string> metadata = 13;
+    string created_at = 14;
+}
+
+// Template represents a notification template
+message Template {
+    string id = 1;
+    string tenant_id = 2;
+    string name = 3;
+    Channel channel = 4;
+    string subject = 5;
+    string body = 6;
+    map<string, string> default_variables = 7;
+    bool active = 8;
+}
+
+message SendRequest {
+    string tenant_id = 1;
+    string recipient_id = 2;
+    string template_id = 3;
+    Channel channel = 4;
+    map<string, string> variables = 5;
+    int32 priority = 6;
+    string scheduled_at = 7;
+    map<string, string> metadata = 8;
+}
+
+message SendResponse {
+    string notification_id = 1;
+    DeliveryStatus status = 2;
+}
+
+message SendBatchRequest {
+    string tenant_id = 1;
+    repeated SendRequest notifications = 2;
+}
+
+message SendBatchResponse {
+    repeated SendResponse results = 1;
+    int32 success_count = 2;
+    int32 failure_count = 3;
+}
+
+message GetNotificationRequest {
+    string notification_id = 1;
+    string tenant_id = 2;
+}
+
+message GetNotificationResponse {
+    Notification notification = 1;
+}
+
+message ListNotificationsRequest {
+    string tenant_id = 1;
+    string recipient_id = 2;
+    common.v1.PaginationRequest pagination = 3;
+    Channel channel_filter = 4;
+    DeliveryStatus status_filter = 5;
+}
+
+message ListNotificationsResponse {
+    repeated Notification notifications = 1;
+    common.v1.PaginationResponse pagination = 2;
+}
+
+// Preferences for notification delivery
+message NotificationPreferences {
+    string user_id = 1;
+    string tenant_id = 2;
+    bool email_enabled = 3;
+    bool sms_enabled = 4;
+    bool push_enabled = 5;
+    bool in_app_enabled = 6;
+    repeated string unsubscribed_categories = 7;
+    string quiet_hours_start = 8;  // HH:MM format
+    string quiet_hours_end = 9;
+    string timezone = 10;
+}
+
+message UpdatePreferencesRequest {
+    string user_id = 1;
+    string tenant_id = 2;
+    NotificationPreferences preferences = 3;
+}
+
+message UpdatePreferencesResponse {
+    NotificationPreferences preferences = 1;
+}
+
+message GetPreferencesRequest {
+    string user_id = 1;
+    string tenant_id = 2;
+}
+
+message GetPreferencesResponse {
+    NotificationPreferences preferences = 1;
+}

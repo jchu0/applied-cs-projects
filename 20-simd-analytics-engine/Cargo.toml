@@ -1,0 +1,23 @@
+[package]
+name = "simd-analytics-engine"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance columnar analytics engine with SIMD vectorization"
+
+[dependencies]
+rayon = "1"
+thiserror = "1"
+rand = "0.8"
+num-traits = "0.2"
+parking_lot = "0.12"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "simd_benchmarks"
+harness = false
+
+[features]
+default = []
+avx2 = []

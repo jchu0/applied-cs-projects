@@ -1,0 +1,212 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: microservice-platform
+data:
+  config.yaml: |
+    service:
+      name: api-gateway
+      environment: production
+      http_port: 8080
+      log_level: info
+      timeout: 30s
+
+    services:
+      user_service: user-service:9090
+      auth_service: auth-service:9091
+      billing_service: billing-service:9092
+      notification_service: notification-service:9093
+
+    redis:
+      host: redis-master
+      port: 6379
+      db: 2
+
+    jwt:
+      public_key_path: /etc/secrets/jwt/public.pem
+      issuer: microservice-platform
+      audience: microservice-platform
+      public_routes:
+        - /api/v1/auth/login
+        - /api/v1/auth/register
+        - /api/v1/auth/refresh
+        - /api/v1/health
+        - /health
+
+    rate_limit:
+      enabled: true
+      requests_per_min: 100
+      burst_size: 20
+
+    tracing:
+      enabled: true
+      jaeger_url: http://jaeger-collector:14268/api/traces
+      sampling_rate: 0.1
+
+    metrics:
+      enabled: true
+      port: 8080
+      path: /metrics
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-service-config
+  namespace: microservice-platform
+data:
+  config.yaml: |
+    service:
+      name: user-service
+      environment: production
+      grpc_port: 9090
+      http_port: 8090
+      log_level: info
+      timeout: 30s
+
+    database:
+      host: postgres-postgresql
+      port: 5432
+      database: users
+      ssl_mode: require
+      max_conns: 25
+      min_conns: 5
+      max_conn_lifetime: 5m
+
+    redis:
+      host: redis-master
+      port: 6379
+      db: 0
+
+    nats:
+      url: nats://nats:4222
+      cluster_id: microservice-cluster
+      client_id: user-service
+
+    tracing:
+      enabled: true
+      jaeger_url: http://jaeger-collector:14268/api/traces
+      sampling_rate: 0.1
+
+    metrics:
+      enabled: true
+      port: 8090
+      path: /metrics
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-service-config
+  namespace: microservice-platform
+data:
+  config.yaml: |
+    service:
+      name: auth-service
+      environment: production
+      grpc_port: 9091
+      http_port: 8091
+      log_level: info
+      timeout: 30s
+
+    database:
+      host: postgres-postgresql
+      port: 5432
+      database: auth
+      ssl_mode: require
+      max_conns: 25
+
+    redis:
+      host: redis-master
+      port: 6379
+      db: 1
+
+    jwt:
+      private_key_path: /etc/secrets/jwt/private.pem
+      public_key_path: /etc/secrets/jwt/public.pem
+      access_token_expiry: 15m
+      refresh_token_expiry: 168h
+      issuer: microservice-platform
+
+    nats:
+      url: nats://nats:4222
+      cluster_id: microservice-cluster
+      client_id: auth-service
+
+    tracing:
+      enabled: true
+      jaeger_url: http://jaeger-collector:14268/api/traces
+      sampling_rate: 0.1
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-service-config
+  namespace: microservice-platform
+data:
+  config.yaml: |
+    service:
+      name: billing-service
+      environment: production
+      grpc_port: 9092
+      http_port: 8092
+      log_level: info
+      timeout: 30s
+
+    database:
+      host: postgres-postgresql
+      port: 5432
+      database: billing
+      ssl_mode: require
+      max_conns: 25
+
+    redis:
+      host: redis-master
+      port: 6379
+      db: 3
+
+    nats:
+      url: nats://nats:4222
+      cluster_id: microservice-cluster
+      client_id: billing-service
+
+    tracing:
+      enabled: true
+      jaeger_url: http://jaeger-collector:14268/api/traces
+      sampling_rate: 0.1
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notification-service-config
+  namespace: microservice-platform
+data:
+  config.yaml: |
+    service:
+      name: notification-service
+      environment: production
+      grpc_port: 9093
+      http_port: 8093
+      log_level: info
+      timeout: 30s
+
+    database:
+      host: postgres-postgresql
+      port: 5432
+      database: notifications
+      ssl_mode: require
+      max_conns: 25
+
+    redis:
+      host: redis-master
+      port: 6379
+      db: 4
+
+    nats:
+      url: nats://nats:4222
+      cluster_id: microservice-cluster
+      client_id: notification-service
+
+    tracing:
+      enabled: true
+      jaeger_url: http://jaeger-collector:14268/api/traces
+      sampling_rate: 0.1

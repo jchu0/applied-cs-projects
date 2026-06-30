@@ -1,0 +1,134 @@
+version: '3.8'
+
+services:
+  # PostgreSQL for User Service
+  postgres-users:
+    image: postgres:15-alpine
+    container_name: microservice-postgres-users
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: users
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-users-data:/var/lib/postgresql/data
+      - ../migrations/user:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL for Auth Service
+  postgres-auth:
+    image: postgres:15-alpine
+    container_name: microservice-postgres-auth
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: auth
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-auth-data:/var/lib/postgresql/data
+      - ../migrations/auth:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for Sessions and Caching
+  redis:
+    image: redis:7-alpine
+    container_name: microservice-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # User Service
+  user-service:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.user
+    container_name: microservice-user-service
+    environment:
+      GRPC_PORT: "9090"
+      HTTP_PORT: "8080"
+      DATABASE_URL: postgres://postgres:postgres@postgres-users:5432/users?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      ENVIRONMENT: development
+    ports:
+      - "9090:9090"
+      - "8080:8080"
+    depends_on:
+      postgres-users:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Auth Service
+  auth-service:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.auth
+    container_name: microservice-auth-service
+    environment:
+      GRPC_PORT: "9091"
+      HTTP_PORT: "8081"
+      DATABASE_URL: postgres://postgres:postgres@postgres-auth:5432/auth?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      ENVIRONMENT: development
+      ACCESS_TOKEN_EXPIRY: "15"
+      REFRESH_TOKEN_EXPIRY: "10080"
+    ports:
+      - "9091:9091"
+      - "8081:8081"
+    depends_on:
+      postgres-auth:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Jaeger for distributed tracing (optional)
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    container_name: microservice-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # UI
+      - "14268:14268"  # HTTP collector
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+
+  # Prometheus for metrics (optional)
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: microservice-prometheus
+    ports:
+      - "9092:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+volumes:
+  postgres-users-data:
+  postgres-auth-data:
+  redis-data:
+  prometheus-data:
+
+networks:
+  default:
+    name: microservice-network

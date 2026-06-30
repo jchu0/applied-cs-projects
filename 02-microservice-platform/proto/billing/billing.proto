@@ -1,0 +1,178 @@
+syntax = "proto3";
+
+package billing.v1;
+
+import "common/common.proto";
+
+option go_package = "github.com/project/microservices/proto/billing/v1;billingpb";
+
+service BillingService {
+    // CreateSubscription creates a new subscription
+    rpc CreateSubscription(CreateSubscriptionRequest) returns (CreateSubscriptionResponse);
+
+    // GetSubscription retrieves subscription details
+    rpc GetSubscription(GetSubscriptionRequest) returns (GetSubscriptionResponse);
+
+    // UpdateSubscription updates a subscription (change plan)
+    rpc UpdateSubscription(UpdateSubscriptionRequest) returns (UpdateSubscriptionResponse);
+
+    // CancelSubscription cancels a subscription
+    rpc CancelSubscription(CancelSubscriptionRequest) returns (CancelSubscriptionResponse);
+
+    // ListSubscriptions lists subscriptions for a tenant
+    rpc ListSubscriptions(ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
+
+    // CreatePaymentMethod adds a payment method
+    rpc CreatePaymentMethod(CreatePaymentMethodRequest) returns (CreatePaymentMethodResponse);
+
+    // ListInvoices lists invoices for a tenant
+    rpc ListInvoices(ListInvoicesRequest) returns (ListInvoicesResponse);
+
+    // GetUsage retrieves usage metrics
+    rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+}
+
+// Subscription represents a billing subscription
+message Subscription {
+    string id = 1;
+    string tenant_id = 2;
+    string stripe_subscription_id = 3;
+    string stripe_customer_id = 4;
+    string plan_id = 5;
+    string status = 6;  // active, past_due, canceled, trialing
+    string current_period_start = 7;
+    string current_period_end = 8;
+    bool cancel_at_period_end = 9;
+    string created_at = 10;
+    string updated_at = 11;
+    map<string, string> metadata = 12;
+}
+
+// Plan represents a subscription plan
+message Plan {
+    string id = 1;
+    string name = 2;
+    string description = 3;
+    int64 price_cents = 4;
+    string currency = 5;
+    string interval = 6;  // month, year
+    map<string, int64> features = 7;  // feature limits
+    bool active = 8;
+}
+
+// Invoice represents a billing invoice
+message Invoice {
+    string id = 1;
+    string tenant_id = 2;
+    string stripe_invoice_id = 3;
+    string status = 4;  // draft, open, paid, void
+    int64 amount_due = 5;
+    int64 amount_paid = 6;
+    string currency = 7;
+    string invoice_url = 8;
+    string invoice_pdf = 9;
+    string created_at = 10;
+    string due_date = 11;
+}
+
+message CreateSubscriptionRequest {
+    string tenant_id = 1;
+    string user_id = 2;
+    string price_id = 3;
+    string payment_method_id = 4;
+    map<string, string> metadata = 5;
+}
+
+message CreateSubscriptionResponse {
+    Subscription subscription = 1;
+    string client_secret = 2;  // For 3D Secure
+}
+
+message GetSubscriptionRequest {
+    string subscription_id = 1;
+    string tenant_id = 2;
+}
+
+message GetSubscriptionResponse {
+    Subscription subscription = 1;
+}
+
+message UpdateSubscriptionRequest {
+    string subscription_id = 1;
+    string tenant_id = 2;
+    string new_price_id = 3;
+    bool prorate = 4;
+}
+
+message UpdateSubscriptionResponse {
+    Subscription subscription = 1;
+}
+
+message CancelSubscriptionRequest {
+    string subscription_id = 1;
+    string tenant_id = 2;
+    bool cancel_immediately = 3;
+    string reason = 4;
+}
+
+message CancelSubscriptionResponse {
+    Subscription subscription = 1;
+}
+
+message ListSubscriptionsRequest {
+    string tenant_id = 1;
+    common.v1.PaginationRequest pagination = 2;
+    string status_filter = 3;
+}
+
+message ListSubscriptionsResponse {
+    repeated Subscription subscriptions = 1;
+    common.v1.PaginationResponse pagination = 2;
+}
+
+message CreatePaymentMethodRequest {
+    string tenant_id = 1;
+    string payment_method_id = 2;  // From Stripe.js
+    bool set_default = 3;
+}
+
+message CreatePaymentMethodResponse {
+    PaymentMethod payment_method = 1;
+}
+
+message PaymentMethod {
+    string id = 1;
+    string type = 2;  // card, bank_account
+    string last_four = 3;
+    string brand = 4;  // visa, mastercard
+    int32 exp_month = 5;
+    int32 exp_year = 6;
+    bool is_default = 7;
+}
+
+message ListInvoicesRequest {
+    string tenant_id = 1;
+    common.v1.PaginationRequest pagination = 2;
+}
+
+message ListInvoicesResponse {
+    repeated Invoice invoices = 1;
+    common.v1.PaginationResponse pagination = 2;
+}
+
+message GetUsageRequest {
+    string tenant_id = 1;
+    string metric_name = 2;
+    string start_date = 3;
+    string end_date = 4;
+}
+
+message GetUsageResponse {
+    repeated UsageRecord records = 1;
+    int64 total_usage = 2;
+}
+
+message UsageRecord {
+    string date = 1;
+    int64 quantity = 2;
+}

@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: microservice-platform
+
+resources:
+  - namespace.yaml
+  - configmaps.yaml
+  - secrets.yaml
+  - gateway-deployment.yaml
+  - user-service-deployment.yaml
+  - auth-service-deployment.yaml
+  - billing-service-deployment.yaml
+  - notification-service-deployment.yaml
+  - ingress.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: microservice-platform
+  app.kubernetes.io/managed-by: kustomize
+
+images:
+  - name: microservice-platform/gateway
+    newTag: latest
+  - name: microservice-platform/user-service
+    newTag: latest
+  - name: microservice-platform/auth-service
+    newTag: latest
+  - name: microservice-platform/billing-service
+    newTag: latest
+  - name: microservice-platform/notification-service
+    newTag: latest

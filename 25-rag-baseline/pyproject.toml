@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ragbaseline"
+version = "0.1.0"
+description = "Production-ready RAG system with document ingestion, retrieval, and LLM generation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "ML/AI Systems", email = "mlai@example.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "sentence-transformers>=2.2.0",
+]
+openai = [
+    "openai>=1.0.0",
+]
+anthropic = [
+    "anthropic>=0.8.0",
+]
+chroma = [
+    "chromadb>=0.4.0",
+]
+parsers = [
+    "PyMuPDF>=1.23.0",
+    "beautifulsoup4>=4.12.0",
+    "markdown>=3.4.0",
+    "nltk>=3.8.0",
+]
+api = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.22.0",
+]
+config = [
+    "pyyaml>=6.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pyyaml>=6.0.0",
+]
+full = [
+    "sentence-transformers>=2.2.0",
+    "openai>=1.0.0",
+    "anthropic>=0.8.0",
+    "chromadb>=0.4.0",
+    "PyMuPDF>=1.23.0",
+    "beautifulsoup4>=4.12.0",
+    "markdown>=3.4.0",
+    "nltk>=3.8.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.22.0",
+    "pyyaml>=6.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

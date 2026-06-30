@@ -1,0 +1,210 @@
+_format_version: "3.0"
+_transform: true
+
+# ============================================================================
+# Services
+# ============================================================================
+
+services:
+  # User Service
+  - name: user-service
+    url: http://user-service:8080
+    retries: 3
+    connect_timeout: 10000
+    read_timeout: 60000
+    write_timeout: 60000
+    routes:
+      - name: user-api
+        paths:
+          - /api/v1/users
+        strip_path: false
+        preserve_host: false
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: false
+      - name: user-health
+        paths:
+          - /health/user
+        strip_path: true
+
+  # Auth Service
+  - name: auth-service
+    url: http://auth-service:8080
+    retries: 3
+    connect_timeout: 10000
+    read_timeout: 60000
+    write_timeout: 60000
+    routes:
+      - name: auth-api
+        paths:
+          - /api/v1/auth
+        strip_path: false
+        preserve_host: false
+        plugins:
+          - name: rate-limiting
+            config:
+              minute: 20
+              hour: 100
+              policy: redis
+              redis_host: redis
+              redis_port: 6379
+              fault_tolerant: true
+      - name: auth-health
+        paths:
+          - /health/auth
+        strip_path: true
+
+  # Billing Service
+  - name: billing-service
+    url: http://billing-service:8080
+    retries: 3
+    connect_timeout: 10000
+    read_timeout: 60000
+    write_timeout: 60000
+    routes:
+      - name: billing-api
+        paths:
+          - /api/v1/billing
+        strip_path: false
+        preserve_host: false
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: false
+      - name: billing-webhooks
+        paths:
+          - /api/v1/webhooks/stripe
+        strip_path: false
+        preserve_host: false
+      - name: billing-health
+        paths:
+          - /health/billing
+        strip_path: true
+
+  # Notification Service
+  - name: notification-service
+    url: http://notification-service:8080
+    retries: 3
+    connect_timeout: 10000
+    read_timeout: 60000
+    write_timeout: 60000
+    routes:
+      - name: notification-api
+        paths:
+          - /api/v1/notifications
+        strip_path: false
+        preserve_host: false
+        plugins:
+          - name: jwt
+            config:
+              key_claim_name: iss
+              claims_to_verify:
+                - exp
+              run_on_preflight: false
+      - name: notification-health
+        paths:
+          - /health/notification
+        strip_path: true
+
+# ============================================================================
+# Consumers
+# ============================================================================
+
+consumers:
+  - username: microservices-platform
+    jwt_secrets:
+      - key: microservices-platform
+        algorithm: RS256
+
+# ============================================================================
+# Global Plugins
+# ============================================================================
+
+plugins:
+  # CORS
+  - name: cors
+    config:
+      origins:
+        - "*"
+      methods:
+        - GET
+        - POST
+        - PUT
+        - PATCH
+        - DELETE
+        - OPTIONS
+      headers:
+        - Authorization
+        - Content-Type
+        - X-Tenant-ID
+      exposed_headers:
+        - X-Request-ID
+      credentials: true
+      max_age: 3600
+
+  # Correlation ID
+  - name: correlation-id
+    config:
+      header_name: X-Request-ID
+      generator: uuid#counter
+      echo_downstream: true
+
+  # Global Rate Limiting with Redis
+  - name: rate-limiting
+    config:
+      minute: 100
+      hour: 1000
+      policy: redis
+      redis_host: redis
+      redis_port: 6379
+      fault_tolerant: true
+      hide_client_headers: false
+
+  # Request Size Limiting
+  - name: request-size-limiting
+    config:
+      allowed_payload_size: 10
+      size_unit: megabytes
+
+  # Prometheus Metrics
+  - name: prometheus
+    config:
+      per_consumer: true
+      status_code_metrics: true
+      latency_metrics: true
+      bandwidth_metrics: true
+      upstream_health_metrics: true
+
+  # Security Headers
+  - name: response-transformer
+    config:
+      add:
+        headers:
+          - "X-Kong-Proxy:true"
+          - "X-Content-Type-Options:nosniff"
+          - "X-Frame-Options:DENY"
+          - "X-XSS-Protection:1; mode=block"
+          - "Strict-Transport-Security:max-age=31536000; includeSubDomains"
+
+  # HTTP Log (for debugging)
+  - name: http-log
+    config:
+      http_endpoint: http://jaeger:14268/api/traces
+      method: POST
+      timeout: 10000
+      keepalive: 60000
+      flush_timeout: 2
+      retry_count: 10
+    enabled: false  # Enable for debugging
+
+  # Bot Detection
+  - name: bot-detection
+    config:
+      deny: []
