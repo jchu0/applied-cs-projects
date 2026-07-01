@@ -139,7 +139,6 @@ import asyncio
 from jobqueue.models import Task
 from jobqueue.broker import Broker
 
-
 class WorkerPool:
     """Manages a pool of workers for task processing.
 
@@ -266,7 +265,6 @@ from unittest.mock import AsyncMock, patch
 from jobqueue.worker import Worker
 from jobqueue.models import Task
 
-
 class TestWorker:
     """Test suite for Worker class."""
 
@@ -338,7 +336,6 @@ from typing import List
 import pytest
 
 from jobqueue import Worker, Broker
-
 
 @pytest.mark.performance
 class TestThroughput:
@@ -585,22 +582,6 @@ We follow [Semantic Versioning](https://semver.org/):
 5. Create release branch
 6. Tag release
 7. Build and publish packages
-
-## Getting Help
-
-### Resources
-
-- **Documentation**: [https://docs.jobqueue.example.com](https://docs.jobqueue.example.com)
-- **Discord**: [https://discord.gg/jobqueue](https://discord.gg/jobqueue)
-- **Stack Overflow**: Tag with `jobqueue`
-- **Email**: dev@jobqueue.example.com
-
-### Community
-
-Join our community:
-- Weekly developer meetings (Thursdays 2 PM UTC)
-- Monthly contributor spotlight
-- Annual contributor summit
 
 ## Recognition
 

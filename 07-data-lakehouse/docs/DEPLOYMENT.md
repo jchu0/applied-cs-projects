@@ -867,11 +867,3 @@ aws s3 ls s3://your-bucket/ --debug
 - [ ] Enable speculative execution
 
 ---
-
-## Support
-
-For additional support:
-- Documentation: https://docs.lakehouse.io
-- Issues: https://github.com/your-org/lakehouse/issues
-- Slack: #lakehouse-support
-- Email: lakehouse-team@your-org.com

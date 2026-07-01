@@ -26,36 +26,18 @@ The SaaS Web Platform is a modern, scalable multi-tenant application built with 
 
 ### High-Level Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         Load Balancer                       │
-│                        (AWS ALB/Nginx)                      │
-└─────────────┬───────────────────────┬──────────────────────┘
-              │                       │
-              v                       v
-┌─────────────────────┐ ┌─────────────────────────┐
-│   CDN (CloudFlare)  │ │    API Gateway          │
-│   Static Assets     │ │   (Kong/AWS API GW)     │
-└─────────┬───────────┘ └──────────┬──────────────┘
-          │                        │
-          v                        v
-┌─────────────────────┐ ┌─────────────────────────┐
-│   Next.js Frontend  │ │   Django REST API       │
-│   - SSR/SSG         │ │   - Business Logic      │
-│   - React UI        │ │   - Authentication      │
-│   - Client State    │ │   - Authorization       │
-└─────────┬───────────┘ └──────────┬──────────────┘
-          │                        │
-          └────────┬───────────────┘
-                   │
-                   v
-┌──────────────────────────────────────────────────┐
-│              Data Layer                          │
-│  ┌──────────┐ ┌─────────┐ ┌──────────┐         │
-│  │PostgreSQL│ │  Redis  │ │    S3    │         │
-│  │   (RDS)  │ │ (Cache) │ │ (Files)  │         │
-│  └──────────┘ └─────────┘ └──────────┘         │
-└──────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    LB[Load Balancer<br/>AWS ALB/Nginx]
+    LB --> CDN[CDN CloudFlare<br/>Static Assets]
+    LB --> GW[API Gateway<br/>Kong/AWS API GW]
+    CDN --> FE[Next.js Frontend<br/>SSR/SSG, React UI, Client State]
+    GW --> API[Django REST API<br/>Business Logic, Auth]
+    FE --> Data[Data Layer]
+    API --> Data
+    Data --> PG[(PostgreSQL RDS)]
+    Data --> Redis[(Redis Cache)]
+    Data --> S3[S3 Files]
 ```
 
 ### Microservices Breakdown
@@ -525,11 +507,3 @@ def process_payment(amount, user):
 2. **RPO**: 1 hour for transactional data
 3. **Automated failover** for stateless services
 4. **Manual intervention** for data consistency checks
-
-## Future Considerations
-
-1. **Event-Driven Architecture**: Migration to event sourcing for audit trails
-2. **GraphQL Federation**: Unified API gateway for microservices
-3. **Edge Computing**: Deploy compute closer to users
-4. **ML Integration**: Predictive analytics and personalization
-5. **Blockchain**: Immutable audit logs for compliance

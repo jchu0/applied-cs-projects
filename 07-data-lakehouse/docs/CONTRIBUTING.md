@@ -191,7 +191,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 class ExampleClass:
     """Class description.
 
@@ -359,7 +358,6 @@ from unittest.mock import Mock, patch
 from pyspark.sql import SparkSession
 from lakehouse.processor import LakehouseProcessor
 
-
 class TestLakehouseProcessor:
     """Test cases for LakehouseProcessor."""
 
@@ -439,7 +437,6 @@ pytest --cov=lakehouse --cov-report=html --cov-report=term
 # tests/performance/test_benchmark.py
 import pytest
 from lakehouse.optimizer import StorageOptimizer
-
 
 @pytest.mark.benchmark(group="optimizer")
 def test_compaction_performance(benchmark, spark, large_dataset):
@@ -663,17 +660,3 @@ Follow Semantic Versioning (MAJOR.MINOR.PATCH):
 - [ ] Published to PyPI
 
 ---
-
-## Getting Help
-
-### Resources
-- [Documentation](https://docs.lakehouse.io)
-- [Issue Tracker](https://github.com/org/lakehouse/issues)
-- [Discussions](https://github.com/org/lakehouse/discussions)
-- [Slack Channel](https://lakehouse.slack.com)
-
-### Contact
-- Email: lakehouse-dev@example.com
-- Twitter: @lakehouse_io
-
-Thank you for contributing to Data Lakehouse!

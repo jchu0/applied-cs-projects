@@ -1,39 +1,86 @@
 # Async Runtime
 
-A custom async runtime implementation in Rust, similar to Tokio. This project demonstrates deep understanding of async/await internals, I/O multiplexing, and concurrent systems.
+A Tokio-style asynchronous runtime built from scratch in Rust: an `epoll`-based
+I/O reactor, a work-stealing multi-threaded scheduler, a hierarchical timer
+wheel, and a full set of async primitives (channels, timers, locks, structured
+concurrency). It implements the `Future`/`Waker` machinery directly on top of the
+Linux syscall layer with no `tokio`/`mio`/`async-std` dependencies.
 
 ## Features
 
-### Core Runtime
-- **Epoll-based reactor** - Event-driven I/O on Linux
-- **Work-stealing scheduler** - Efficient multi-threaded task execution
-- **Hierarchical timer wheel** - O(1) timer operations
-- **Cooperative multitasking** - Non-blocking async execution
+- **Epoll reactor** — edge-triggered I/O readiness via `epoll_create1`/`epoll_ctl`/`epoll_wait`, mapping `Token`s to `Waker`s (`reactor::Reactor`).
+- **Work-stealing scheduler** — a global `crossbeam_deque::Injector` plus per-worker FIFO queues with cross-worker stealing (`scheduler::Scheduler`, `runtime::Runtime`).
+- **Single-threaded executor** — a `SegQueue`-backed executor driving the `block_on`/`spawn` free functions (`executor::Executor`).
+- **Manual waker vtable** — `Arc<Task>` is turned into a `RawWaker` with a hand-written `RawWakerVTable` (`task::Task`).
+- **Hierarchical timer wheel** — four cascading wheels (256, 64, 64, 64 slots) at 1 ms tick granularity (`timer::TimerWheel`).
+- **Time utilities** — `sleep`, `sleep_until`, `timeout`, `timeout_at`, `interval`, with an `Elapsed` error type (`time`).
+- **Future combinators** — `select` (returning `Either`), `join`, `join3`, `yield_now`, `ready`, `pending` (`future`).
+- **Channels** — single-use `oneshot` and bounded `mpsc` with backpressure and waker wake-ups (`sync::oneshot`, `sync::mpsc`).
+- **Async sync primitives** — `Mutex`, `RwLock`, `Notify`, `Semaphore`, `Barrier` (`sync::mutex`, `sync::notify`).
+- **Cancellation** — hierarchical `CancellationToken` with child tokens and `run_until_cancelled` (`sync::cancellation`).
+- **Structured concurrency** — `scope`/`scope_detached`/`TaskSet` that join all spawned work before returning (`scope`).
+- **Networking** — async `TcpListener`/`TcpStream`, `UdpSocket`, and `UnixListener`/`UnixStream` over the reactor (`net`).
 
-### Synchronization Primitives
-- **Oneshot channel** - Single-value communication between tasks
-- **MPSC channel** - Bounded multi-producer, single-consumer queue
-- **JoinHandle** - Task completion awaiting
+## Architecture
 
-### Networking
-- **TCP** - Async TcpListener and TcpStream
-- **UDP** - Async UdpSocket with send/recv operations
-- **Unix sockets** - UnixListener and UnixStream
+```mermaid
+flowchart TD
+    APP[Async application code] --> RT[Runtime / block_on]
+    RT --> SCHED[Work-stealing scheduler]
+    RT --> EXEC[Single-threaded executor]
+    SCHED --> TASK[Task (Pin Box dyn Future)]
+    EXEC --> TASK
+    TASK --> WAKER[Manual RawWaker vtable]
+    WAKER --> SCHED
+    TASK --> REACTOR[Epoll reactor]
+    TASK --> TIMER[Timer wheel]
+    REACTOR --> EPOLL[(Linux epoll fd)]
+    REACTOR --> WAKER
+    TIMER --> WAKER
+```
 
-### Time Utilities
-- **sleep/sleep_until** - Async delay functions
-- **timeout/timeout_at** - Deadline enforcement
-- **interval** - Periodic timer
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Reactor | `reactor` | Register fds with `epoll`, poll for readiness, wake the right `Waker` |
+| Scheduler | `scheduler` | Global injector + per-worker deques with work stealing |
+| Runtime | `runtime` | Multi-threaded runtime, `Builder`, worker threads, `JoinHandle` |
+| Executor | `executor` | Single-threaded `block_on`/`spawn` driver |
+| Task | `task` | Future state, `Arc<Task>` to `RawWaker` conversion |
+| Timer wheel | `timer` | O(1) insert/cancel, cascading hierarchical wheels |
+| Time | `time` | `sleep`/`timeout`/`interval` futures over the timer wheel |
+| Combinators | `future` | `select`/`join`/`yield_now`/`ready`/`pending` |
+| Channels | `sync::oneshot`, `sync::mpsc` | Task-to-task value passing |
+| Sync | `sync::mutex`, `sync::notify`, `sync::cancellation` | Async locks, notifications, cancellation |
+| Scope | `scope` | Structured concurrency over spawned tasks |
+| Net | `net::tcp`, `net::udp`, `net::unix` | Async sockets driven by the reactor |
 
-### Future Combinators
-- **select** - Race multiple futures
-- **join/join3** - Wait for multiple futures
-- **yield_now** - Cooperative yielding
-- **ready/pending** - Utility futures
+## Quick Start
+
+### Prerequisites
+
+- Rust 1.70+ (`edition = "2021"`) and Cargo.
+- **Linux only.** The reactor calls the `epoll` syscall family unconditionally, so
+  the crate has a `compile_error!` guard and will not build on macOS/Windows. Use a
+  Linux host, VM, or container.
+
+### Installation
+
+```bash
+cd 06-async-runtime
+cargo build
+```
+
+### Running
+
+```bash
+cargo run --example echo_server    # TCP echo server on 127.0.0.1:8080
+cargo run --example timeout_demo   # timeout combinator demo
+cargo run --example channels       # oneshot + mpsc channel demo
+```
 
 ## Usage
 
-### Basic Example
+Spawn background work on the single-threaded executor with the free functions:
 
 ```rust
 use async_runtime::{block_on, spawn, sleep};
@@ -41,174 +88,111 @@ use std::time::Duration;
 
 fn main() {
     block_on(async {
-        // Spawn a background task
         spawn(async {
-            sleep(Duration::from_millis(100)).await;
-            println!("Background task complete!");
+            sleep(Duration::from_millis(10)).await;
+            println!("background task done");
         });
-
-        // Main task
-        println!("Hello from async runtime!");
+        println!("hello from the runtime");
     });
 }
 ```
 
-### TCP Echo Server
+Use the multi-threaded `Runtime` when you want worker threads and `JoinHandle`s.
+`Runtime::spawn` returns a `JoinHandle<T>` that resolves to `Result<T, JoinError>`:
 
 ```rust
-use async_runtime::net::TcpListener;
-use async_runtime::{spawn, Runtime};
+use async_runtime::Runtime;
 
 fn main() -> std::io::Result<()> {
     let rt = Runtime::new()?;
 
-    rt.block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:8080".parse().unwrap())?;
+    let handle = rt.spawn(async { 21 * 2 });
+    let result = rt.block_on(handle).unwrap();
+    println!("{result}");
 
-        loop {
-            let (mut stream, _) = listener.accept().await?;
-
-            spawn(async move {
-                let mut buf = [0u8; 1024];
-                loop {
-                    let n = stream.read(&mut buf).await?;
-                    if n == 0 { break; }
-                    stream.write_all(&buf[..n]).await?;
-                }
-                Ok::<_, std::io::Error>(())
-            });
-        }
-    })
+    rt.shutdown();
+    Ok(())
 }
 ```
 
-### Using Channels
+Channels, timeout, and select against the real public API:
 
 ```rust
+use async_runtime::{block_on, spawn, timeout, select, sleep, Either};
 use async_runtime::sync::{oneshot, mpsc};
-use async_runtime::{block_on, spawn};
-
-fn main() {
-    block_on(async {
-        // Oneshot channel
-        let (tx, rx) = oneshot::channel();
-        spawn(async move { tx.send(42).unwrap() });
-        let value = rx.await.unwrap();
-
-        // MPSC channel
-        let (tx, mut rx) = mpsc::channel(16);
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
-
-        while let Ok(v) = rx.try_recv() {
-            println!("Received: {}", v);
-        }
-    });
-}
-```
-
-### Timeout and Select
-
-```rust
-use async_runtime::{block_on, timeout, select, sleep, Either};
 use std::time::Duration;
 
 fn main() {
     block_on(async {
-        // Timeout
-        let result = timeout(
-            Duration::from_millis(100),
-            async { "completed" }
-        ).await;
+        // oneshot: single value across tasks
+        let (tx, rx) = oneshot::channel();
+        spawn(async move { tx.send(42).unwrap(); });
+        let _value = rx.await.unwrap();
 
-        // Select between futures
-        let fast = sleep(Duration::from_millis(10));
-        let slow = sleep(Duration::from_millis(100));
+        // bounded mpsc with try_send / try_recv
+        let (tx, mut rx) = mpsc::channel(16);
+        tx.try_send(1).unwrap();
+        while let Ok(v) = rx.try_recv() {
+            println!("received {v}");
+        }
 
-        match select(fast, slow).await {
-            Either::Left(_) => println!("Fast won!"),
-            Either::Right(_) => println!("Slow won!"),
+        // deadline enforcement
+        let _ = timeout(Duration::from_millis(100), async { "done" }).await;
+
+        // race two futures
+        match select(sleep(Duration::from_millis(10)),
+                     sleep(Duration::from_millis(100))).await {
+            Either::Left(_)  => println!("fast won"),
+            Either::Right(_) => println!("slow won"),
         }
     });
 }
 ```
 
-## Architecture
+## What's Real vs Simulated
 
-### Reactor
-The reactor uses Linux's epoll for I/O event notification. It maintains a mapping of file descriptors to wakers and efficiently polls for ready events.
+- **Real:** The `epoll` reactor (`epoll_create1`/`epoll_ctl`/`epoll_wait`, edge-triggered) is genuine and exercised by reactor unit tests against `UnixStream` pairs. The hierarchical timer wheel, the manual `RawWaker` vtable, the `oneshot`/`mpsc` channels, the future combinators, the work-stealing scheduler primitives (`Injector` + per-worker deques with stealing), and the async sync primitives are all fully implemented with passing unit tests. TCP/UDP/Unix sockets set `O_NONBLOCK` and register real fds with the reactor.
+- **Linux only:** Builds and runs on Linux exclusively. There is no `kqueue`/IOCP backend; the crate emits a `compile_error!` on non-Linux targets.
+- **Simulated / aspirational:** I/O futures register their `Waker` through the **single-threaded** `EXECUTOR` thread-local, so socket readiness wiring is wired for `block_on`/`spawn`, not for the multi-threaded `Runtime` worker loop. `JoinHandle::poll` in `task.rs` busy-wakes rather than registering a completion waker. The integration suites `tests/executor_tests.rs` and `tests/io_tests.rs` describe a larger target API (`ExecutorConfig`, `async_runtime::fs`, async `bind`/`accept`, `stream.split`, task-locals) that is **not** implemented and does not compile; the trustworthy tests are the in-module `#[cfg(test)]` units.
 
-### Scheduler
-The work-stealing scheduler distributes tasks across worker threads. Each worker has a local FIFO queue and can steal from others when idle.
-
-### Timer Wheel
-A hierarchical timer wheel provides O(1) insertion and cancellation. Timers are organized into 4 levels of granularity for efficient processing.
-
-### Task System
-Tasks are represented as pinned futures with associated wakers. The runtime manages task state transitions and polling.
-
-## Running Examples
+## Testing
 
 ```bash
-# Echo server
-cargo run --example echo_server
-
-# Timeout demo
-cargo run --example timeout_demo
-
-# Channel demo
-cargo run --example channels
+cargo test --lib          # in-module unit tests (reactor, timer, scheduler, channels, ...)
+cargo bench               # Criterion benchmarks
 ```
 
-## Running Benchmarks
-
-```bash
-cargo bench
-```
-
-## Running Tests
-
-```bash
-cargo test
-```
+The in-module unit tests cover the reactor (register/poll/deregister), the timer
+wheel (insert/cancel/cascade), the scheduler (push/pop/steal), the channels, the
+combinators, and the TCP listener. They need no external services. The standalone
+`tests/` integration files target an unimplemented API and are not part of the
+passing suite (see What's Real vs Simulated).
 
 ## Project Structure
 
 ```
-src/
-├── lib.rs          # Main library exports
-├── reactor.rs      # Epoll-based event reactor
-├── task.rs         # Task and waker implementation
-├── executor.rs     # Single-threaded executor
-├── scheduler.rs    # Work-stealing scheduler
-├── runtime.rs      # Multi-threaded runtime
-├── timer.rs        # Hierarchical timer wheel
-├── time.rs         # Time utilities (sleep, timeout)
-├── future.rs       # Future combinators
-├── io.rs           # Legacy I/O (being replaced)
-├── io_util.rs      # Buffered I/O utilities
-├── sync/           # Synchronization primitives
-│   ├── mod.rs
-│   ├── oneshot.rs
-│   └── mpsc.rs
-└── net/            # Networking
-    ├── mod.rs
-    ├── tcp.rs
-    ├── udp.rs
-    └── unix.rs
+06-async-runtime/
+  README.md                 # this file
+  Cargo.toml                # crate + criterion bench config
+  src/
+    lib.rs                  # public exports, Interest/Token/Event/Events
+    reactor.rs              # epoll-based I/O reactor
+    task.rs                 # Task + manual RawWaker vtable
+    executor.rs             # single-threaded block_on/spawn executor
+    scheduler.rs            # work-stealing scheduler
+    runtime.rs              # multi-threaded Runtime + Builder
+    timer.rs                # hierarchical timer wheel
+    time.rs                 # sleep/timeout/interval
+    future.rs               # select/join/yield_now/ready/pending
+    scope.rs                # structured concurrency (scope/TaskSet)
+    io.rs, io_util.rs       # async I/O traits + buffered helpers
+    sync/                   # oneshot, mpsc, mutex, notify, cancellation
+    net/                    # tcp, udp, unix sockets
+  examples/                 # echo_server, timeout_demo, channels
+  benches/benchmarks.rs     # Criterion benchmarks
+  docs/BLUEPRINT.md         # full architecture and design
 ```
 
-## Design Decisions
+## License
 
-1. **Epoll over io_uring** - Chose epoll for broader compatibility and simpler implementation
-2. **Work-stealing** - Provides good load balancing with minimal overhead
-3. **Timer wheel** - O(1) operations are critical for high-throughput systems
-4. **Thread-local executor** - Simplifies implementation while maintaining efficiency
-
-## Future Improvements
-
-- Add macOS kqueue support
-- Implement async file I/O
-- Add tracing/debugging support
-- Optimize hot paths
-- Add more comprehensive error handling
+MIT — see ../LICENSE

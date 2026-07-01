@@ -180,7 +180,6 @@ from typing import Optional, List
 from django.db import models
 from django.contrib.auth.models import User
 
-
 class Project(models.Model):
     """
     Represents a project in the system.
@@ -391,7 +390,6 @@ from unittest.mock import patch, Mock
 from apps.projects.models import Project
 from apps.projects.services import ProjectService
 
-
 class ProjectModelTests(TestCase):
     """Test Project model functionality."""
 
@@ -433,7 +431,6 @@ class ProjectModelTests(TestCase):
             mock_signal.call_args[1]['sender'],
             Project
         )
-
 
 @pytest.mark.django_db
 class TestProjectService:
@@ -727,13 +724,6 @@ For user-facing features:
 - **Slack**: Real-time chat (invite link in README)
 - **Email**: dev@saas-platform.com for development questions
 - **Twitter**: @saasplatform for announcements
-
-### Getting Help
-
-- Check existing documentation
-- Search closed issues and PRs
-- Ask in GitHub Discussions
-- Join our Slack community
 
 ### Recognition
 

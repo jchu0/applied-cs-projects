@@ -1021,11 +1021,3 @@ docker service rollback saas-platform_frontend
 # Database migration rollback
 docker-compose exec backend python manage.py migrate app_name migration_name
 ```
-
-## Support Resources
-
-- Documentation: https://docs.saas-platform.com
-- Status Page: https://status.saas-platform.com
-- Support Email: support@saas-platform.com
-- Slack Community: https://saas-platform.slack.com
-- GitHub Issues: https://github.com/your-org/saas-platform/issues

@@ -6,46 +6,32 @@ The Warehouse Semantic Layer is a Python-based metrics platform that provides a 
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Client Applications                       │
-│         (BI Tools, Dashboards, Analytics Platforms)          │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Semantic Layer API                         │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              API Endpoints & Validation              │    │
-│  └─────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     Query Engine Layer                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │   Metric     │  │   Semantic   │  │    Query     │     │
-│  │   Catalog    │  │    Query     │  │   Executor   │     │
-│  │              │  │    Engine    │  │              │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Data Models Layer                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │   Metrics    │  │  Dimensions  │  │    Query     │     │
-│  │ Definitions  │  │              │  │   Results    │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Data Warehouse Layer                       │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
-│  │Snowflake │  │ BigQuery │  │ Redshift │  │ Postgres │   │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘   │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Client[Client Applications<br/>BI Tools, Dashboards, Analytics Platforms]
+    subgraph API[Semantic Layer API]
+        Endpoints[API Endpoints & Validation]
+    end
+    subgraph QueryEngine[Query Engine Layer]
+        Catalog[Metric Catalog]
+        SemQuery[Semantic Query Engine]
+        Executor[Query Executor]
+    end
+    subgraph Models[Data Models Layer]
+        MetricsDef[Metrics Definitions]
+        Dimensions
+        QueryResults[Query Results]
+    end
+    subgraph Warehouse[Data Warehouse Layer]
+        Snowflake
+        BigQuery
+        Redshift
+        Postgres
+    end
+    Client --> API
+    API --> QueryEngine
+    QueryEngine --> Models
+    Models --> Warehouse
 ```
 
 ## Core Components
@@ -136,8 +122,9 @@ Advanced capabilities for enterprise deployments:
 4. **Execution**: SQL executed against data warehouse
 5. **Result Processing**: Results formatted and returned
 
-```
-Client Request → API Validation → SQL Generation → Warehouse Execution → Result Formatting
+```mermaid
+flowchart LR
+    A[Client Request] --> B[API Validation] --> C[SQL Generation] --> D[Warehouse Execution] --> E[Result Formatting]
 ```
 
 ### Metric Registration Flow
@@ -260,16 +247,8 @@ services:
 - Azure Container Instances ready
 - Kubernetes native
 
-## Future Enhancements
+## Extension Points
 
-### Planned Features
-1. Real-time streaming metrics
-2. Machine learning metric predictions
-3. Natural language query interface
-4. Automated anomaly detection
-5. Cost-based query optimization
-
-### Extension Points
 - Custom calculation methods
 - Warehouse plugins
 - Metric transformers

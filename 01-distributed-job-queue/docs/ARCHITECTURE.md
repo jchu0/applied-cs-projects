@@ -8,24 +8,16 @@ The Distributed Job Queue is a high-performance, scalable task processing system
 
 ### Core Architecture
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   Client Apps   │────▶│    API Gateway   │────▶│  Redis Broker   │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-                                                           │
-                              ┌────────────────────────────┼────────────────────────────┐
-                              │                            │                            │
-                              ▼                            ▼                            ▼
-                    ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-                    │   Worker Pool 1   │     │   Worker Pool 2   │     │   Worker Pool N   │
-                    └──────────────────┘     └──────────────────┘     └──────────────────┘
-                              │                            │                            │
-                              └────────────────────────────┼────────────────────────────┘
-                                                           │
-                                                           ▼
-                                                ┌──────────────────┐
-                                                │  Metrics Store   │
-                                                └──────────────────┘
+```mermaid
+flowchart LR
+    Client[Client Apps] --> API[API Gateway]
+    API --> Broker[Redis Broker]
+    Broker --> WP1[Worker Pool 1]
+    Broker --> WP2[Worker Pool 2]
+    Broker --> WPN[Worker Pool N]
+    WP1 --> Metrics[Metrics Store]
+    WP2 --> Metrics
+    WPN --> Metrics
 ```
 
 ## Component Details
@@ -385,11 +377,3 @@ services:
 - StatefulSets for Redis persistence
 - ConfigMaps for configuration management
 - Secrets for sensitive data
-
-## Future Enhancements
-
-1. **Multi-Broker Support**: Support for RabbitMQ, Kafka
-2. **Task Workflows**: DAG-based task dependencies
-3. **Result Backend**: Separate storage for large results
-4. **WebSocket Support**: Real-time task status updates
-5. **Machine Learning Integration**: Smart task routing based on historical data

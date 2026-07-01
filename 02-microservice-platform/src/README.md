@@ -4,23 +4,20 @@ A production-ready microservice platform with Auth, User, Billing, and Notificat
 
 ## Architecture
 
-```
-┌─────────────────┐
-│   API Gateway   │
-└────────┬────────┘
-         │
-┌────────┼────────┐────────────────┐
-│        │        │                │
-▼        ▼        ▼                ▼
-Auth     User     Billing     Notification
-Service  Service  Service     Service
-│        │        │                │
-▼        ▼        ▼                ▼
-Redis    PostgreSQL PostgreSQL   PostgreSQL
-         │        │                │
-         └────────┴────────────────┘
-                  │
-              NATS (Events)
+```mermaid
+flowchart TD
+    GW[API Gateway]
+    GW --> Auth[Auth Service]
+    GW --> User[User Service]
+    GW --> Billing[Billing Service]
+    GW --> Notify[Notification Service]
+    Auth --> Redis[(Redis)]
+    User --> PGU[(PostgreSQL)]
+    Billing --> PGB[(PostgreSQL)]
+    Notify --> PGN[(PostgreSQL)]
+    User --> NATS[NATS Events]
+    Billing --> NATS
+    Notify --> NATS
 ```
 
 ## Services

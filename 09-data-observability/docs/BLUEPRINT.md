@@ -1,301 +1,525 @@
-# Data Observability Platform (Monte Carlo-lite) - Technical Blueprint
+# Data Observability Platform
 
-## Executive Summary
+## Overview
 
-This project implements a comprehensive data observability platform that monitors data health, detects anomalies, tracks metadata, and provides impact analysis across the data ecosystem. Inspired by platforms like Monte Carlo and Datadog for data, it demonstrates mastery of data quality management, anomaly detection, metadata graph construction, and operational data intelligence.
+This is a Monte Carlo–style data observability platform, implemented from scratch in
+Python. It watches the tables in a data warehouse and answers the operational questions a
+data team asks every day: is this table fresh, did its row count move, did its schema
+change, are its null rates climbing, is its value distribution drifting, and — when
+something breaks — what downstream tables, pipelines, and dashboards are affected.
 
-> **Concepts covered:** [§05 Metrics + alerting](../../../05-cross-cutting-concerns/observability/metrics/metrics.md) · [§05 Distributed tracing](../../../05-cross-cutting-concerns/observability/distributed-tracing/distributed-tracing.md) · [§05 Logging](../../../05-cross-cutting-concerns/observability/logging/logging.md) · [§02 Real-time analytics (anomaly detection)](../../../02-data-engineering/04-streaming/real-time-analytics/real-time-analytics.md). Pairs with [Project 49 (AI benchmark suite — observability for ML systems)](../../49-ai-benchmark-suite/) and [Project 05 (SaaS observability stack)](../../05-saas-web-platform/). Map: [`CONCEPT_TO_PROJECT_MAP.md`](../../CONCEPT_TO_PROJECT_MAP.md).
+The platform is organized around a metadata model (`TableMetadata`, `ColumnMetadata`,
+`ColumnStats`) that every subsystem shares. Collectors pull that metadata from a warehouse;
+the detectors keep a rolling history of metrics per table and flag deviations; a hand-built
+SQL parser turns query text into a column-level lineage graph; a health scorer rolls the
+signals into a single 0–100 score; a PII scanner classifies sensitive columns; and an
+alerting engine matches anomalies against rules and routes them to channels with
+escalation. A FastAPI gateway exposes the whole thing over REST.
 
-**Primary Goals:**
-- Build automated data quality monitoring without manual rule configuration
-- Implement ML-based anomaly detection for volume, schema, and distribution
-- Create a metadata graph for lineage tracking and impact analysis
-- Provide actionable alerts with root cause analysis
+The goals are to demonstrate:
 
----
+- **Statistical and ML anomaly detection** — z-score, IQR, and modified-z-score methods
+  alongside an Isolation Forest ensemble over engineered feature vectors.
+- **Metadata graph construction** — a directed lineage graph with table- and column-level
+  edges, transitive upstream/downstream traversal, and impact analysis.
+- **SQL static analysis** — extracting sources, targets, and column mappings from
+  `SELECT` / `INSERT` / `CREATE TABLE AS` / `MERGE` / `UPDATE` statements.
+- **Operational alerting** — rule matching, deduplication, multi-channel routing, and
+  time-based escalation.
 
-## System Architecture
+The concepts this project is built to teach run through every component: the difference
+between a hard threshold and a robust statistical estimator (and why the latter matters once
+a metric history contains a past incident); how an anomaly detector earns trust by staying
+silent until it has a baseline; how a lineage graph turns "this table broke" into "here is
+everything downstream that broke with it"; and how an alerting layer avoids both
+under-paging (missing a real incident) and over-paging (firing the same alert repeatedly or
+once per affected table). The codebase favors small, explicit algorithms — z-scores, IQR
+fences, median/MAD, additive seasonal decomposition, breadth-first graph traversal — over
+heavyweight frameworks, so the mechanics are visible rather than hidden behind a library.
 
-### High-Level Architecture
+Scope is deliberately in-process: the default `InMemoryCollector` and `LogChannel` let the
+entire pipeline — collection, detection, lineage, health, PII, alerting — run and be tested
+with no external services. The warehouse collectors and network channels are real adapters
+written against vendor client libraries but require credentials to exercise against live
+systems.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Data Sources & Pipelines                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐            │
-│  │ Airflow  │  │ Dagster  │  │  dbt     │  │  Spark   │            │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘            │
-└───────┴─────────────┴─────────────┴─────────────┴───────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Metadata Collectors                               │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐            │
-│  │    Schema     │  │    Query      │  │   Pipeline    │            │
-│  │   Crawler     │  │    Logger     │  │    Events     │            │
-│  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘            │
-└──────────┴──────────────────┴──────────────────┴────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                 Observability Platform Core                          │
-│                                                                      │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐      │
-│  │   Metadata      │  │    Anomaly      │  │   Alerting      │      │
-│  │    Store        │  │   Detector      │  │    Engine       │      │
-│  │                 │  │                 │  │                 │      │
-│  │  - Graph DB     │  │  - Volume       │  │  - Rules        │      │
-│  │  - Time Series  │  │  - Schema       │  │  - Routing      │      │
-│  │  - Search Index │  │  - Distribution │  │  - Escalation   │      │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘      │
-│           │                    │                    │                │
-│           └────────────────────┼────────────────────┘                │
-│                                │                                     │
-│                    ┌───────────▼───────────┐                        │
-│                    │     API Gateway       │                        │
-│                    └───────────┬───────────┘                        │
-└────────────────────────────────┼────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         UI Dashboard                                 │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐                │
-│  │Lineage  │  │ Alerts  │  │ Health  │  │ Impact  │                │
-│  │ Graph   │  │  Feed   │  │ Scores  │  │Analysis │                │
-│  └─────────┘  └─────────┘  └─────────┘  └─────────┘                │
-└─────────────────────────────────────────────────────────────────────┘
-```
+## Architecture
 
-### Data Collection Flow
+```mermaid
+flowchart TD
+    WH[(Data Warehouses)] --> Collectors[Metadata Collectors]
+    Collectors --> Store[Metadata and Metric History]
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Collection Architecture                        │
-│                                                                    │
-│  Push-based:                    Pull-based:                       │
-│  ┌─────────────┐                ┌─────────────┐                   │
-│  │  Webhooks   │                │  Scheduled  │                   │
-│  │  (events)   │                │  (crawlers) │                   │
-│  └──────┬──────┘                └──────┬──────┘                   │
-│         │                              │                          │
-│         ▼                              ▼                          │
-│  ┌────────────────────────────────────────────┐                   │
-│  │            Collection Queue                │                   │
-│  │         (Kafka / Redis Streams)            │                   │
-│  └────────────────┬───────────────────────────┘                   │
-│                   │                                               │
-│                   ▼                                               │
-│  ┌────────────────────────────────────────────┐                   │
-│  │          Metadata Processors               │                   │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐   │                   │
-│  │  │ Schema   │ │ Stats    │ │ Lineage  │   │                   │
-│  │  │ Parser   │ │Aggregator│ │ Builder  │   │                   │
-│  │  └──────────┘ └──────────┘ └──────────┘   │                   │
-│  └────────────────────────────────────────────┘                   │
-└──────────────────────────────────────────────────────────────────┘
+    Store --> Stat[Statistical Detector]
+    Store --> ML[Isolation Forest Detector]
+    Stat --> Ensemble[Ensemble Detector]
+    ML --> Ensemble
+    Ensemble --> Correlate[Anomaly Correlator]
+
+    Store --> Lineage[SQL Lineage Graph]
+    Store --> Health[Health Scorer]
+    Store --> PII[PII Detector]
+    Store --> Forecast[Metric Forecaster]
+
+    Correlate --> Alerting[Alerting Engine]
+    Lineage --> Alerting
+    Alerting --> Channels[Slack / Teams / PagerDuty / Email / Webhook / Log]
+    Correlate --> Triage[LLM Triage Runbooks]
+
+    API[FastAPI Gateway] --> Store
+    API --> Ensemble
+    API --> Lineage
+    API --> Health
+    API --> PII
 ```
 
----
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Collectors | `collectors.py` | Pull table/column metadata and stats from warehouses |
+| Rule detector | `detector.py` | Freshness/volume/schema/null/distribution monitors |
+| ML detector | `ml_detector.py` | Statistical + Isolation Forest ensemble and correlation |
+| Lineage graph | `lineage.py` | Directed table/column graph, traversal, impact analysis |
+| SQL parser | `sql_parser.py` | Extract sources, targets, and column mappings from SQL |
+| Health | `health.py` | Roll signals into a 0–100 `DataHealthScore` |
+| PII | `pii.py` | Name- and value-based PII classification |
+| Alerting | `alerting.py` | Rule matching, dedup, routing, escalation, channels |
+| Forecaster | `forecaster.py` | Trend/seasonal decomposition for proactive alerts |
+| Integrations | `integrations.py` | Airflow/dbt/Spark hooks and auto-remediation |
+| LLM triage | `llm_triage.py` | Generate incident triage and runbooks |
+| API | `api.py` | FastAPI REST gateway |
 
-## Core Internals
+The platform is a set of cooperating components rather than a layered monolith, and they
+communicate through the shared dataclasses in `models.py`:
 
-### Metadata Collector
+- **Collection layer** (`collectors.py`) — abstract `MetadataCollector` with concrete
+  warehouse adapters and an in-memory implementation. Produces `TableMetadata` and
+  `ColumnStats`.
+- **Detection layer** (`detector.py`, `ml_detector.py`) — keeps rolling per-table metric
+  history and emits typed `Anomaly` records. Two implementations: a rule-based
+  `AnomalyDetector` and an `EnsembleDetector` that combines statistical methods with an
+  Isolation Forest.
+- **Lineage layer** (`lineage.py`, `sql_parser.py`) — a `LineageGraph` built either by
+  hand or from parsed SQL, supporting transitive traversal and impact analysis.
+- **Scoring and classification** (`health.py`, `pii.py`) — aggregate signals into a
+  `DataHealthScore` and classify columns as PII.
+- **Alerting and triage** (`alerting.py`, `llm_triage.py`) — rule matching, routing,
+  escalation, and optional LLM-generated runbooks.
+- **Forecasting** (`forecaster.py`) — projects metric trends to anticipate anomalies.
+- **Integrations** (`integrations.py`) — Airflow/dbt/Spark hooks and auto-remediation.
+- **Gateway** (`api.py`) — a FastAPI app wiring the components behind REST endpoints.
+
+The end-to-end flow for a single monitoring sweep ties these together:
+
+1. A `MetadataCollector` returns the table's current `TableMetadata` and a
+   `{column -> ColumnStats}` map.
+2. The detector compares those values against its rolling history and emits zero or more
+   typed `Anomaly` records, then records the new observations for next time.
+3. The `AnomalyCorrelator` folds the new anomalies into incident groups using the lineage
+   graph, so related failures collapse into one incident.
+4. The `HealthScorer` recomputes the table's `DataHealthScore` from the same metadata,
+   stats, and recent anomalies.
+5. Each anomaly flows into the `AlertingEngine`, which deduplicates, matches rules, routes
+   to channels, and optionally schedules escalation.
+6. For high-severity incidents, the `LLMTriageEngine` generates a triage summary and
+   runbook from the anomaly and its context.
+
+The same components are reachable individually through the FastAPI gateway, which is how the
+API tests drive them without an event loop of their own.
+
+## Core Components
+
+### Metadata Collectors
+
+`MetadataCollector` (`collectors.py`) is an abstract base with four coroutine methods:
 
 ```python
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-
-@dataclass
-class TableMetadata:
-    """Metadata for a data table"""
-    table_id: str
-    database: str
-    schema: str
-    table_name: str
-    columns: List['ColumnMetadata']
-    row_count: int
-    size_bytes: int
-    last_modified: datetime
-    partitions: List[str]
-    owner: str
-    tags: Dict[str, str]
-
-@dataclass
-class ColumnMetadata:
-    """Metadata for a column"""
-    name: str
-    data_type: str
-    nullable: bool
-    description: Optional[str]
-    stats: 'ColumnStats'
-
-@dataclass
-class ColumnStats:
-    """Statistical profile for a column"""
-    null_count: int
-    null_ratio: float
-    distinct_count: int
-    min_value: Any
-    max_value: Any
-    mean: Optional[float]
-    stddev: Optional[float]
-    histogram: Optional[List[int]]
-
 class MetadataCollector(ABC):
-    """Base class for metadata collectors"""
-
     @abstractmethod
-    async def collect_schema(self, table_ref: str) -> TableMetadata:
-        """Collect schema metadata for a table"""
-        pass
-
+    async def collect_schema(self, table_ref: str) -> TableMetadata: ...
     @abstractmethod
-    async def collect_stats(self, table_ref: str) -> Dict[str, ColumnStats]:
-        """Collect column statistics for a table"""
-        pass
-
+    async def collect_stats(self, table_ref: str) -> Dict[str, ColumnStats]: ...
     @abstractmethod
-    async def collect_lineage(self, table_ref: str) -> 'LineageInfo':
-        """Collect lineage information for a table"""
-        pass
-
-class SnowflakeCollector(MetadataCollector):
-    """Collector for Snowflake data warehouse"""
-
-    def __init__(self, connection_params: dict):
-        self.conn = snowflake.connector.connect(**connection_params)
-
-    async def collect_schema(self, table_ref: str) -> TableMetadata:
-        database, schema, table = table_ref.split('.')
-
-        # Get columns
-        columns_query = f"""
-            SELECT
-                column_name,
-                data_type,
-                is_nullable,
-                comment
-            FROM {database}.information_schema.columns
-            WHERE table_schema = '{schema}'
-              AND table_name = '{table}'
-            ORDER BY ordinal_position
-        """
-        columns_df = self._execute(columns_query)
-
-        # Get table stats
-        stats_query = f"""
-            SELECT
-                row_count,
-                bytes
-            FROM {database}.information_schema.tables
-            WHERE table_schema = '{schema}'
-              AND table_name = '{table}'
-        """
-        stats_df = self._execute(stats_query)
-
-        return TableMetadata(
-            table_id=f"{database}.{schema}.{table}",
-            database=database,
-            schema=schema,
-            table_name=table,
-            columns=[
-                ColumnMetadata(
-                    name=row['column_name'],
-                    data_type=row['data_type'],
-                    nullable=row['is_nullable'] == 'YES',
-                    description=row['comment'],
-                    stats=None  # Populated separately
-                )
-                for _, row in columns_df.iterrows()
-            ],
-            row_count=stats_df['row_count'].iloc[0],
-            size_bytes=stats_df['bytes'].iloc[0],
-            last_modified=datetime.now(),
-            partitions=[],
-            owner='',
-            tags={}
-        )
-
-    async def collect_stats(self, table_ref: str) -> Dict[str, ColumnStats]:
-        database, schema, table = table_ref.split('.')
-
-        # Profile query for each column
-        stats = {}
-        schema_info = await self.collect_schema(table_ref)
-
-        for col in schema_info.columns:
-            col_stats = await self._profile_column(table_ref, col.name, col.data_type)
-            stats[col.name] = col_stats
-
-        return stats
-
-    async def _profile_column(
-        self,
-        table_ref: str,
-        column_name: str,
-        data_type: str
-    ) -> ColumnStats:
-        # Build profiling query based on data type
-        if data_type in ('NUMBER', 'FLOAT', 'INTEGER'):
-            query = f"""
-                SELECT
-                    COUNT(*) as total_count,
-                    SUM(CASE WHEN {column_name} IS NULL THEN 1 ELSE 0 END) as null_count,
-                    COUNT(DISTINCT {column_name}) as distinct_count,
-                    MIN({column_name}) as min_value,
-                    MAX({column_name}) as max_value,
-                    AVG({column_name}) as mean,
-                    STDDEV({column_name}) as stddev
-                FROM {table_ref}
-            """
-        else:
-            query = f"""
-                SELECT
-                    COUNT(*) as total_count,
-                    SUM(CASE WHEN {column_name} IS NULL THEN 1 ELSE 0 END) as null_count,
-                    COUNT(DISTINCT {column_name}) as distinct_count,
-                    MIN({column_name}) as min_value,
-                    MAX({column_name}) as max_value,
-                    NULL as mean,
-                    NULL as stddev
-                FROM {table_ref}
-            """
-
-        result = self._execute(query)
-        row = result.iloc[0]
-
-        return ColumnStats(
-            null_count=int(row['null_count']),
-            null_ratio=row['null_count'] / row['total_count'] if row['total_count'] > 0 else 0,
-            distinct_count=int(row['distinct_count']),
-            min_value=row['min_value'],
-            max_value=row['max_value'],
-            mean=float(row['mean']) if row['mean'] else None,
-            stddev=float(row['stddev']) if row['stddev'] else None,
-            histogram=None
-        )
+    async def collect_lineage(self, table_ref: str) -> LineageInfo: ...
+    @abstractmethod
+    async def get_column_sample(self, table_ref: str, column: str, size: int) -> List[Any]: ...
 ```
 
-### Anomaly Detection Engine
+`InMemoryCollector` is the reference implementation used by the tests. Tables and samples
+are registered up front with `add_table(...)` and `add_sample(...)`, and the four collect
+methods serve them back. Because the interface is fully async, the in-memory path exercises
+the same coroutine call sites as the warehouse adapters.
+
+`GenericSQLCollector` implements the shared SQL-profiling logic: it opens a connection,
+queries the `information_schema` for columns, and builds a per-column profiling query to
+populate `ColumnStats`. The profiling query branches on whether the column is numeric — for
+numeric types it computes `AVG` and `STDDEV` alongside the universal counts, and for
+non-numeric types it leaves `mean`/`stddev` null:
 
 ```python
-import numpy as np
-from scipy import stats
-from sklearn.ensemble import IsolationForest
-from typing import Tuple, List
-from enum import Enum
+async def _profile_column(self, table_ref, column_name, data_type):
+    is_numeric = data_type.lower() in (
+        "integer", "int", "bigint", "smallint",
+        "numeric", "decimal", "float", "double", "real", "number",
+    )
+    # SELECT COUNT(*), SUM(CASE WHEN col IS NULL ...), COUNT(DISTINCT col),
+    #        MIN(col), MAX(col) [, AVG(col), STDDEV(col) if numeric] FROM table_ref
+    row = (await self._execute(query))[0]
+    total, null_count = row["total_count"], row["null_count"]
+    return ColumnStats(
+        null_count=null_count,
+        null_ratio=null_count / total if total > 0 else 0,
+        distinct_count=row["distinct_count"],
+        min_value=row.get("min_value"), max_value=row.get("max_value"),
+        mean=float(row["mean"]) if row.get("mean") else None,
+        stddev=float(row["stddev"]) if row.get("stddev") else None,
+    )
+```
 
+`collect_stats` calls `_profile_column` for every column returned by `collect_schema`, and
+`get_column_sample` issues a `SELECT … WHERE col IS NOT NULL LIMIT n` for the PII scanner.
+The vendor adapters — `SnowflakeCollector`, `BigQueryCollector`, `PostgresCollector`,
+`RedshiftCollector`, `DatabricksCollector` — subclass `GenericSQLCollector` and override
+`connect()` and `_execute_with_connection()` to use the appropriate driver and dialect; the
+`information_schema` query in `collect_schema` is overridden where a warehouse exposes
+metadata differently. `create_collector(...)` is a factory that dispatches on
+`warehouse_type` so callers can configure a warehouse purely from a `WarehouseConfig`
+without importing the concrete class. This is the seam between the tested in-process path
+and the credential-gated live path: every subsystem above the collector is written against
+the abstract interface and the `InMemoryCollector`, so swapping in a real warehouse changes
+nothing downstream.
+
+### Anomaly Detection — Rule-Based
+
+`AnomalyDetector` (`detector.py`) maintains rolling history dictionaries keyed by table
+(and column, where relevant), capped at the last 100 points. Each `record_*` method appends
+and trims; each `detect_*` coroutine reads the history and returns an `Optional[Anomaly]`.
+
+- **Volume** — computes mean and standard deviation of the row-count history and a z-score
+  for the current count. When `std == 0` it substitutes an effective standard deviation of
+  `mean / volume_threshold` so that a flat history still flags a large jump. Severity is
+  `critical` above a z-score of 5, otherwise `warning`.
+- **Freshness** — takes the first difference of the update-timestamp history to get typical
+  intervals, then flags when the current interval exceeds `mean + 3·std`. Severity is
+  `critical` when the table is more than 24 hours overdue.
+- **Schema** — diffs the previous and current `TableMetadata` via `_diff_schemas`,
+  producing `SchemaChange` records for added, removed, and type-changed columns. Removals
+  and type changes are `critical`; additions are `warning`.
+- **Null rate** — z-score against the column's null-ratio history, with the same
+  effective-std floor as volume. A null ratio at or above 0.5 is `critical`.
+- **Distribution** — accumulates a multi-dimensional anomaly score from the z-scores of
+  null ratio, distinct count, and mean (where numeric), flagging when the total exceeds 3.
+
+`detect_all_anomalies` runs every check for a table, then records the new observations so
+the next call sees them.
+
+The volume check is the canonical example of the design. The effective-standard-deviation
+floor is what makes a flat history usable: a table that has reported exactly 1000 rows ten
+times in a row has `std == 0`, and a naive z-score would divide by zero or never fire.
+Substituting `mean / volume_threshold` as the effective std means a 3× threshold flags any
+count that moves by more than the mean itself, so a drop to 200 rows is caught even with no
+historical variance:
+
+```python
+async def detect_volume_anomaly(self, table_id, current_count):
+    history = self._volume_history.get(table_id, [])
+    if len(history) < self.config.min_history_points:
+        return None
+    mean = float(np.mean(history))
+    std = float(np.std(history))
+    min_tolerance = mean if mean > 0 else 1
+    effective_std = max(std, min_tolerance / self.config.volume_threshold) if std == 0 else std
+    z_score = (current_count - mean) / effective_std
+    if abs(z_score) > self.config.volume_threshold:
+        severity = "critical" if abs(z_score) > 5 else "warning"
+        return Anomaly(..., anomaly_type=AnomalyType.VOLUME, severity=severity,
+                       expected_range=(mean - 3 * std, mean + 3 * std), ...)
+    return None
+```
+
+Freshness detection works on *intervals* rather than absolute timestamps: it takes
+`np.diff` of the recorded update times to recover the table's natural cadence, so a table
+that updates hourly and one that updates daily are each judged against their own rhythm
+rather than a fixed staleness limit. Schema detection is a set diff over column names and
+types, classified into added / removed / type-changed, with removals and type changes
+treated as breaking. Every returned `Anomaly` carries a `context` dictionary with the
+supporting numbers (z-score, historical mean and std, the diff, the last ten history
+points) so a downstream consumer — or the LLM triage engine — has the evidence behind the
+verdict.
+
+### Anomaly Detection — ML Ensemble
+
+`ml_detector.py` adds an Isolation Forest path that runs alongside the statistical methods.
+
+`IsolationForestDetector` wraps scikit-learn's `IsolationForest`. Training samples are
+`FeatureVector` objects buffered in memory; `fit(min_samples=30)` scales the features with
+`StandardScaler` and fits the forest. `predict` returns a `DetectionResult` with an
+`is_anomaly` flag, a normalized `anomaly_score`, per-feature contributions (the scaled
+deviation from the mean, used as a SHAP-free proxy), and a confidence derived from the
+distance to the decision boundary. sklearn is an optional dependency — the class raises a
+clear `ImportError` if it is missing.
+
+`EnsembleDetector.extract_features` turns a table's metadata and column stats into a fixed
+feature vector: row count, byte size, column count, and aggregate null-ratio and
+cardinality statistics. `detect_anomalies` always runs the `StatisticalDetector` (IQR for
+volume, modified-z-score for null rates — both robust to outliers) and, when the forest has
+been fitted and confidence exceeds 0.6, adds an ML-detected distribution anomaly naming the
+top contributing features.
+
+The statistical detector deliberately uses estimators that are robust to outliers in the
+history, because a metric series that already contains a past incident would poison a
+mean/std model. Volume uses Tukey's IQR fences (`Q1 − 1.5·IQR`, `Q3 + 1.5·IQR`); null rates
+use the modified z-score built on the median and median absolute deviation
+(`0.6745·(x − median)/MAD`), with a percentage-change fallback when MAD is zero. The
+modified z-score's 3.5 cutoff is the conventional threshold from Iglewicz and Hoaglin.
+
+`AnomalyCorrelator` keeps a sliding window of recent anomalies (30 minutes by default) and
+groups them into candidate incidents. `find_correlated` links two anomalies when they share
+a table, sit in an upstream/downstream relationship in the lineage graph, or are the same
+type within a five-minute window; `get_incident_groups` performs a simple single-pass
+clustering over the window so that a fan-out failure — one upstream table breaking and
+taking ten downstream tables with it — surfaces as one incident with eleven members rather
+than eleven separate pages.
+
+### Lineage Graph and SQL Parser
+
+`LineageGraph` (`lineage.py`) is an in-memory directed graph of tables connected by
+`LineageEdge` objects that carry an optional transformation label and column mappings.
+`add_table`, `add_lineage`/`add_edge`, and the removal methods mutate the graph;
+`get_upstream`/`get_downstream` return immediate neighbors while `get_all_upstream`/
+`get_all_downstream` traverse transitively up to a depth bound. `get_impact_analysis`
+returns an `ImpactAnalysis` summarizing everything reachable downstream, `trace_column` and
+`get_column_lineage` follow column-level mappings, and `to_dict` serializes the graph.
+
+Both the immediate (`get_upstream`/`get_downstream`) and transitive
+(`get_all_upstream`/`get_all_downstream`) traversals are breadth-first walks over the node
+adjacency sets with a `visited` guard, so cycles in the graph terminate cleanly and each
+table appears at most once in the result. `get_impact_analysis` reuses the transitive
+downstream walk and attaches whatever `TableMetadata` is known for each affected node, which
+is what makes "if I break this table, what else breaks" a single call.
+
+`sql_parser.py` builds the lineage edges from query text. `SQLParser.parse` prefers
+`sqlglot` (parsing into an expression tree and walking `exp.Table`, `exp.Select`,
+`exp.Insert`, etc.) and falls back to a regex extractor when sqlglot is unavailable or a
+statement fails to parse. It classifies the statement (`SELECT`, `INSERT`,
+`CREATE TABLE AS`, `MERGE`, `UPDATE`), extracts source and target `TableReference`s, and
+derives column mappings from `SELECT` aliases and `INSERT` column lists. The
+sqlglot/regex split is the honest part of the design: with sqlglot present, the parser
+understands aliases, qualified names, and column provenance; without it, the regex path
+recovers table names from `FROM`/`JOIN`/`INTO` clauses but cannot resolve column mappings.
+`LineageExtractor` runs the parser over a whole workload of queries:
+`build_dependency_graph` returns a `target -> {sources}` map, and `get_table_dependencies`
+answers upstream/downstream questions for one table by checking whether it appears as a
+source or a target across the workload.
+
+### Health Scoring
+
+`HealthScorer` (`health.py`) computes four sub-scores — freshness, volume, schema, and
+quality — each on a 0–100 scale, then combines them with fixed weights into an overall
+`DataHealthScore`:
+
+```python
+weights = {"freshness": 0.25, "volume": 0.25, "schema": 0.20, "quality": 0.30}
+overall = (freshness * 0.25) + (volume * 0.25) + (schema * 0.20) + (quality * 0.30)
+```
+
+Each sub-score is a piecewise-linear decay rather than a hard threshold, which keeps the
+overall number continuous and interpretable:
+
+- **Freshness** is 100 while the table is within its expected interval, decays linearly to
+  50 over the second interval, then decays severely toward 0 beyond 2× the interval.
+- **Volume** is 100 while the row count is within `volume_variance_threshold` (default 20%)
+  of the historical mean, then decays in two bands as variance grows. With fewer than three
+  history points it returns 100 — absence of evidence is treated as healthy, not unhealthy.
+- **Schema** starts at 100 and subtracts a per-anomaly penalty (30 for critical, 15 for
+  warning) for recent schema anomalies.
+- **Quality** starts at 100 and subtracts penalties for columns whose null ratio exceeds
+  `quality_null_threshold` (default 10%) plus penalties for recent null-rate and
+  distribution anomalies.
+
+Every sub-score appends a human-readable `factor` dict ("Last updated 30.2 hours ago",
+"3 column(s) with high null rates") to the score's `factors` list, so the resulting
+`DataHealthScore` explains *why* it is what it is rather than just reporting a number.
+`HealthMonitor` records scores over time (capped at 100 per table), fits a linear trend with
+`np.polyfit` to label the direction improving/declining/stable, lists degraded tables below
+a threshold, and produces a fleet-wide healthy/warning/critical summary.
+
+### PII Detection
+
+`PIIDetector` (`pii.py`) classifies columns through two independent signals and combines
+their confidences. The first is **column-name suspicion**: the name is matched against a
+curated token list (`ssn`, `email`, `phone`, `credit_card`, `dob`, `bank_account`,
+`passport`, `drivers_license`, …) and mapped to a `PIIType`. The second is **value-pattern
+matching**: anchored regexes classify a sampled value as `EMAIL`, `PHONE`, `SSN`,
+`CREDIT_CARD`, `IP_ADDRESS`, `ZIP_CODE`, or `DATE_OF_BIRTH`, and a column is flagged only
+when the match ratio across the sample crosses a threshold — so a single coincidental match
+does not label a column as PII. `detect` uses looser unanchored patterns for finding PII
+inside free text, while `scan_column`/`scan_table` use the anchored patterns for
+column-level classification. The two signals are deliberately complementary: a column named
+`x17` full of `123-45-6789` values is caught by the data pattern even with a meaningless
+name, and a sparsely populated `ssn` column is caught by the name even when few values
+match. `mask` redacts detected values, `get_recommendations` suggests remediations
+(encryption, access controls), and `column_name_suspicion` exposes the name signal as a
+0–1 score. A `PIIRegistry` stores detections, surfaces high-risk tables above a confidence
+threshold, and summarizes coverage across the warehouse.
+
+### Alerting Engine
+
+`AlertingEngine` (`alerting.py`) holds registered channels and rules. `process_anomaly`
+deduplicates within a configurable window, finds every matching `AlertRule`, builds an
+`Alert`, fans it out to the union of the matched rules' channels (or the default channels
+when nothing matches), stores it, and schedules an escalation timer for any rule with an
+`EscalationPolicy`. Alerts can be acknowledged and resolved, and queried by status or table.
+
+The routing logic fans out to the *union* of every matched rule's channels, which is what
+lets one anomaly notify both Slack and PagerDuty without duplicate alerts:
+
+```python
+async def process_anomaly(self, anomaly):
+    dedup_key = f"{anomaly.table_id}:{anomaly.anomaly_type.value}:{anomaly.anomaly_id}"
+    if self._within_dedup_window(dedup_key):
+        return self._existing_alert_for(anomaly)
+    matching_rules = [r for r in self.rules if r.matches(anomaly)]
+    alert = Alert(alert_id=generate_id(), anomaly=anomaly, created_at=datetime.now())
+    channels = set()
+    for rule in matching_rules:
+        channels.update(rule.get_channels(anomaly))
+    if not matching_rules:
+        channels.update(self.default_channels)
+    for name in channels:
+        if name in self.channels:
+            await self.channels[name].send(alert)
+    self._store(alert, dedup_key)
+    for rule in matching_rules:
+        if rule.escalation_policy:
+            asyncio.create_task(self._escalation_timer(alert, rule.escalation_policy))
+    return alert
+```
+
+Escalation is a fire-and-forget asyncio task that sleeps for the policy's
+`escalate_after_minutes` and then re-checks the alert's status; if it is still `active`, it
+fans out to the escalation channels with `escalated=True`. `AlertRule.matches` filters on
+anomaly type, severity, and table-name patterns, so a rule can target, say, only critical
+freshness anomalies on `prod.*` tables.
+
+`AlertChannel` is an abstract base with six implementations. `LogChannel` records alerts
+in memory for testing; `SlackChannel`, `TeamsChannel`, `PagerDutyChannel`, `EmailChannel`,
+and `WebhookChannel` build the appropriate payload (Slack Block Kit, Teams MessageCard,
+PagerDuty Events API, an email body, or an HMAC-signed JSON webhook) and, in this build,
+log the payload they *would* send rather than performing live network I/O — the channel
+objects also retain the constructed payloads in memory so the tests can assert on them.
+Three ready-made rules ship with the module: `CRITICAL_ALERT_RULE` (Slack + PagerDuty with
+15-minute escalation), `SCHEMA_CHANGE_RULE`, and `FRESHNESS_ALERT_RULE`.
+
+### Forecasting, Integrations, and LLM Triage
+
+`MetricForecaster` (`forecaster.py`) records metric series and projects them forward with a
+classical additive decomposition rather than an external forecasting library. The trend
+component is a centered moving average (`np.convolve`) over a window of the seasonality
+period; the seasonal component reshapes the series into complete periods and averages each
+position to recover the repeating pattern; and the residual standard deviation measures how
+far the reconstructed `trend·w_t + seasonal·w_s` signal sits from the observed values. Each
+forecast point combines the extrapolated trend, the seasonal index for that future slot, and
+a persistence term, and widens its 95% confidence band as `1.96·σ·√i` so uncertainty grows
+the further out the projection runs:
+
+```python
+predicted = trend_value * trend_weight + seasonal_value * seasonal_weight
+predicted += values[-1] * (1 - trend_weight - seasonal_weight)
+lower = predicted - 1.96 * residual_std * np.sqrt(i)
+upper = predicted + 1.96 * residual_std * np.sqrt(i)
+```
+
+`forecast` returns `None` until it has at least two full seasonal periods of history, so it
+never extrapolates from too little data. `AnomalyForecaster` uses those bounds to anticipate
+anomalies: if the current value already sits outside the projected band, it raises a
+forward-looking warning before the metric crosses a hard threshold.
+
+`integrations.py` wires the platform into the orchestration layer. `AirflowIntegration`
+produces callables that fit Airflow's hook points: `create_lineage_callback` records a
+source→target edge as a task runs, `create_quality_check` raises (failing the task) when a
+critical anomaly is present, and `create_freshness_sensor_check` returns a poke function a
+sensor can wait on. `DbtIntegration.process_manifest` reads a dbt `manifest.json` and
+registers the models and their `ref()`/`source()` dependencies as lineage edges, so lineage
+can be bootstrapped from an existing dbt project without parsing SQL. `SparkIntegration`
+provides the analogous hooks for Spark jobs. All three talk to an `ObservabilityClient`
+facade. `AutoRemediation` ties detection back to action: `remediate_freshness` and
+`remediate_volume_drop` are remediation handlers that return a `RemediationResult`
+describing what they would do (re-trigger a pipeline, page an owner), so the loop from
+"anomaly detected" to "action taken" is closed in code even though the concrete actions are
+no-ops in this build.
+
+`llm_triage.py` defines an `LLMTriageEngine` that generates incident triage and runbooks
+through a pluggable `LLMClient` Protocol. The engine builds a structured prompt from the
+anomaly and its context (`_build_context` pulls in the table, the metric values, the
+expected range, and any correlated anomalies), asks the client for JSON, and parses the
+response into a `TriageResult` (root-cause analysis, probable causes, recommended actions,
+severity assessment, estimated impact, and a confidence score) or a `GeneratedRunbook` (an
+ordered list of `RunbookStep`s with expected outcomes and rollback actions). Results are
+cached by a key derived from the anomaly and context, with a validity window, so repeated
+triage of the same incident does not re-spend tokens.
+
+The pluggable client is what keeps the path testable. `MockLLMClient` is the default and
+returns deterministic JSON keyed on the prompt ("root cause" vs "runbook"), with a small
+simulated latency, so the full triage and runbook flow — prompt construction, JSON parsing,
+caching, report formatting — runs in the test suite with no API keys. `AnthropicClient` and
+`OpenAIClient` are real adapters that satisfy the same Protocol and are selected by
+`TriageConfig.provider`; they only activate when credentials are supplied.
+`TriageReportGenerator` renders a `TriageResult` and `GeneratedRunbook` into a
+human-readable Markdown report for an on-call engineer.
+
+## Data Structures
+
+The shared model layer (`models.py`) is a set of plain dataclasses:
+
+```python
 class AnomalyType(Enum):
     VOLUME = "volume"
     FRESHNESS = "freshness"
     SCHEMA = "schema"
     DISTRIBUTION = "distribution"
     NULL_RATE = "null_rate"
+    UNIQUENESS = "uniqueness"
+    CUSTOM = "custom"
+
+
+@dataclass
+class ColumnStats:
+    null_count: int
+    null_ratio: float
+    distinct_count: int
+    min_value: Any = None
+    max_value: Any = None
+    mean: Optional[float] = None
+    stddev: Optional[float] = None
+    histogram: Optional[List[int]] = None
+
+
+@dataclass
+class ColumnMetadata:
+    name: str
+    data_type: str
+    nullable: bool
+    description: Optional[str] = None
+    stats: Optional[ColumnStats] = None
+
+
+@dataclass
+class TableMetadata:
+    table_id: str
+    database: str
+    schema: str
+    table_name: str
+    columns: List[ColumnMetadata]
+    row_count: int
+    size_bytes: int
+    last_modified: datetime
+    partitions: List[str] = field(default_factory=list)
+    owner: str = ""
+    tags: Dict[str, str] = field(default_factory=dict)
+
 
 @dataclass
 class Anomaly:
-    """Detected anomaly"""
     anomaly_id: str
     table_id: str
     column_name: Optional[str]
@@ -305,1370 +529,264 @@ class Anomaly:
     metric_value: float
     expected_range: Tuple[float, float]
     description: str
-    context: Dict[str, Any]
-
-class AnomalyDetector:
-    """ML-based anomaly detection for data quality"""
-
-    def __init__(self, config: 'DetectorConfig'):
-        self.config = config
-        self.models: Dict[str, Any] = {}
-        self.history: Dict[str, List[float]] = {}
-
-    async def detect_volume_anomaly(
-        self,
-        table_id: str,
-        current_count: int
-    ) -> Optional[Anomaly]:
-        """Detect anomalies in row count"""
-        history = await self._get_volume_history(table_id)
-
-        if len(history) < self.config.min_history_points:
-            return None
-
-        # Calculate statistics
-        mean = np.mean(history)
-        std = np.std(history)
-
-        # Z-score based detection
-        z_score = (current_count - mean) / std if std > 0 else 0
-
-        if abs(z_score) > self.config.volume_threshold:
-            severity = "critical" if abs(z_score) > 5 else "warning"
-
-            return Anomaly(
-                anomaly_id=generate_id(),
-                table_id=table_id,
-                column_name=None,
-                anomaly_type=AnomalyType.VOLUME,
-                severity=severity,
-                detected_at=datetime.now(),
-                metric_value=current_count,
-                expected_range=(mean - 3*std, mean + 3*std),
-                description=f"Row count {current_count} is {abs(z_score):.1f} standard deviations from expected {mean:.0f}",
-                context={
-                    "z_score": z_score,
-                    "historical_mean": mean,
-                    "historical_std": std,
-                    "history": history[-10:]
-                }
-            )
-
-        return None
-
-    async def detect_freshness_anomaly(
-        self,
-        table_id: str,
-        last_updated: datetime
-    ) -> Optional[Anomaly]:
-        """Detect anomalies in data freshness"""
-        history = await self._get_freshness_history(table_id)
-
-        if len(history) < self.config.min_history_points:
-            return None
-
-        # Calculate typical update interval
-        intervals = np.diff(history)
-        mean_interval = np.mean(intervals)
-        std_interval = np.std(intervals)
-
-        current_interval = (datetime.now() - last_updated).total_seconds()
-
-        if current_interval > mean_interval + 3 * std_interval:
-            delay_hours = (current_interval - mean_interval) / 3600
-
-            return Anomaly(
-                anomaly_id=generate_id(),
-                table_id=table_id,
-                column_name=None,
-                anomaly_type=AnomalyType.FRESHNESS,
-                severity="critical" if delay_hours > 24 else "warning",
-                detected_at=datetime.now(),
-                metric_value=current_interval,
-                expected_range=(0, mean_interval + 3*std_interval),
-                description=f"Table has not been updated for {delay_hours:.1f} hours longer than expected",
-                context={
-                    "last_updated": last_updated.isoformat(),
-                    "expected_interval_hours": mean_interval / 3600,
-                    "actual_interval_hours": current_interval / 3600
-                }
-            )
-
-        return None
-
-    async def detect_schema_anomaly(
-        self,
-        table_id: str,
-        current_schema: TableMetadata
-    ) -> Optional[Anomaly]:
-        """Detect schema changes"""
-        previous_schema = await self._get_previous_schema(table_id)
-
-        if not previous_schema:
-            return None
-
-        changes = self._diff_schemas(previous_schema, current_schema)
-
-        if changes:
-            severity = "critical" if any(
-                c['type'] in ('column_removed', 'type_changed') for c in changes
-            ) else "warning"
-
-            return Anomaly(
-                anomaly_id=generate_id(),
-                table_id=table_id,
-                column_name=None,
-                anomaly_type=AnomalyType.SCHEMA,
-                severity=severity,
-                detected_at=datetime.now(),
-                metric_value=len(changes),
-                expected_range=(0, 0),
-                description=f"Schema change detected: {len(changes)} modification(s)",
-                context={
-                    "changes": changes,
-                    "previous_column_count": len(previous_schema.columns),
-                    "current_column_count": len(current_schema.columns)
-                }
-            )
-
-        return None
-
-    async def detect_distribution_anomaly(
-        self,
-        table_id: str,
-        column_name: str,
-        current_stats: ColumnStats
-    ) -> Optional[Anomaly]:
-        """Detect anomalies in column value distribution"""
-        history = await self._get_distribution_history(table_id, column_name)
-
-        if not history or len(history) < self.config.min_history_points:
-            return None
-
-        # Use Isolation Forest for multivariate anomaly detection
-        features = np.array([
-            [h['null_ratio'], h['distinct_ratio'], h['mean'] or 0, h['stddev'] or 0]
-            for h in history
-        ])
-
-        model = IsolationForest(contamination=0.1, random_state=42)
-        model.fit(features)
-
-        current_features = np.array([[
-            current_stats.null_ratio,
-            current_stats.distinct_count / (current_stats.null_count + current_stats.distinct_count),
-            current_stats.mean or 0,
-            current_stats.stddev or 0
-        ]])
-
-        prediction = model.predict(current_features)
-
-        if prediction[0] == -1:  # Anomaly
-            return Anomaly(
-                anomaly_id=generate_id(),
-                table_id=table_id,
-                column_name=column_name,
-                anomaly_type=AnomalyType.DISTRIBUTION,
-                severity="warning",
-                detected_at=datetime.now(),
-                metric_value=model.score_samples(current_features)[0],
-                expected_range=(-1, 0),
-                description=f"Unusual distribution detected for column {column_name}",
-                context={
-                    "current_stats": {
-                        "null_ratio": current_stats.null_ratio,
-                        "distinct_count": current_stats.distinct_count,
-                        "mean": current_stats.mean,
-                        "stddev": current_stats.stddev
-                    },
-                    "isolation_score": float(model.score_samples(current_features)[0])
-                }
-            )
-
-        return None
-
-    async def detect_null_rate_anomaly(
-        self,
-        table_id: str,
-        column_name: str,
-        current_null_ratio: float
-    ) -> Optional[Anomaly]:
-        """Detect anomalies in null rate"""
-        history = await self._get_null_rate_history(table_id, column_name)
-
-        if len(history) < self.config.min_history_points:
-            return None
-
-        mean = np.mean(history)
-        std = np.std(history)
-
-        # Check for significant increase in null rate
-        if current_null_ratio > mean + 3 * std:
-            return Anomaly(
-                anomaly_id=generate_id(),
-                table_id=table_id,
-                column_name=column_name,
-                anomaly_type=AnomalyType.NULL_RATE,
-                severity="warning" if current_null_ratio < 0.5 else "critical",
-                detected_at=datetime.now(),
-                metric_value=current_null_ratio,
-                expected_range=(max(0, mean - 3*std), min(1, mean + 3*std)),
-                description=f"Null rate for {column_name} increased to {current_null_ratio:.1%} (expected ~{mean:.1%})",
-                context={
-                    "historical_mean": mean,
-                    "historical_std": std,
-                    "increase_factor": current_null_ratio / mean if mean > 0 else float('inf')
-                }
-            )
-
-        return None
+    context: Dict[str, Any] = field(default_factory=dict)
 ```
 
-### Lineage Graph
-
-```python
-from neo4j import GraphDatabase
-from typing import List, Set
-
-class LineageGraph:
-    """Graph-based lineage tracking using Neo4j"""
-
-    def __init__(self, uri: str, user: str, password: str):
-        self.driver = GraphDatabase.driver(uri, auth=(user, password))
-
-    def add_table(self, table: TableMetadata):
-        """Add or update a table node"""
-        with self.driver.session() as session:
-            session.run("""
-                MERGE (t:Table {id: $id})
-                SET t.database = $database,
-                    t.schema = $schema,
-                    t.name = $name,
-                    t.row_count = $row_count,
-                    t.updated_at = datetime()
-            """, {
-                'id': table.table_id,
-                'database': table.database,
-                'schema': table.schema,
-                'name': table.table_name,
-                'row_count': table.row_count
-            })
-
-            # Add columns
-            for col in table.columns:
-                session.run("""
-                    MATCH (t:Table {id: $table_id})
-                    MERGE (c:Column {id: $col_id})
-                    SET c.name = $name,
-                        c.data_type = $data_type
-                    MERGE (t)-[:HAS_COLUMN]->(c)
-                """, {
-                    'table_id': table.table_id,
-                    'col_id': f"{table.table_id}.{col.name}",
-                    'name': col.name,
-                    'data_type': col.data_type
-                })
-
-    def add_lineage(
-        self,
-        source_table: str,
-        target_table: str,
-        transformation: str = None,
-        column_mappings: List[dict] = None
-    ):
-        """Add a lineage edge between tables"""
-        with self.driver.session() as session:
-            # Table-level lineage
-            session.run("""
-                MATCH (source:Table {id: $source})
-                MATCH (target:Table {id: $target})
-                MERGE (source)-[r:FEEDS_INTO]->(target)
-                SET r.transformation = $transformation,
-                    r.created_at = datetime()
-            """, {
-                'source': source_table,
-                'target': target_table,
-                'transformation': transformation
-            })
-
-            # Column-level lineage
-            if column_mappings:
-                for mapping in column_mappings:
-                    session.run("""
-                        MATCH (sc:Column {id: $source_col})
-                        MATCH (tc:Column {id: $target_col})
-                        MERGE (sc)-[r:MAPS_TO]->(tc)
-                        SET r.transformation = $transformation
-                    """, {
-                        'source_col': f"{source_table}.{mapping['source']}",
-                        'target_col': f"{target_table}.{mapping['target']}",
-                        'transformation': mapping.get('transformation')
-                    })
-
-    def get_upstream(self, table_id: str, depth: int = 3) -> List[dict]:
-        """Get upstream dependencies"""
-        with self.driver.session() as session:
-            result = session.run("""
-                MATCH path = (t:Table {id: $id})<-[:FEEDS_INTO*1..%d]-(upstream:Table)
-                RETURN upstream.id as table_id,
-                       length(path) as distance,
-                       [rel in relationships(path) | rel.transformation] as transformations
-                ORDER BY distance
-            """ % depth, {'id': table_id})
-
-            return [dict(record) for record in result]
-
-    def get_downstream(self, table_id: str, depth: int = 3) -> List[dict]:
-        """Get downstream dependencies"""
-        with self.driver.session() as session:
-            result = session.run("""
-                MATCH path = (t:Table {id: $id})-[:FEEDS_INTO*1..%d]->(downstream:Table)
-                RETURN downstream.id as table_id,
-                       length(path) as distance,
-                       [rel in relationships(path) | rel.transformation] as transformations
-                ORDER BY distance
-            """ % depth, {'id': table_id})
-
-            return [dict(record) for record in result]
-
-    def get_impact_analysis(self, table_id: str) -> 'ImpactAnalysis':
-        """Analyze impact of changes to a table"""
-        downstream = self.get_downstream(table_id, depth=10)
-
-        # Get downstream tables with their metadata
-        affected_tables = []
-        affected_pipelines = set()
-        affected_dashboards = set()
-
-        for item in downstream:
-            table_info = self._get_table_info(item['table_id'])
-            affected_tables.append(table_info)
-
-            # Track pipelines
-            pipelines = self._get_pipelines_for_table(item['table_id'])
-            affected_pipelines.update(pipelines)
-
-            # Track dashboards
-            dashboards = self._get_dashboards_for_table(item['table_id'])
-            affected_dashboards.update(dashboards)
-
-        return ImpactAnalysis(
-            source_table=table_id,
-            affected_tables=affected_tables,
-            affected_pipelines=list(affected_pipelines),
-            affected_dashboards=list(affected_dashboards),
-            total_downstream=len(downstream)
-        )
-
-    def get_column_lineage(self, column_id: str) -> dict:
-        """Get column-level lineage"""
-        with self.driver.session() as session:
-            # Upstream columns
-            upstream = session.run("""
-                MATCH (c:Column {id: $id})<-[:MAPS_TO*1..5]-(upstream:Column)
-                RETURN upstream.id as column_id,
-                       upstream.name as name
-            """, {'id': column_id})
-
-            # Downstream columns
-            downstream = session.run("""
-                MATCH (c:Column {id: $id})-[:MAPS_TO*1..5]->(downstream:Column)
-                RETURN downstream.id as column_id,
-                       downstream.name as name
-            """, {'id': column_id})
-
-            return {
-                'upstream': [dict(r) for r in upstream],
-                'downstream': [dict(r) for r in downstream]
-            }
-```
-
-### Alerting Engine
-
-```python
-from typing import List, Dict
-import asyncio
-
-class AlertingEngine:
-    """Alert management and routing"""
-
-    def __init__(self, config: AlertConfig):
-        self.config = config
-        self.channels: Dict[str, AlertChannel] = {}
-        self.rules: List[AlertRule] = []
-
-    def add_channel(self, name: str, channel: 'AlertChannel'):
-        """Register an alert channel"""
-        self.channels[name] = channel
-
-    def add_rule(self, rule: 'AlertRule'):
-        """Add an alerting rule"""
-        self.rules.append(rule)
-
-    async def process_anomaly(self, anomaly: Anomaly):
-        """Process an anomaly and send alerts"""
-        # Find matching rules
-        matching_rules = [
-            rule for rule in self.rules
-            if rule.matches(anomaly)
-        ]
-
-        if not matching_rules:
-            # Use default rule
-            matching_rules = [self.config.default_rule]
-
-        # Create alert
-        alert = Alert(
-            alert_id=generate_id(),
-            anomaly=anomaly,
-            created_at=datetime.now(),
-            status='active'
-        )
-
-        # Route to channels
-        for rule in matching_rules:
-            channels = rule.get_channels(anomaly)
-
-            for channel_name in channels:
-                if channel_name in self.channels:
-                    await self.channels[channel_name].send(alert)
-
-        # Store alert
-        await self._store_alert(alert)
-
-        # Check escalation
-        await self._check_escalation(alert, matching_rules)
-
-    async def _check_escalation(self, alert: Alert, rules: List['AlertRule']):
-        """Check if alert should be escalated"""
-        for rule in rules:
-            if rule.escalation_policy:
-                asyncio.create_task(
-                    self._escalation_timer(alert, rule.escalation_policy)
-                )
-
-    async def _escalation_timer(self, alert: Alert, policy: 'EscalationPolicy'):
-        """Wait and escalate if not acknowledged"""
-        await asyncio.sleep(policy.escalate_after_minutes * 60)
-
-        # Check if still active
-        current_alert = await self._get_alert(alert.alert_id)
-
-        if current_alert.status == 'active':
-            # Escalate
-            for channel_name in policy.escalate_to:
-                if channel_name in self.channels:
-                    await self.channels[channel_name].send(alert, escalated=True)
-
-class AlertRule:
-    """Rule for alert routing"""
-
-    def __init__(
-        self,
-        name: str,
-        conditions: Dict[str, Any],
-        channels: List[str],
-        escalation_policy: 'EscalationPolicy' = None
-    ):
-        self.name = name
-        self.conditions = conditions
-        self.channels_list = channels
-        self.escalation_policy = escalation_policy
-
-    def matches(self, anomaly: Anomaly) -> bool:
-        """Check if anomaly matches this rule"""
-        # Check anomaly type
-        if 'anomaly_types' in self.conditions:
-            if anomaly.anomaly_type not in self.conditions['anomaly_types']:
-                return False
-
-        # Check severity
-        if 'severities' in self.conditions:
-            if anomaly.severity not in self.conditions['severities']:
-                return False
-
-        # Check table patterns
-        if 'table_patterns' in self.conditions:
-            if not any(
-                pattern in anomaly.table_id
-                for pattern in self.conditions['table_patterns']
-            ):
-                return False
-
-        return True
-
-    def get_channels(self, anomaly: Anomaly) -> List[str]:
-        """Get channels for this anomaly"""
-        return self.channels_list
-
-class SlackChannel:
-    """Slack alert channel"""
-
-    def __init__(self, webhook_url: str, channel: str):
-        self.webhook_url = webhook_url
-        self.channel = channel
-
-    async def send(self, alert: Alert, escalated: bool = False):
-        """Send alert to Slack"""
-        emoji = {
-            'critical': ':rotating_light:',
-            'warning': ':warning:',
-            'info': ':information_source:'
-        }.get(alert.anomaly.severity, ':grey_question:')
-
-        prefix = '[ESCALATED] ' if escalated else ''
-
-        blocks = [
-            {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": f"{emoji} {prefix}Data Anomaly Detected"
-                }
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Table:*\n{alert.anomaly.table_id}"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Type:*\n{alert.anomaly.anomaly_type.value}"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Severity:*\n{alert.anomaly.severity}"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Detected:*\n{alert.anomaly.detected_at.strftime('%Y-%m-%d %H:%M:%S')}"
-                    }
-                ]
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Description:*\n{alert.anomaly.description}"
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "View Details"},
-                        "url": f"https://observability.company.com/alerts/{alert.alert_id}"
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Acknowledge"},
-                        "action_id": f"ack_{alert.alert_id}"
-                    }
-                ]
-            }
-        ]
-
-        async with aiohttp.ClientSession() as session:
-            await session.post(
-                self.webhook_url,
-                json={"channel": self.channel, "blocks": blocks}
-            )
-```
-
----
-
-## Data Structures
-
-### Core Entities
+The remaining models follow the same pattern. `Alert` wraps an `Anomaly` with lifecycle
+fields; `DataHealthScore` carries the four sub-scores plus an overall score and contributing
+factors; `LineageInfo` and `ImpactAnalysis` describe graph relationships:
 
 ```python
 @dataclass
 class Alert:
-    """Alert entity"""
     alert_id: str
     anomaly: Anomaly
     created_at: datetime
-    status: str  # active, acknowledged, resolved
+    status: str = "active"               # active, acknowledged, resolved
     acknowledged_by: Optional[str] = None
     acknowledged_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
     resolution_notes: Optional[str] = None
 
-@dataclass
-class ImpactAnalysis:
-    """Impact analysis result"""
-    source_table: str
-    affected_tables: List[TableMetadata]
-    affected_pipelines: List[str]
-    affected_dashboards: List[str]
-    total_downstream: int
 
 @dataclass
 class DataHealthScore:
-    """Health score for a data asset"""
     table_id: str
-    overall_score: float  # 0-100
+    overall_score: float                 # 0-100
     freshness_score: float
     volume_score: float
     schema_score: float
     quality_score: float
     calculated_at: datetime
-    factors: List[dict]
+    factors: List[dict] = field(default_factory=list)
+
 
 @dataclass
-class Pipeline:
-    """Data pipeline entity"""
-    pipeline_id: str
-    name: str
-    orchestrator: str  # airflow, dagster, etc.
-    schedule: str
-    source_tables: List[str]
-    target_tables: List[str]
-    last_run: Optional[datetime]
-    last_status: Optional[str]
+class SchemaChange:
+    change_type: str                     # column_added, column_removed, type_changed
+    column_name: str
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
 ```
 
----
+`Pipeline`, `MetricHistory`, and the lineage `LineageEdge`/`LineageNode` types round out the
+warehouse and graph model. Choosing plain dataclasses over an ORM or Pydantic for the core
+model is deliberate: the model layer has no I/O and no validation framework dependency, so
+every subsystem can construct and pattern-match these objects freely, and the API layer is
+the only place Pydantic appears — at the boundary, where request/response validation
+actually belongs.
+
+The ML layer adds two dataclasses:
+
+```python
+@dataclass
+class FeatureVector:
+    table_id: str
+    features: np.ndarray
+    feature_names: List[str]
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class DetectionResult:
+    is_anomaly: bool
+    anomaly_score: float          # higher = more anomalous
+    feature_contributions: Dict[str, float]
+    confidence: float
+```
+
+Configuration (`config.py`) is a tree of dataclasses with sensible defaults:
+
+```python
+@dataclass
+class DetectorConfig:
+    min_history_points: int = 10
+    volume_threshold: float = 3.0
+    freshness_threshold_hours: float = 24.0
+    null_rate_threshold: float = 3.0
+    distribution_contamination: float = 0.1
+
+
+@dataclass
+class ObservabilityConfig:
+    detector: DetectorConfig = field(default_factory=DetectorConfig)
+    collector: CollectorConfig = field(default_factory=CollectorConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
+    alerts: AlertConfig = field(default_factory=AlertConfig)
+    warehouses: Dict[str, WarehouseConfig] = field(default_factory=dict)
+```
 
 ## API Design
 
+### Public Python API
+
+The package re-exports its public surface from `observability/__init__.py`. The detector,
+ensemble, lineage, alerting, health, PII, forecasting, and triage classes are all importable
+directly:
+
+```python
+from observability import (
+    AnomalyDetector, EnsembleDetector, AnomalyCorrelator,
+    LineageGraph, SQLParser, LineageExtractor, extract_lineage, extract_tables,
+    HealthScorer, HealthMonitor, PIIDetector, PIIRegistry,
+    AlertingEngine, AlertRule, EscalationPolicy,
+    SlackChannel, TeamsChannel, PagerDutyChannel, EmailChannel, WebhookChannel, LogChannel,
+    MetricForecaster, AnomalyForecaster,
+    LLMTriageEngine, MockLLMClient,
+    InMemoryCollector, create_collector,
+)
+```
+
+Detector and alerting calls are coroutines:
+
+```python
+detector = AnomalyDetector(DetectorConfig())
+for rows in (1000, 1010, 990, 1005, 1002, 998, 1001, 1003, 999, 1000, 1004):
+    detector.record_volume("sales.orders", rows)
+anomaly = await detector.detect_volume_anomaly("sales.orders", current_count=200)
+
+engine = AlertingEngine(default_channels=["log"])
+engine.add_channel("log", LogChannel())
+engine.add_rule(FRESHNESS_ALERT_RULE)
+alert = await engine.process_anomaly(anomaly)
+```
+
 ### REST API
 
-```yaml
-openapi: 3.0.0
-info:
-  title: Data Observability API
-  version: 1.0.0
+`api.py` builds a FastAPI app (`app`, plus a `create_app()` factory) exposing:
 
-paths:
-  /tables:
-    get:
-      summary: List monitored tables
-      parameters:
-        - name: database
-          in: query
-          schema:
-            type: string
-        - name: search
-          in: query
-          schema:
-            type: string
-      responses:
-        200:
-          description: List of tables
-
-  /tables/{table_id}:
-    get:
-      summary: Get table details
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TableDetails'
-
-  /tables/{table_id}/lineage:
-    get:
-      summary: Get table lineage
-      parameters:
-        - name: direction
-          in: query
-          schema:
-            type: string
-            enum: [upstream, downstream, both]
-        - name: depth
-          in: query
-          schema:
-            type: integer
-            default: 3
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Lineage'
-
-  /tables/{table_id}/health:
-    get:
-      summary: Get table health score
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HealthScore'
-
-  /tables/{table_id}/anomalies:
-    get:
-      summary: Get anomalies for table
-      parameters:
-        - name: start_date
-          in: query
-          schema:
-            type: string
-            format: date
-        - name: end_date
-          in: query
-          schema:
-            type: string
-            format: date
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/Anomaly'
-
-  /anomalies:
-    get:
-      summary: List all anomalies
-      parameters:
-        - name: status
-          in: query
-          schema:
-            type: string
-            enum: [active, acknowledged, resolved]
-        - name: severity
-          in: query
-          schema:
-            type: string
-            enum: [critical, warning, info]
-
-  /anomalies/{anomaly_id}/acknowledge:
-    post:
-      summary: Acknowledge an anomaly
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                notes:
-                  type: string
-
-  /impact/{table_id}:
-    get:
-      summary: Get impact analysis
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ImpactAnalysis'
-
-  /pipelines:
-    get:
-      summary: List pipelines
-      responses:
-        200:
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/Pipeline'
-
-  /search:
-    get:
-      summary: Search across all entities
-      parameters:
-        - name: q
-          in: query
-          required: true
-          schema:
-            type: string
+```
+GET  /health
+GET  /tables                              list registered tables (filter by database/search)
+POST /tables                              register a table
+GET  /tables/{table_id}                   table detail
+GET  /tables/{table_id}/lineage           upstream/downstream lineage
+POST /tables/{table_id}/lineage           add an upstream edge
+GET  /tables/{table_id}/health            health score
+GET  /tables/{table_id}/anomalies         anomalies for a table
+POST /tables/{table_id}/detect            run detection for a table
+GET  /tables/{table_id}/pii               PII scan results
+GET  /anomalies                           list anomalies (filter by status/severity)
+GET  /anomalies/{anomaly_id}              anomaly detail
+POST /anomalies/{anomaly_id}/acknowledge  acknowledge an anomaly
+GET  /impact/{table_id}                   downstream impact analysis
 ```
 
-### Python SDK
-
-```python
-class ObservabilityClient:
-    """Client for Data Observability Platform"""
-
-    def __init__(self, base_url: str, api_key: str):
-        self.base_url = base_url
-        self.api_key = api_key
-
-    # Table operations
-    def get_table(self, table_id: str) -> TableDetails:
-        """Get table details"""
-        pass
-
-    def get_table_lineage(
-        self,
-        table_id: str,
-        direction: str = 'both',
-        depth: int = 3
-    ) -> Lineage:
-        """Get table lineage"""
-        pass
-
-    def get_table_health(self, table_id: str) -> HealthScore:
-        """Get table health score"""
-        pass
-
-    # Anomaly operations
-    def get_anomalies(
-        self,
-        table_id: str = None,
-        status: str = None,
-        severity: str = None
-    ) -> List[Anomaly]:
-        """Get anomalies"""
-        pass
-
-    def acknowledge_anomaly(
-        self,
-        anomaly_id: str,
-        notes: str = None
-    ) -> None:
-        """Acknowledge an anomaly"""
-        pass
-
-    # Impact analysis
-    def get_impact(self, table_id: str) -> ImpactAnalysis:
-        """Get impact analysis"""
-        pass
-
-    # Metadata management
-    def add_table_tags(self, table_id: str, tags: Dict[str, str]) -> None:
-        """Add tags to a table"""
-        pass
-
-    def add_column_description(
-        self,
-        table_id: str,
-        column_name: str,
-        description: str
-    ) -> None:
-        """Add description to a column"""
-        pass
-```
-
----
-
-## Enterprise Features
-
-### 1. PII Detection
-
-```python
-import re
-from typing import List, Tuple
-
-class PIIDetector:
-    """Detect PII in column names and data"""
-
-    def __init__(self):
-        self.patterns = {
-            'email': r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$',
-            'phone': r'^\+?1?\d{9,15}$',
-            'ssn': r'^\d{3}-\d{2}-\d{4}$',
-            'credit_card': r'^\d{13,16}$',
-            'ip_address': r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$',
-        }
-
-        self.suspicious_names = [
-            'ssn', 'social_security', 'password', 'pwd', 'secret',
-            'credit_card', 'card_number', 'cvv', 'pin',
-            'email', 'phone', 'mobile', 'address', 'dob', 'birth_date',
-            'first_name', 'last_name', 'full_name', 'name',
-            'ip_address', 'user_agent', 'location'
-        ]
-
-    def detect_in_column_name(self, column_name: str) -> List[str]:
-        """Detect PII indicators in column name"""
-        detections = []
-        name_lower = column_name.lower()
-
-        for suspicious in self.suspicious_names:
-            if suspicious in name_lower:
-                detections.append(f"Column name contains '{suspicious}'")
-
-        return detections
-
-    def detect_in_sample(self, column_name: str, sample: List[str]) -> List[Tuple[str, float]]:
-        """Detect PII patterns in data sample"""
-        detections = []
-
-        for pii_type, pattern in self.patterns.items():
-            matches = sum(1 for value in sample if re.match(pattern, str(value)))
-            ratio = matches / len(sample) if sample else 0
-
-            if ratio > 0.5:  # More than 50% match
-                detections.append((pii_type, ratio))
-
-        return detections
-
-    async def scan_table(self, table_id: str, collector: MetadataCollector) -> List[PIIDetection]:
-        """Scan a table for PII"""
-        schema = await collector.collect_schema(table_id)
-        detections = []
-
-        for column in schema.columns:
-            # Check column name
-            name_indicators = self.detect_in_column_name(column.name)
-
-            # Sample data
-            sample = await collector.get_column_sample(table_id, column.name, 1000)
-            data_indicators = self.detect_in_sample(column.name, sample)
-
-            if name_indicators or data_indicators:
-                detections.append(PIIDetection(
-                    table_id=table_id,
-                    column_name=column.name,
-                    name_indicators=name_indicators,
-                    data_indicators=data_indicators,
-                    confidence=self._calculate_confidence(name_indicators, data_indicators)
-                ))
-
-        return detections
-```
-
-### 2. Orchestrator Integration
-
-```python
-from airflow.hooks.base import BaseHook
-from airflow.models import Variable
-from airflow.operators.python import PythonOperator
-
-class AirflowIntegration:
-    """Integrate with Apache Airflow"""
-
-    def __init__(self, observability_client: ObservabilityClient):
-        self.client = observability_client
-
-    def create_lineage_callback(self, source_tables: List[str], target_table: str):
-        """Create callback for lineage tracking"""
-        def callback(context):
-            dag_id = context['dag'].dag_id
-            task_id = context['task'].task_id
-            run_id = context['run_id']
-
-            for source in source_tables:
-                self.client.add_lineage(
-                    source_table=source,
-                    target_table=target_table,
-                    transformation=f"airflow:{dag_id}.{task_id}",
-                    context={
-                        'run_id': run_id,
-                        'execution_date': str(context['execution_date'])
-                    }
-                )
-
-        return callback
-
-    def create_quality_check_operator(
-        self,
-        task_id: str,
-        table_id: str,
-        expectations: List[dict]
-    ) -> PythonOperator:
-        """Create operator for quality checks"""
-        def check_quality(**context):
-            # Run anomaly detection
-            anomalies = self.client.check_table(table_id)
-
-            if anomalies:
-                for anomaly in anomalies:
-                    if anomaly.severity == 'critical':
-                        raise Exception(f"Critical anomaly: {anomaly.description}")
-
-        return PythonOperator(
-            task_id=task_id,
-            python_callable=check_quality,
-            provide_context=True
-        )
-
-    def create_observability_sensor(
-        self,
-        task_id: str,
-        table_id: str,
-        max_staleness_hours: int = 24
-    ):
-        """Sensor to wait for fresh data"""
-        from airflow.sensors.base import BaseSensorOperator
-
-        class FreshnessSensor(BaseSensorOperator):
-            def poke(self, context):
-                health = self.client.get_table_health(table_id)
-                return health.freshness_score > 80
-
-        return FreshnessSensor(
-            task_id=task_id,
-            poke_interval=300,
-            timeout=3600
-        )
-```
-
-### 3. Time-Series Forecasting
-
-```python
-from prophet import Prophet
-import pandas as pd
-
-class MetricForecaster:
-    """Forecast metrics for proactive alerting"""
-
-    def __init__(self):
-        self.models: Dict[str, Prophet] = {}
-
-    def train(self, metric_name: str, history: pd.DataFrame):
-        """Train a forecasting model"""
-        # Prophet expects 'ds' (date) and 'y' (value) columns
-        df = history.rename(columns={'timestamp': 'ds', 'value': 'y'})
-
-        model = Prophet(
-            changepoint_prior_scale=0.05,
-            seasonality_prior_scale=10,
-            daily_seasonality=True,
-            weekly_seasonality=True
-        )
-
-        model.fit(df)
-        self.models[metric_name] = model
-
-    def forecast(
-        self,
-        metric_name: str,
-        periods: int = 24,
-        freq: str = 'H'
-    ) -> pd.DataFrame:
-        """Generate forecast"""
-        if metric_name not in self.models:
-            raise ValueError(f"No model trained for {metric_name}")
-
-        model = self.models[metric_name]
-        future = model.make_future_dataframe(periods=periods, freq=freq)
-        forecast = model.predict(future)
-
-        return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
-
-    async def detect_future_anomalies(
-        self,
-        table_id: str,
-        metric_name: str,
-        hours_ahead: int = 24
-    ) -> List[Anomaly]:
-        """Detect potential future anomalies"""
-        forecast = self.forecast(metric_name, periods=hours_ahead)
-
-        anomalies = []
-        current_value = await self._get_current_value(table_id, metric_name)
-
-        # Check if current value is outside forecast bounds
-        latest_forecast = forecast.iloc[-1]
-
-        if current_value < latest_forecast['yhat_lower'] or current_value > latest_forecast['yhat_upper']:
-            anomalies.append(Anomaly(
-                anomaly_id=generate_id(),
-                table_id=table_id,
-                column_name=None,
-                anomaly_type=AnomalyType.VOLUME,
-                severity="warning",
-                detected_at=datetime.now(),
-                metric_value=current_value,
-                expected_range=(latest_forecast['yhat_lower'], latest_forecast['yhat_upper']),
-                description=f"Forecasted anomaly: {metric_name} trending outside expected range",
-                context={
-                    'forecast': forecast.tail(24).to_dict(),
-                    'current_value': current_value
-                }
-            ))
-
-        return anomalies
-```
-
----
-
-## Stretch Goals
-
-### 1. Automatic Remediation
-
-```python
-class AutoRemediation:
-    """Automatic remediation for common issues"""
-
-    def __init__(self, config: RemediationConfig):
-        self.config = config
-        self.remediation_handlers: Dict[str, Callable] = {}
-
-    def register_handler(
-        self,
-        anomaly_type: AnomalyType,
-        handler: Callable[[Anomaly], bool]
-    ):
-        """Register a remediation handler"""
-        self.remediation_handlers[anomaly_type] = handler
-
-    async def attempt_remediation(self, anomaly: Anomaly) -> RemediationResult:
-        """Attempt automatic remediation"""
-        handler = self.remediation_handlers.get(anomaly.anomaly_type)
-
-        if not handler:
-            return RemediationResult(
-                success=False,
-                message="No handler registered for this anomaly type"
-            )
-
-        try:
-            success = await handler(anomaly)
-
-            if success:
-                return RemediationResult(
-                    success=True,
-                    message="Automatic remediation successful"
-                )
-            else:
-                return RemediationResult(
-                    success=False,
-                    message="Remediation attempted but unsuccessful"
-                )
-        except Exception as e:
-            return RemediationResult(
-                success=False,
-                message=f"Remediation failed: {str(e)}"
-            )
-
-# Example remediation handlers
-async def remediate_freshness(anomaly: Anomaly) -> bool:
-    """Trigger pipeline re-run for stale data"""
-    pipeline = await get_pipeline_for_table(anomaly.table_id)
-
-    if pipeline:
-        # Trigger Airflow DAG
-        await trigger_dag_run(pipeline.pipeline_id)
-        return True
-
-    return False
-
-async def remediate_volume_drop(anomaly: Anomaly) -> bool:
-    """Check upstream and retry"""
-    # Check upstream tables
-    upstream = await get_upstream_tables(anomaly.table_id)
-
-    for table in upstream:
-        health = await get_table_health(table)
-        if health.overall_score < 80:
-            # Upstream issue - trigger that pipeline
-            await trigger_pipeline_for_table(table)
-            return True
-
-    return False
-```
-
-### 2. LLM-Based Issue Triage
-
-```python
-class LLMTriage:
-    """LLM-powered issue analysis and triage"""
-
-    def __init__(self, llm_client):
-        self.llm = llm_client
-
-    async def analyze_anomaly(self, anomaly: Anomaly) -> TriageResult:
-        """Use LLM to analyze and triage anomaly"""
-        # Gather context
-        context = await self._gather_context(anomaly)
-
-        prompt = f"""
-        Analyze this data anomaly and provide triage recommendations:
-
-        Anomaly Details:
-        - Type: {anomaly.anomaly_type.value}
-        - Table: {anomaly.table_id}
-        - Description: {anomaly.description}
-        - Metric Value: {anomaly.metric_value}
-        - Expected Range: {anomaly.expected_range}
-
-        Context:
-        - Recent Changes: {context['recent_changes']}
-        - Upstream Status: {context['upstream_status']}
-        - Historical Patterns: {context['historical_patterns']}
-        - Related Anomalies: {context['related_anomalies']}
-
-        Provide:
-        1. Root cause analysis (most likely causes)
-        2. Impact assessment
-        3. Recommended actions
-        4. Suggested owner/team
-        """
-
-        response = await self.llm.complete(prompt)
-
-        return TriageResult(
-            anomaly_id=anomaly.anomaly_id,
-            analysis=response.root_cause,
-            impact=response.impact,
-            recommendations=response.actions,
-            suggested_owner=response.owner
-        )
-
-    async def generate_runbook(self, anomaly_type: AnomalyType) -> str:
-        """Generate runbook for anomaly type"""
-        # Get historical resolutions
-        resolutions = await self._get_historical_resolutions(anomaly_type)
-
-        prompt = f"""
-        Generate a runbook for handling {anomaly_type.value} anomalies.
-
-        Historical resolutions:
-        {resolutions}
-
-        Include:
-        1. Initial investigation steps
-        2. Common root causes
-        3. Resolution procedures
-        4. Escalation criteria
-        """
-
-        return await self.llm.complete(prompt)
-```
-
----
+Requests and responses use Pydantic models (`RegisterTableRequest`, `LineageResponse`,
+`HealthResponse`, `AnomalyListResponse`, `PIIScanResponse`, `AcknowledgeRequest`, …) so the
+gateway validates input and emits a typed schema. `POST /tables/{id}/detect` runs the
+detector for a table on demand and returns the anomalies it produced;
+`GET /tables/{id}/lineage` and `GET /impact/{id}` expose the lineage graph and downstream
+impact; `GET /tables/{id}/pii` runs the PII scanner. List endpoints accept filters
+(`status`, `severity`, `database`, `search`) and the acknowledge endpoint mutates an
+anomaly's lifecycle. The app is constructed once as a module-level `app` and also via a
+`create_app()` factory so tests can spin up isolated instances; interactive docs are served
+at `/docs`. Because the gateway holds the same in-process collector, detector, lineage
+graph, and alerting engine the library exposes, the REST surface and the Python API are two
+views of one running platform rather than separate code paths.
+
+## Performance
+
+The platform is built for the operational scale of a metadata catalog, not for streaming
+throughput, and the design choices reflect that:
+
+- **Bounded history.** Every detector caps its per-table (and per-column) history at the
+  last 100 points and the ML feature buffer at the last 1000 samples per table, so memory
+  is O(tables × columns) and bounded regardless of how long the platform runs.
+- **Cheap statistical detection.** Volume, freshness, null-rate, and distribution checks
+  are O(history) NumPy reductions — a handful of microseconds per check — so the rule-based
+  path scales to thousands of tables without an ML model.
+- **Robust estimators.** The statistical detector uses IQR for volume and the modified
+  z-score (median/MAD) for null rates, which tolerate outliers in the history far better
+  than mean/std and reduce false positives on noisy metrics.
+- **Optional ML.** The Isolation Forest is an optional, fitted-on-demand component
+  (`n_jobs=-1` for parallel trees); when sklearn is absent or the model is unfitted, the
+  platform degrades gracefully to the statistical path.
+- **Async I/O.** Collectors and channels are coroutines, so warehouse profiling and alert
+  fan-out can overlap when wired into an event loop.
+
+No throughput or latency benchmarks are published for this build; the numbers above are
+complexity characteristics, not measured results.
+
+A few design decisions are worth calling out as deliberate performance/robustness
+tradeoffs:
+
+- **Robust over efficient estimators.** The statistical detector spends extra work on IQR
+  and median/MAD instead of plain mean/std. On a 100-point history this costs a sort and a
+  median rather than a single pass, which is negligible, and in exchange the detector does
+  not get fooled by a prior incident still sitting in its window.
+- **Fitted-on-demand ML.** The Isolation Forest is not retrained on every call. Samples are
+  buffered as features are extracted, and `train_ml_model` is an explicit step, so the
+  expensive `fit` happens on the operator's schedule while the cheap `predict` runs inline.
+  Because the forest is optional, the platform's worst-case latency is the statistical path,
+  not a model fit.
+- **In-memory everything.** History, the lineage graph, the alert store, and the dedup
+  window all live in process dictionaries. This bounds the deployment to a single process
+  and to whatever fits in memory, but it removes a database from the hot path and makes the
+  whole pipeline deterministic and trivially testable. The `StorageConfig.backend` field is
+  the seam where a persistent backend would attach.
+- **Async fan-out.** Channel sends and warehouse profiling are coroutines, so an anomaly
+  that routes to five channels issues five sends concurrently rather than serially, and a
+  detection sweep across many tables can overlap I/O when driven from an event loop.
 
 ## Testing Strategy
 
-### Unit Tests
+Tests live in `tests/` (15 modules, ~300 test functions) and run entirely in-process with
+no warehouse or network access — the `InMemoryCollector` and `LogChannel` stand in for
+external systems.
 
-```python
-import pytest
-from unittest.mock import Mock, AsyncMock
+- **Models** (`test_models.py`) — construction and defaults for every dataclass.
+- **Collectors** (`test_collectors.py`) — the in-memory collector and the shared profiling
+  logic, including the factory.
+- **Detectors** (`test_detector.py`, `test_ml_detector.py`) — each anomaly type against
+  hand-built histories: normal values produce no anomaly, injected drops/spikes/drift do,
+  and severity thresholds are checked. The ML module covers feature extraction, fit/predict,
+  the statistical detector's IQR and modified-z-score paths, and the correlator's incident
+  grouping.
+- **Lineage and SQL** (`test_lineage.py`, `test_sql_parser.py`) — graph mutation and
+  transitive traversal, plus parsing of `SELECT`/`INSERT`/`CREATE TABLE AS`/`MERGE` and the
+  regex fallback.
+- **Health and PII** (`test_health.py`, `test_pii.py`) — sub-score and overall-score math,
+  trend and degradation reporting, and name/value PII classification with masking.
+- **Alerting and channels** (`test_alerting.py`, `test_channels.py`) — rule matching,
+  deduplication, routing to the union of matched channels, escalation, acknowledge/resolve,
+  and each channel's payload construction.
+- **Triage** (`test_llm_triage.py`) — the `MockLLMClient` triage and runbook paths and
+  caching, with no API keys.
+- **Config and API** (`test_config.py`, `test_api.py`) — config defaults and overrides and
+  the FastAPI endpoints via the test client.
 
-class TestAnomalyDetector:
-    @pytest.fixture
-    def detector(self):
-        config = DetectorConfig(
-            min_history_points=10,
-            volume_threshold=3.0
-        )
-        return AnomalyDetector(config)
+Async tests use `pytest-asyncio`; statistical assertions feed the detectors enough history
+to clear `min_history_points` and then assert on the presence, type, and severity of the
+returned `Anomaly`.
 
-    async def test_volume_anomaly_detection(self, detector):
-        # Mock history
-        detector._get_volume_history = AsyncMock(return_value=[100, 102, 98, 101, 99, 103, 97, 100, 101, 99])
+The edge cases that the design has to get right, and that the suite targets explicitly:
 
-        # Normal value
-        anomaly = await detector.detect_volume_anomaly("test.table", 105)
-        assert anomaly is None
-
-        # Anomalous value
-        anomaly = await detector.detect_volume_anomaly("test.table", 50)
-        assert anomaly is not None
-        assert anomaly.anomaly_type == AnomalyType.VOLUME
-        assert anomaly.severity in ['warning', 'critical']
-
-    async def test_null_rate_anomaly(self, detector):
-        detector._get_null_rate_history = AsyncMock(return_value=[0.01, 0.02, 0.01, 0.015, 0.02, 0.01, 0.02, 0.015, 0.01, 0.02])
-
-        # Significant increase
-        anomaly = await detector.detect_null_rate_anomaly("test.table", "column", 0.5)
-        assert anomaly is not None
-        assert anomaly.anomaly_type == AnomalyType.NULL_RATE
-
-class TestLineageGraph:
-    @pytest.fixture
-    def graph(self):
-        # Use test Neo4j instance
-        return LineageGraph("bolt://localhost:7687", "neo4j", "test")
-
-    def test_add_and_query_lineage(self, graph):
-        # Add tables
-        graph.add_table(create_test_table("source"))
-        graph.add_table(create_test_table("target"))
-
-        # Add lineage
-        graph.add_lineage("source", "target", "dbt:model")
-
-        # Query
-        downstream = graph.get_downstream("source")
-        assert len(downstream) == 1
-        assert downstream[0]['table_id'] == "target"
-```
-
-### Integration Tests
-
-```python
-class TestObservabilityPlatform:
-    @pytest.fixture
-    async def platform(self):
-        config = PlatformConfig(...)
-        platform = ObservabilityPlatform(config)
-        await platform.start()
-        yield platform
-        await platform.stop()
-
-    async def test_end_to_end_anomaly_detection(self, platform):
-        # Add table to monitoring
-        await platform.add_table("test.schema.table", SnowflakeCollector(...))
-
-        # Simulate data
-        await platform.collect_metadata("test.schema.table")
-
-        # Check for anomalies
-        anomalies = await platform.get_anomalies("test.schema.table")
-        assert isinstance(anomalies, list)
-
-    async def test_alert_routing(self, platform):
-        # Register test channel
-        test_channel = TestChannel()
-        platform.alerting.add_channel("test", test_channel)
-
-        # Create anomaly
-        anomaly = create_test_anomaly(severity="critical")
-
-        # Process
-        await platform.alerting.process_anomaly(anomaly)
-
-        # Verify alert sent
-        assert len(test_channel.sent_alerts) == 1
-```
-
----
-
-## Implementation Phases
-
-### Phase 1: Foundation (Weeks 1-2)
-- Core data model and API
-- Basic metadata collector (single warehouse)
-- Time-series storage setup
-- Simple anomaly detection (volume, freshness)
-
-### Phase 2: Detection Engine (Weeks 3-4)
-- ML-based anomaly detection
-- Schema change detection
-- Distribution analysis
-- Historical pattern learning
-
-### Phase 3: Lineage and Graph (Weeks 5-6)
-- Neo4j lineage graph
-- Column-level lineage
-- Impact analysis
-- Query lineage extraction
-
-### Phase 4: Alerting and UI (Weeks 7-8)
-- Alerting engine with routing
-- Slack/PagerDuty integration
-- Web dashboard
-- Lineage visualization
-
-### Phase 5: Enterprise Features (Weeks 9-10)
-- PII detection
-- Orchestrator integration
-- Time-series forecasting
-- Auto-remediation
-
----
+- **Insufficient history.** Every detector returns `None` when it has fewer than
+  `min_history_points` observations, so a freshly registered table never produces false
+  anomalies before it has a baseline.
+- **Zero-variance history.** The effective-std floor in volume and null-rate detection is
+  tested directly with a flat history plus an injected jump, confirming the anomaly fires
+  rather than dividing by zero.
+- **Missing sklearn.** `IsolationForestDetector` raises a clear `ImportError`, and
+  `EnsembleDetector` falls back to the statistical path, so the suite passes whether or not
+  the optional ML dependency is installed.
+- **Unparseable SQL.** The parser's sqlglot path catches exceptions and falls back to the
+  regex extractor, and the regex path is tested on its own so lineage degrades rather than
+  crashes on dialect quirks.
+- **Cyclic lineage.** The BFS traversals are exercised against graphs with cycles to
+  confirm they terminate and de-duplicate.
+- **Alert deduplication and escalation.** The alerting tests assert that a repeated anomaly
+  inside the dedup window does not re-page, and that an unacknowledged critical alert fires
+  its escalation channel.
 
 ## References
 
-- [Monte Carlo Data](https://www.montecarlodata.com/)
-- [Great Expectations](https://greatexpectations.io/)
-- [Apache Atlas](https://atlas.apache.org/)
-- [Amundsen](https://www.amundsen.io/)
-- [DataHub](https://datahubproject.io/)
-- [OpenLineage](https://openlineage.io/)
+- [Monte Carlo Data](https://www.montecarlodata.com/) — data observability product this is
+  modeled on.
+- [Great Expectations](https://greatexpectations.io/) — data quality expectations.
+- [OpenLineage](https://openlineage.io/) — lineage metadata standard.
+- [scikit-learn Isolation Forest](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.IsolationForest.html)
+- [sqlglot](https://github.com/tobymao/sqlglot) — the SQL parser used for lineage
+  extraction.
+- F. T. Liu, K. M. Ting, Z.-H. Zhou, "Isolation Forest," ICDM 2008.

@@ -1,1520 +1,800 @@
-# Data Lakehouse (Delta Lake / Spark / Flink) - Technical Blueprint
+# Data Lakehouse
 
-## Executive Summary
+## Overview
 
-This project implements a production-grade data lakehouse architecture combining the flexibility of data lakes with the ACID guarantees and performance of data warehouses. Built on Delta Lake with Spark/Flink compute engines, it demonstrates mastery of modern data platform design, distributed computing, and analytical data modeling.
+This project is a data lakehouse built from scratch in Python. A lakehouse stores data in
+open file formats on cheap object storage (like a data lake) while layering the ACID
+transactions, schema management, and time travel of a data warehouse on top. The unifying
+mechanism is a **transaction log**: a serializable, append-only record of every change to a
+table, from which the current state — and any historical state — can be reconstructed.
 
-> **Concepts covered:** [§02 Spark / data processing](../../../02-data-engineering/02-data-processing/spark/) · [§02 Dimensional modeling](../../../02-data-engineering/03-data-warehousing/dimensional-modeling/dimensional-modeling.md) · [§02 dbt transformations](../../../02-data-engineering/03-data-warehousing/dbt/dbt-transformations.md) · [§02 Kafka / Flink streaming](../../../02-data-engineering/04-streaming/). Pairs with [Project 10 (semantic layer on top)](../../10-warehouse-semantic-layer/) and [Project 17 (DuckDB-lite query engine)](../../17-columnar-query-engine/). Map: [`CONCEPT_TO_PROJECT_MAP.md`](../../CONCEPT_TO_PROJECT_MAP.md).
+The heart of this implementation is `delta_log.py`, a **pure-Python re-implementation of
+the Delta Lake transaction protocol**. It depends on nothing but the standard library
+(plus optional `pyarrow` for parquet checkpoints), which makes the core algorithms —
+atomic versioned commits, optimistic concurrency control, snapshot replay, checkpointing,
+time travel, and vacuum — directly readable and testable without spinning up a JVM or a
+Spark cluster. Around that core, the project provides a set of PySpark/Delta-backed
+processors that implement the **medallion architecture** (Bronze → Silver → Gold), data
+quality validation, streaming ingestion, file optimization, lineage tracking, and cost
+analysis.
 
-**Primary Goals:**
-- Build medallion architecture (Bronze → Silver → Gold) with ACID transactions
-- Implement unified batch and streaming data processing
-- Enable time travel, schema evolution, and data versioning
-- Optimize query performance through Z-ordering and partition pruning
+**Goals**
 
----
+- Implement the Delta transaction-log protocol (Add/Remove/Metadata/Protocol actions,
+  versioned JSON commits, parquet checkpoints) faithfully and from scratch.
+- Provide ACID semantics through optimistic concurrency control with put-if-absent writes.
+- Support time travel and table restore by replaying the log to an arbitrary version.
+- Model the medallion architecture as a concrete ETL pipeline with deduplication, merge,
+  SCD Type 2, and SQL aggregation.
+- Offer a chainable data-quality engine and a lineage graph with impact analysis.
 
-## System Architecture
+**Concepts it teaches**
 
-### High-Level Architecture
+- Log-structured table formats and the difference between the log and the data files.
+- Optimistic concurrency control and conflict detection via exclusive file creation.
+- Checkpointing as a log-compaction technique to bound read cost.
+- Snapshot isolation through deterministic log replay.
+- The Bronze/Silver/Gold refinement pattern and slowly-changing-dimension handling.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     Orchestration Layer (Airflow/Dagster)           │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐           │
-│  │   Ingestion  │    │  Processing  │    │   Serving    │           │
-│  │              │    │              │    │              │           │
-│  │  Kafka/CDC   │───▶│  Spark/Flink │───▶│  Query APIs  │           │
-│  │  Batch Load  │    │  dbt Models  │    │  Dashboards  │           │
-│  └──────────────┘    └──────────────┘    └──────────────┘           │
-│          │                   │                   │                   │
-│          ▼                   ▼                   ▼                   │
-│  ┌─────────────────────────────────────────────────────────────┐    │
-│  │                     Delta Lake Storage                       │    │
-│  │  ┌─────────┐     ┌─────────┐     ┌─────────┐                │    │
-│  │  │ Bronze  │────▶│ Silver  │────▶│  Gold   │                │    │
-│  │  │  (Raw)  │     │(Cleaned)│     │ (Curated)│                │    │
-│  │  └─────────┘     └─────────┘     └─────────┘                │    │
-│  │                                                              │    │
-│  │  ┌─────────────────────────────────────────────────────┐    │    │
-│  │  │  S3/ADLS/GCS Object Storage                          │    │    │
-│  │  │  (Parquet files + Delta Transaction Log)             │    │    │
-│  │  └─────────────────────────────────────────────────────┘    │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-│                                                                      │
-├─────────────────────────────────────────────────────────────────────┤
-│                Metadata & Governance (Unity Catalog / HMS)          │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**Scope**
 
-### Medallion Architecture Detail
+The pure-Python transaction log is complete and fully tested. The Spark-backed processors
+are real PySpark code but require `pyspark`, `delta-spark`, and a JVM to execute; without
+them the modules import as `None` and their tests are skipped. Streaming requires a Kafka
+broker. This is a learning-oriented implementation, not a drop-in replacement for the
+production Delta Lake engine.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Bronze Layer (Raw)                        │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  - Raw data landed as-is from sources                    │    │
-│  │  - Full history with append-only pattern                 │    │
-│  │  - Metadata: source, ingestion_ts, batch_id              │    │
-│  │  - No transformations, schema-on-read                    │    │
-│  │  - Partitioned by date/source                            │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │
-                      ▼ (Cleanse, Dedupe, Validate)
-┌─────────────────────────────────────────────────────────────────┐
-│                       Silver Layer (Cleaned)                     │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  - Cleaned, deduplicated, validated data                 │    │
-│  │  - Enforced schemas with evolution support               │    │
-│  │  - Business keys, SCD Type 2 for dimensions              │    │
-│  │  - Conformed data types and formats                      │    │
-│  │  - Optimized for joins (Z-ordered on join keys)          │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │
-                      ▼ (Aggregate, Enrich, Model)
-┌─────────────────────────────────────────────────────────────────┐
-│                        Gold Layer (Curated)                      │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  - Business-ready, aggregated datasets                   │    │
-│  │  - Star/snowflake schemas for analytics                  │    │
-│  │  - Pre-computed metrics and KPIs                         │    │
-│  │  - Optimized for query patterns (partitioned, Z-ordered) │    │
-│  │  - Documented with business glossary                     │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
+## Architecture
+
+```mermaid
+flowchart TD
+    Files[Files and APIs] --> Bronze[Bronze -- raw plus _source, _ingestion_ts, _batch_id]
+    Kafka[Kafka topics] --> Streaming[StreamingProcessor]
+    Streaming --> Bronze
+    Bronze --> Silver[Silver -- deduped, merged, SCD2]
+    Silver --> Gold[Gold -- SQL aggregates and KPIs]
+    Processor[LakehouseProcessor] --> Bronze
+    Processor --> Silver
+    Processor --> Gold
+    Quality[QualityEngine] --> Silver
+    Processor --> Log[DeltaLog -- transaction log]
+    Log --> Commits[(NNN.json commits)]
+    Log --> Checkpoints[(NNN.checkpoint.parquet)]
+    Optimizer[TableOptimizer and CompactionScheduler] --> Log
+    Lineage[LineageTracker] --> Gold
+    Enterprise[WorkflowOrchestrator, Monitor, CostOptimizer] --> Log
 ```
 
----
+The system has two cleanly separated tiers.
 
-## Core Internals
+**Tier 1 — the transaction log (pure Python, `delta_log.py`).** Every table is a directory
+containing data files plus a `_delta_log/` subdirectory. Each commit is a JSON file named
+by a 20-digit zero-padded version (`00000000000000000000.json`). The log is the single
+source of truth: the set of files that logically belong to the table at any version is
+computed by replaying every commit up to that version and folding the actions into a
+`TableState`. Periodic checkpoints snapshot the active-file set into parquet so reads do
+not have to replay the entire history.
 
-### Delta Lake Transaction Protocol
+**Tier 2 — the Spark processors.** `LakehouseProcessor` reads and writes Delta tables
+through `pyspark` and `delta-spark`, moving data through the Bronze, Silver, and Gold
+layers. `QualityEngine` validates DataFrames, `StreamingProcessor` and
+`ChangeDataFeedProcessor` handle continuous ingestion, `TableOptimizer` and friends manage
+file layout, and the `enterprise` module adds orchestration, monitoring, and cost
+reporting. These wrap the production Delta engine rather than the Tier-1 log; the Tier-1
+log is the from-scratch teaching artifact.
+
+**Medallion layers.**
+
+- **Bronze** — raw data landed as-is, append-only, enriched with metadata columns
+  (`_source`, `_ingestion_ts`, `_batch_id`, `_input_file`, `_ingestion_date`) and
+  partitioned by ingestion date.
+- **Silver** — cleaned and conformed: transformations applied, deduplicated by business
+  key keeping the latest record per watermark, then merged (upsert) into the target.
+  Supports SCD Type 2 for dimension history.
+- **Gold** — business-ready aggregates produced by registering silver tables as temp views
+  and running a SQL aggregation, optionally Z-ordered for query performance.
+
+## Core Components
+
+### DeltaLog — the transaction log
+
+`DeltaLog` (`delta_log.py`) is the central abstraction. It manages a `_delta_log/`
+directory and exposes commit, snapshot, time-travel, checkpoint, vacuum, and statistics
+operations.
+
+**Commit (optimistic concurrency control).** `commit()` computes the next version as
+`latest_version + 1`, then performs an *atomic* write of a new JSON log file using exclusive
+creation (`open(path, "x")`). If two writers race, the second `open` raises
+`FileExistsError`; the loser catches it, recomputes the version, and retries up to
+`max_retries`. This is optimistic concurrency control: writers assume no conflict and
+detect collisions at commit time rather than holding locks.
 
 ```python
-# Delta Lake Transaction Log Structure
-class DeltaLog:
-    """
-    Delta Lake uses a transaction log (_delta_log/) to provide ACID guarantees.
-    Each transaction creates a new JSON file (00000000000000000000.json).
-    """
+def commit(self, actions: List[Action], max_retries: int = 3) -> int:
+    for attempt in range(max_retries):
+        try:
+            version = self._get_latest_version() + 1
+            log_file = self.log_path / f"{version:020d}.json"
+            self._atomic_write(log_file, actions)   # open(path, "x") -> put-if-absent
+            self._current_version = version
+            self._snapshot.extend(actions)
+            return version
+        except FileExistsError:
+            continue   # conflict: another writer took this version, retry
+    raise Exception("Max retries exceeded for commit")
+```
 
-    def __init__(self, table_path: str):
-        self.table_path = table_path
-        self.log_path = f"{table_path}/_delta_log"
-        self.snapshot = None
+**Snapshot reconstruction.** `get_snapshot(version)` builds table state by (1) finding the
+latest checkpoint at or before the target version, (2) loading that checkpoint into a
+`TableState`, and (3) replaying every commit after the checkpoint up to the target. With no
+checkpoint, it replays from version 0. `TableState.apply_actions` folds each action: an
+`AddFile` appends to the file list, a `RemoveFile` drops the matching path, and
+`Metadata`/`Protocol` overwrite the schema/protocol.
 
-    def get_snapshot(self, version: Optional[int] = None) -> 'Snapshot':
-        """
-        Read the current state of the table.
-        Uses checkpoints (parquet) for efficiency with log replay.
-        """
-        # Find latest checkpoint
-        checkpoint_version = self._find_latest_checkpoint()
+```python
+def get_snapshot(self, version: Optional[int] = None) -> Snapshot:
+    checkpoint_version = self._find_latest_checkpoint()
+    if checkpoint_version is not None:
+        state = self._read_checkpoint(checkpoint_version)
+        start_version = checkpoint_version + 1
+    else:
+        state = TableState()
+        start_version = 0
+    target = version if version is not None else self._get_latest_version()
+    for v in range(start_version, target + 1):
+        state = state.apply_actions(self._read_log_file(v))
+    return Snapshot(version=target, state=state)
+```
 
-        if checkpoint_version:
-            # Read checkpoint
-            state = self._read_checkpoint(checkpoint_version)
-            start_version = checkpoint_version + 1
+**Time travel.** `time_travel(version)` replays log files `0..version` into a fresh
+`TableState` and returns the active `AddFile` list — the exact set of files that made up the
+table at that version. This is how historical reads and `restore` are expressed.
+
+**Active-file resolution.** `get_active_files()` walks the in-memory action snapshot,
+tracking added and removed paths, so that a file added then removed does not appear, and a
+removed path is excluded even if its add came earlier. `get_partitions()` groups the active
+files by a canonicalized (sorted-key) JSON of their partition values.
+
+**Checkpoints.** `create_checkpoint()` writes the current active-file set to
+`NNN.checkpoint.parquet` via `pyarrow`. When `pyarrow` is unavailable it falls back to a
+JSON checkpoint and `touch`es an empty `.parquet` placeholder so checkpoint *detection*
+(`_find_latest_checkpoint`, which globs `*.checkpoint.parquet`) still works. Reads prefer
+the parquet checkpoint and fall back to the JSON one.
+
+**Vacuum.** `vacuum(retention_hours)` returns the paths of `RemoveFile` actions whose
+deletion timestamp is older than the retention cutoff (`retention_hours == 0` selects all),
+identifying tombstoned files that are safe to physically delete.
+
+**Stats.** `collect_stats()` sums sizes across active files and parses each file's `stats`
+JSON (`numRecords`) to report total files, total size, total records, partitions, and the
+current version.
+
+**Why exclusive creation gives atomicity.** The protocol's correctness hinges on one
+property: a versioned commit file either does not exist or exists fully, and only one writer
+can create it. POSIX `O_EXCL` (`open(path, "x")`) provides exactly that — a put-if-absent
+primitive. Two writers that both compute version *v* will both try to create
+`{v:020d}.json`; the OS guarantees exactly one succeeds and the other gets `FileExistsError`.
+There is no read-modify-write window to lose, so no lock is required. The retry loop simply
+re-reads the latest version and tries *v+1*. On object stores that lack `O_EXCL`, the same
+role is played by conditional writes (put-if-absent); the algorithm is identical.
+
+**Action serialization.** `_action_to_json` / `_parse_action` translate between the dataclass
+actions and the on-wire JSON envelope keyed by action kind (`add`, `remove`, `metaData`,
+`protocol`), using Delta's camelCase field names (`partitionValues`, `modificationTime`,
+`dataChange`, `minReaderVersion`). Each commit file is newline-delimited JSON — one action
+per line — so files can be appended to and parsed line-by-line without loading the whole
+commit into memory.
+
+**Checkpoint read/fallback.** `_read_checkpoint` prefers the parquet file (`pyarrow` →
+pandas → reconstruct `AddFile`s) and, on any failure or when `pyarrow` is missing, falls
+through to the JSON checkpoint, parsing each line back into an action. `_find_latest_checkpoint`
+globs `*.checkpoint.parquet` and takes the max version, which is why the JSON-fallback path
+still `touch`es an empty `.parquet` placeholder — detection and reading are deliberately
+decoupled so the rest of the code never branches on which checkpoint format exists.
+
+### LakehouseProcessor — medallion ETL
+
+`LakehouseProcessor` (`processor.py`) requires `pyspark`; calling its constructor without it
+raises a descriptive `ImportError`. It implements the layer transitions.
+
+- **`bronze_ingestion`** reads JSON/CSV/Parquet (with optional schema), appends the bronze
+  metadata columns, and writes append-only Delta partitioned by `_ingestion_date`.
+  `bronze_ingestion_df` does the same for an existing DataFrame. The metadata columns are not
+  decoration — they are the provenance and idempotency backbone: `_source` records where the
+  row came from, `_ingestion_ts` and `_ingestion_date` timestamp and partition it,
+  `_batch_id` (a fresh UUID per ingest) lets a bad batch be isolated and re-run, and
+  `_input_file` ties each row back to its source file for debugging. Bronze never transforms
+  the payload, which preserves a faithful, replayable record of exactly what arrived.
+- **`bronze_to_silver`** reads bronze, filters incrementally against the silver watermark if
+  the target exists, applies the supplied transformation functions, deduplicates with a
+  window (`row_number()` over `partitionBy(dedup_keys).orderBy(watermark desc)` keeping
+  `row_num == 1`), strips the `_`-prefixed bronze metadata, and merges (upsert) into silver
+  via `whenMatchedUpdateAll().whenNotMatchedInsertAll()`.
+- **`silver_to_gold`** registers each silver table as a temp view, runs the aggregation SQL,
+  overwrites gold, and optionally Z-orders.
+- **`apply_scd_type2`** implements Slowly Changing Dimension Type 2: it hashes the tracked
+  columns (`sha2(concat_ws(...))`) to detect change, closes the current record (sets
+  `end_date`, `is_current = false`) when the hash differs, and inserts new versions for
+  changed keys, preserving full history.
+- Utility methods cover time-travel reads (`read_table`), `optimize_table`, `vacuum_table`,
+  `get_table_history`, `restore_table`, generic `merge_delta_tables`, and `create_business_view`.
+
+The Bronze→Silver dedup-and-merge is the load-bearing transition. Bronze is append-only, so
+the same business key can appear many times; Silver must keep exactly the latest. The window
+function ranks rows per key by the watermark and keeps rank 1, then the result is upserted so
+re-running the job is idempotent:
+
+```python
+window = Window.partitionBy(dedup_keys).orderBy(col(watermark_col).desc())
+df_deduped = (df.withColumn("_row_num", row_number().over(window))
+                .filter(col("_row_num") == 1)
+                .drop("_row_num"))
+# strip bronze metadata, then upsert into silver
+(silver_table.alias("target")
+    .merge(df_clean.alias("source"), merge_condition)
+    .whenMatchedUpdateAll()
+    .whenNotMatchedInsertAll()
+    .execute())
+```
+
+Incrementality comes from reading the silver watermark first
+(`agg(max(watermark_col))`) and filtering bronze to only newer rows, so each run processes a
+slice rather than the full history; `df.rdd.isEmpty()` short-circuits when there is nothing
+new.
+
+The SCD Type 2 path layers change-detection on top of merge. A hash of the tracked columns is
+the change signal: matched rows whose hash differs have their current version closed
+(`whenMatchedUpdate` with a condition on `is_current = true AND hashes differ`), and a second
+pass appends fresh current rows for the changed keys, so the dimension carries a full validity
+timeline (`effective_date`, `end_date`, `is_current`).
+
+### QualityEngine — data quality validation
+
+`QualityEngine` (`quality.py`) offers a fluent, Great-Expectations-style API. Each
+`expect_*` method appends a declarative expectation and returns `self` for chaining;
+`validate(df)` evaluates them all and returns a `ValidationResult`. Supported expectations:
+column existence, not-null, uniqueness, in-set membership, between-bounds, and table
+row-count bounds. Each check computes concrete counts (e.g. null count, duplicate count,
+out-of-range count) so failures are diagnosable, and `ValidationResult.failed_expectations`
+returns only the failures. The expectation registry is in-memory; the actual counts require
+`pyspark`.
+
+The two-phase shape — declare, then evaluate — keeps expectations data-agnostic and reusable
+across DataFrames, and lets `validate` compute the shared `row_count` once. Each check is a
+small, self-contained function that first guards against a missing column (returning a
+failure with an `error` message rather than throwing), then expresses the violation as a
+filter whose `count()` is the number of bad rows:
+
+```python
+def _check_between(self, df, column, min_value, max_value) -> ExpectationResult:
+    if column not in df.columns:
+        return ExpectationResult(..., success=False, result={"error": f"Column {column} not found"})
+    conditions = []
+    if min_value is not None: conditions.append(col(column) < min_value)
+    if max_value is not None: conditions.append(col(column) > max_value)
+    filter_condition = conditions[0]
+    for cond in conditions[1:]:
+        filter_condition = filter_condition | cond
+    outside_count = df.filter(filter_condition).count()
+    return ExpectationResult(..., success=outside_count == 0,
+        result={"outside_count": outside_count, "total_count": df.count(),
+                "min_value": min_value, "max_value": max_value})
+```
+
+The aggregate `ValidationResult.success` is the logical AND of every check, and its
+`statistics` records how many expectations ran and how many passed — enough for a pipeline to
+decide whether to fail the run or merely warn.
+
+### StreamingProcessor and ChangeDataFeedProcessor
+
+`StreamingProcessor` (`streaming.py`) builds Structured Streaming pipelines:
+`stream_from_kafka` parses JSON message values against a schema; `stream_to_bronze` writes a
+watermarked, metadata-enriched append stream; `stream_aggregation` performs tumbling/sliding
+windowed aggregation; `stream_dedupe` drops duplicates within a watermark; `monitor_query`
+surfaces a streaming query's status and progress.
+
+`ChangeDataFeedProcessor` enables Delta Change Data Feed, reads or streams row-level changes
+between versions/timestamps, and `propagate_changes` applies inserts/updates/deletes from a
+source table's CDF into a target table inside a `foreachBatch` merge. The micro-batch handler
+splits the change stream by `_change_type`: `insert` and `update_postimage` rows are unioned
+and upserted, while `delete` rows are translated into a `DELETE` predicate on the merge keys.
+This makes a target table a continuously-maintained materialized replica of the source — the
+streaming analog of the batch Bronze→Silver merge.
+
+Watermarks are central to the streaming design: every aggregation, dedup, and bronze stream
+declares `withWatermark(col, delay)` so Spark can bound the in-flight state it must retain for
+late-arriving events and emit/close windows. Dedup remembers IDs only within the watermark
+horizon (`stream_dedupe`), and windowed aggregation uses `update` output mode so partial
+window results are revised as more data arrives.
+
+### TableOptimizer and the optimizer toolkit
+
+`TableOptimizer` (`optimizer.py`) wraps Delta `OPTIMIZE` (with optional Z-ordering),
+`VACUUM` (with dry-run), storage analysis (`analyze_storage` returns a `StorageReport` with
+file count, average size, small-file count, version count, and recommendations), and table
+property configuration. `PartitionOptimizer` evaluates candidate partition columns by
+cardinality, and `CompactionScheduler` decides whether to compact from heuristics
+(`should_compact`) and runs full `schedule_maintenance` (analyze → compact → vacuum).
+
+Several optimizer helpers are **pure Python** and unit-tested directly:
+`StorageOptimizer.identify_small_files` / `calculate_compaction_bins`,
+`CompactionStrategy.bin_packing` / `adapt_target_size` / `select_incremental`, and
+`OptimizationPlan.create_plan` / `prioritize_tasks` / `estimate_cost` / `create_schedule`.
+
+Compaction is fundamentally a bin-packing problem: many small files must be combined into
+fewer ~1 GB files. `CompactionStrategy.bin_packing` implements **first-fit-decreasing** —
+sort files largest-first, then place each into the first bin that can hold it (allowing 20%
+overflow), opening a new bin only when none fits:
+
+```python
+def bin_packing(self, files: List[Dict]) -> List[List[Dict]]:
+    sorted_files = sorted(files, key=lambda x: x.get("size_mb", 0), reverse=True)
+    bins, bin_sizes = [], []
+    for f in sorted_files:
+        size = f.get("size_mb", 0)
+        for i, bin_size in enumerate(bin_sizes):
+            if bin_size + size <= self.target_file_size_mb * 1.2:   # 20% overflow allowed
+                bins[i].append(f); bin_sizes[i] += size
+                break
         else:
-            state = TableState()
-            start_version = 0
+            bins.append([f]); bin_sizes.append(size)
+    return bins
+```
 
-        # Replay logs since checkpoint
-        target = version or self._get_latest_version()
-        for v in range(start_version, target + 1):
-            actions = self._read_log_file(v)
-            state = state.apply_actions(actions)
+`OptimizationPlan.create_plan` turns table statistics into a concrete action list: it flags
+compaction when files exceed 100 or average size drops below 128 MB, vacuum when deleted
+files exist, and Z-ordering when the file count is high — accumulating a rough
+`estimated_duration_minutes` per operation. `create_schedule` then greedily packs the
+highest-priority tables into a fixed maintenance window. These planners are deterministic and
+Spark-free, which is why they are exercised directly in the test suite.
 
-        return Snapshot(version=target, state=state)
+### LineageTracker — lineage and impact analysis
 
-    def commit(self, actions: List['Action']) -> int:
-        """
-        Atomically commit a set of actions.
-        Uses optimistic concurrency control.
-        """
-        # Retry loop for concurrent commits
-        for attempt in range(MAX_RETRIES):
-            try:
-                version = self._get_latest_version() + 1
-                log_file = f"{self.log_path}/{version:020d}.json"
+`LineageTracker` (`lineage.py`) maintains a `LineageGraph` of `TableNode`s and
+`LineageEdge`s with forward and reverse adjacency maps. `register_table` adds nodes;
+`add_transformation` records source→target edges plus column-level `ColumnLineage` entries
+typed by `LineageType` (direct, derived, filtered, joined, aggregated). Graph queries
+include depth-bounded `get_upstream`/`get_downstream`, `get_column_lineage`,
+`impact_analysis` (which downstream tables and columns a change touches, grouped by layer),
+and `get_full_upstream_path`. `create_medallion_lineage` is a helper that wires a standard
+Bronze→Silver→Gold lineage from mapping dicts. This module is pure Python.
 
-                # Atomic write (put-if-absent semantics)
-                self._atomic_write(log_file, actions)
-                return version
+Traversal is a depth-bounded DFS over the adjacency maps with a `visited` set, so cycles and
+diamond dependencies terminate and are not double-counted:
 
-            except ConcurrentWriteException:
-                # Conflict detected, retry with new version
-                continue
+```python
+def get_downstream(self, table_name: str, depth: int = -1) -> Set[str]:
+    downstream, visited = set(), set()
+    def traverse(name: str, current_depth: int):
+        if name in visited or (depth >= 0 and current_depth > depth):
+            return
+        visited.add(name)
+        for target in self._adjacency.get(name, set()):
+            downstream.add(target)
+            traverse(target, current_depth + 1)
+    traverse(table_name, 0)
+    return downstream
+```
 
-        raise CommitFailedException("Max retries exceeded")
+`impact_analysis` builds on this: it reports the directly affected tables (one hop), all
+transitively affected tables, the affected count, and a per-layer grouping, plus — when a
+column is given — the specific downstream columns and the transformation that produced each.
+This answers "if I change this column, what breaks?" before the change is made.
 
-class Action:
-    """Base class for Delta Lake actions"""
-    pass
+### Enterprise — orchestration, monitoring, cost
 
+`enterprise.py` adds `WorkflowOrchestrator` (build an Airflow-compatible DAG definition and
+execute tasks in dependency order with simple topological scheduling and failure
+short-circuiting), `LakehouseMonitor` (collect `TableMetrics`, register and evaluate
+`Alert`s, summarize table history), and `CostOptimizer` (estimate storage/query cost and
+apply cost-saving table properties plus vacuum/optimize). The Spark-touching methods require
+`pyspark`; the orchestration scheduling logic itself is plain Python.
+
+`execute_dag` runs a simple Kahn-style topological loop: in each round it executes every task
+whose dependencies are all complete, marks successes complete, and removes failed tasks
+without running their dependents. If a full round makes no progress while tasks remain, it
+raises — surfacing a circular or blocked dependency rather than hanging:
+
+```python
+while remaining:
+    executed_this_round = False
+    for task in remaining[:]:
+        if all(dep in completed for dep in task.depends_on):
+            result = self.execute_task(task)
+            results[task.task_id] = result
+            if result["status"] == "success":
+                completed.add(task.task_id)
+            remaining.remove(task)
+            executed_this_round = True
+    if not executed_this_round and remaining:
+        raise RuntimeError(f"Cannot execute remaining tasks: {[t.task_id for t in remaining]}")
+```
+
+`execute_task` wraps each handler in try/except so a failure becomes a structured result
+(`status="failed"` plus the error string and timing) instead of an exception that aborts the
+whole DAG — the same defensive pattern `check_alerts` uses when evaluating alert conditions.
+
+### Concurrency and isolation semantics
+
+The transaction log is what makes concurrent access safe, and it is worth stating the
+guarantees precisely because the tests assert them.
+
+- **Atomicity.** A commit is a single `O_EXCL` file creation. Either the whole commit file
+  exists (and all its actions take effect on the next replay) or it does not. There is no
+  partial commit, because readers only ever see complete, named version files.
+- **Serializability of the version order.** Versions are dense integers assigned by
+  put-if-absent. Because only one writer can create version *v*, the committed history is a
+  total order `0, 1, 2, …` with no gaps and no duplicates — which `test_transactions.py`
+  verifies by committing from many threads and checking the resulting version set.
+- **Snapshot isolation for readers.** A reader resolves a target version and replays the log
+  up to exactly that version. Commits that land while it reads have higher version numbers
+  and are simply not included, so the read sees a consistent point-in-time snapshot without
+  blocking writers.
+- **Conflict handling.** The only conflict is two writers choosing the same next version; the
+  loser retries against the new latest version. The implementation retries blindly up to
+  `max_retries` (it does not yet check whether the concurrent commit logically conflicts with
+  the in-flight one — a deliberate simplification of Delta's conflict-detection rules).
+
+The cost of these guarantees is that the log grows by one file per commit. Checkpoints bound
+the *read* cost of a long history, and `vacuum` plus log retention bound the *storage* cost by
+identifying tombstoned data files and old log entries that can be removed.
+
+### End-to-end walkthrough
+
+Tracing one record clarifies how the pieces compose. Suppose a sales event arrives as JSON.
+
+1. **Ingest (Bronze).** `bronze_ingestion` reads the file, tags the row with `_source`,
+   `_ingestion_ts`, `_batch_id`, `_input_file`, `_ingestion_date`, and appends it to the
+   bronze Delta table partitioned by ingestion date. The write produces a new data file and a
+   commit containing an `AddFile` action; bronze keeps every version of the event, including
+   duplicates from retried deliveries.
+2. **Refine (Silver).** `bronze_to_silver` reads only bronze rows newer than the silver
+   watermark, applies cleaning transforms, ranks rows per business key by the watermark and
+   keeps the latest, strips the `_`-prefixed metadata, and upserts into silver. The same
+   commit machinery records the merge as add/remove actions, so silver is itself
+   time-travelable and the job is safe to re-run.
+3. **Validate.** Before or after the merge, a `QualityEngine` suite checks the silver
+   DataFrame — keys non-null and unique, amounts in range, status in an allowed set — and
+   returns a `ValidationResult` the pipeline can branch on.
+4. **Aggregate (Gold).** `silver_to_gold` registers silver as a temp view, runs the
+   aggregation SQL (e.g. daily revenue per category), overwrites gold, and optionally
+   Z-orders the result on the columns queries filter by.
+5. **Track and maintain.** `LineageTracker` records the bronze→silver→gold edges so an
+   `impact_analysis` can later answer what a schema change would break, and
+   `CompactionScheduler.schedule_maintenance` periodically analyzes, compacts, and vacuums the
+   tables as their file counts and versions grow.
+
+At every step the *log* — not the data files — is authoritative about what the table contains,
+which is what lets reads at step 4 see a consistent snapshot even while step 1 keeps appending.
+
+## Data Structures
+
+### Transaction-log actions
+
+The protocol actions are dataclasses. They are the alphabet of every commit.
+
+```python
+@dataclass
 class AddFile(Action):
     path: str
     partition_values: Dict[str, str]
     size: int
     modification_time: int
     data_change: bool
-    stats: Optional[str]  # JSON column statistics
-    tags: Optional[Dict[str, str]]
+    stats: Optional[str] = None            # JSON column statistics, e.g. {"numRecords": 1000}
+    tags: Optional[Dict[str, str]] = None
 
+@dataclass
 class RemoveFile(Action):
     path: str
-    deletion_timestamp: int
+    deletion_timestamp: int                # used by vacuum retention
     data_change: bool
-    extended_file_metadata: bool
-    partition_values: Dict[str, str]
+    extended_file_metadata: bool = False
+    partition_values: Dict[str, str] = field(default_factory=dict)
 
+@dataclass
 class Metadata(Action):
     id: str
     name: str
     description: str
-    format: Format
     schema_string: str
     partition_columns: List[str]
-    configuration: Dict[str, str]
+    configuration: Dict[str, str] = field(default_factory=dict)
+    format_provider: str = "parquet"
 
+@dataclass
 class Protocol(Action):
     min_reader_version: int
     min_writer_version: int
-```
-
-### Spark Processing Engine
-
-```python
-from pyspark.sql import SparkSession
-from delta import DeltaTable
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
-
-class LakehouseProcessor:
-    def __init__(self, spark: SparkSession):
-        self.spark = spark
-
-    def bronze_ingestion(
-        self,
-        source_path: str,
-        bronze_path: str,
-        source_name: str,
-        schema: StructType = None
-    ):
-        """
-        Ingest raw data into bronze layer with metadata.
-        """
-        # Read raw data (schema inference or provided)
-        if schema:
-            df = self.spark.read.schema(schema).json(source_path)
-        else:
-            df = self.spark.read.json(source_path)
-
-        # Add bronze metadata columns
-        df_bronze = df \
-            .withColumn("_source", lit(source_name)) \
-            .withColumn("_ingestion_ts", current_timestamp()) \
-            .withColumn("_batch_id", lit(str(uuid.uuid4()))) \
-            .withColumn("_input_file", input_file_name())
-
-        # Write to bronze (append-only)
-        df_bronze.write \
-            .format("delta") \
-            .mode("append") \
-            .partitionBy("_ingestion_date") \
-            .save(bronze_path)
-
-    def bronze_to_silver(
-        self,
-        bronze_path: str,
-        silver_path: str,
-        dedup_keys: List[str],
-        watermark_col: str,
-        transformations: List[Callable]
-    ):
-        """
-        Transform bronze to silver with cleaning, deduplication, and validation.
-        """
-        # Read bronze data (incremental based on watermark)
-        bronze_df = self.spark.read.format("delta").load(bronze_path)
-
-        # Get watermark for incremental processing
-        if DeltaTable.isDeltaTable(self.spark, silver_path):
-            silver_table = DeltaTable.forPath(self.spark, silver_path)
-            max_watermark = silver_table.toDF() \
-                .agg(max(watermark_col)) \
-                .collect()[0][0]
-            bronze_df = bronze_df.filter(col(watermark_col) > max_watermark)
-
-        # Apply transformations
-        df = bronze_df
-        for transform in transformations:
-            df = transform(df)
-
-        # Deduplicate (keep latest by watermark)
-        window = Window.partitionBy(dedup_keys).orderBy(col(watermark_col).desc())
-        df_deduped = df \
-            .withColumn("_row_num", row_number().over(window)) \
-            .filter(col("_row_num") == 1) \
-            .drop("_row_num")
-
-        # Validate data quality
-        df_validated = self._apply_quality_checks(df_deduped)
-
-        # Merge into silver (upsert)
-        if DeltaTable.isDeltaTable(self.spark, silver_path):
-            silver_table = DeltaTable.forPath(self.spark, silver_path)
-
-            merge_condition = " AND ".join([
-                f"target.{key} = source.{key}" for key in dedup_keys
-            ])
-
-            silver_table.alias("target").merge(
-                df_validated.alias("source"),
-                merge_condition
-            ).whenMatchedUpdateAll() \
-             .whenNotMatchedInsertAll() \
-             .execute()
-        else:
-            # Initial load
-            df_validated.write \
-                .format("delta") \
-                .mode("overwrite") \
-                .save(silver_path)
-
-    def silver_to_gold(
-        self,
-        silver_tables: Dict[str, str],
-        gold_path: str,
-        aggregation_query: str,
-        z_order_cols: List[str] = None
-    ):
-        """
-        Build gold layer aggregations from silver tables.
-        """
-        # Register silver tables as temp views
-        for name, path in silver_tables.items():
-            self.spark.read.format("delta").load(path).createOrReplaceTempView(name)
-
-        # Execute aggregation query
-        gold_df = self.spark.sql(aggregation_query)
-
-        # Write to gold
-        gold_df.write \
-            .format("delta") \
-            .mode("overwrite") \
-            .option("overwriteSchema", "true") \
-            .save(gold_path)
-
-        # Optimize with Z-ordering
-        if z_order_cols:
-            gold_table = DeltaTable.forPath(self.spark, gold_path)
-            gold_table.optimize().zOrderBy(z_order_cols).executeCompaction()
-
-    def _apply_quality_checks(self, df: DataFrame) -> DataFrame:
-        """Apply data quality constraints"""
-        # This would integrate with Great Expectations or similar
-        return df
-```
-
-### Flink Streaming Engine
-
-```python
-from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.table import StreamTableEnvironment, EnvironmentSettings
-from pyflink.table.expressions import col, lit
-from pyflink.table.window import Tumble
-
-class StreamingLakehouse:
-    def __init__(self):
-        self.env = StreamExecutionEnvironment.get_execution_environment()
-        self.env.enable_checkpointing(60000)  # 1 minute checkpoints
-
-        settings = EnvironmentSettings.new_instance() \
-            .in_streaming_mode() \
-            .build()
-        self.t_env = StreamTableEnvironment.create(self.env, settings)
-
-        # Configure Delta Lake connector
-        self._configure_delta()
-
-    def _configure_delta(self):
-        """Configure Flink for Delta Lake"""
-        self.t_env.execute_sql("""
-            CREATE CATALOG delta_catalog WITH (
-                'type' = 'delta-catalog',
-                'catalog-type' = 'in-memory'
-            )
-        """)
-
-    def streaming_bronze_ingestion(
-        self,
-        kafka_config: dict,
-        bronze_path: str
-    ):
-        """
-        Stream data from Kafka to Bronze layer.
-        """
-        # Create Kafka source
-        self.t_env.execute_sql(f"""
-            CREATE TABLE kafka_source (
-                event_id STRING,
-                event_type STRING,
-                payload STRING,
-                event_time TIMESTAMP(3),
-                WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
-            ) WITH (
-                'connector' = 'kafka',
-                'topic' = '{kafka_config['topic']}',
-                'properties.bootstrap.servers' = '{kafka_config['bootstrap_servers']}',
-                'properties.group.id' = '{kafka_config['group_id']}',
-                'scan.startup.mode' = 'latest-offset',
-                'format' = 'json'
-            )
-        """)
-
-        # Create Delta sink
-        self.t_env.execute_sql(f"""
-            CREATE TABLE bronze_sink (
-                event_id STRING,
-                event_type STRING,
-                payload STRING,
-                event_time TIMESTAMP(3),
-                _ingestion_ts TIMESTAMP(3),
-                _partition_date STRING
-            ) PARTITIONED BY (_partition_date)
-            WITH (
-                'connector' = 'delta',
-                'table-path' = '{bronze_path}'
-            )
-        """)
-
-        # Insert with metadata
-        self.t_env.execute_sql("""
-            INSERT INTO bronze_sink
-            SELECT
-                event_id,
-                event_type,
-                payload,
-                event_time,
-                CURRENT_TIMESTAMP as _ingestion_ts,
-                DATE_FORMAT(event_time, 'yyyy-MM-dd') as _partition_date
-            FROM kafka_source
-        """)
-
-    def streaming_aggregations(
-        self,
-        silver_path: str,
-        gold_path: str,
-        window_size: str = "1 HOUR"
-    ):
-        """
-        Continuous aggregations from Silver to Gold.
-        """
-        # Read from Silver as streaming table
-        self.t_env.execute_sql(f"""
-            CREATE TABLE silver_source (
-                user_id STRING,
-                event_type STRING,
-                amount DECIMAL(10, 2),
-                event_time TIMESTAMP(3),
-                WATERMARK FOR event_time AS event_time - INTERVAL '10' SECOND
-            ) WITH (
-                'connector' = 'delta',
-                'table-path' = '{silver_path}',
-                'mode' = 'streaming'
-            )
-        """)
-
-        # Windowed aggregation
-        result = self.t_env.sql_query(f"""
-            SELECT
-                user_id,
-                TUMBLE_START(event_time, INTERVAL '{window_size}') as window_start,
-                TUMBLE_END(event_time, INTERVAL '{window_size}') as window_end,
-                COUNT(*) as event_count,
-                SUM(amount) as total_amount,
-                AVG(amount) as avg_amount
-            FROM silver_source
-            GROUP BY
-                user_id,
-                TUMBLE(event_time, INTERVAL '{window_size}')
-        """)
-
-        # Write to Gold
-        self.t_env.execute_sql(f"""
-            CREATE TABLE gold_sink (
-                user_id STRING,
-                window_start TIMESTAMP(3),
-                window_end TIMESTAMP(3),
-                event_count BIGINT,
-                total_amount DECIMAL(10, 2),
-                avg_amount DECIMAL(10, 2)
-            ) WITH (
-                'connector' = 'delta',
-                'table-path' = '{gold_path}'
-            )
-        """)
-
-        result.execute_insert("gold_sink")
-```
-
----
-
-## Data Structures
-
-### Table Configuration
-
-```python
-from dataclasses import dataclass
-from typing import List, Dict, Optional
-from enum import Enum
-
-class Layer(Enum):
-    BRONZE = "bronze"
-    SILVER = "silver"
-    GOLD = "gold"
+    reader_features: List[str] = field(default_factory=list)
+    writer_features: List[str] = field(default_factory=list)
 
 @dataclass
-class DeltaTableConfig:
-    """Configuration for a Delta Lake table"""
-    name: str
-    path: str
-    layer: Layer
-    schema: StructType
-    partition_columns: List[str]
-    z_order_columns: List[str]
-    description: str
+class CommitInfo(Action):
+    timestamp: int
+    user_id: str = ""
+    operation: str = ""
+    operation_parameters: Dict[str, str] = field(default_factory=dict)
+    job_name: str = ""
+    notebook_id: str = ""
+    is_blind_append: bool = True
 
-    # Delta-specific configurations
-    enable_change_data_feed: bool = False
+@dataclass
+class SetTransaction(Action):
+    app_id: str
+    version: int
+    last_updated: Optional[int] = None
+```
+
+### Table state and snapshot
+
+`TableState` is the folded result of applying actions; `Snapshot` pairs it with a version.
+
+```python
+@dataclass
+class TableState:
+    files: List[AddFile] = field(default_factory=list)
+    metadata: Optional[Metadata] = None
+    protocol: Optional[Protocol] = None
+
+    def apply_actions(self, actions: List[Action]) -> "TableState":
+        new_state = TableState(files=self.files.copy(),
+                               metadata=self.metadata, protocol=self.protocol)
+        for action in actions:
+            if isinstance(action, AddFile):
+                new_state.files.append(action)
+            elif isinstance(action, RemoveFile):
+                new_state.files = [f for f in new_state.files if f.path != action.path]
+            elif isinstance(action, Metadata):
+                new_state.metadata = action
+            elif isinstance(action, Protocol):
+                new_state.protocol = action
+        return new_state
+
+@dataclass
+class Snapshot:
+    version: int
+    state: TableState
+```
+
+### On-disk layout
+
+A table directory holds data files plus the log:
+
+```
+events_table/
+  _delta_log/
+    00000000000000000000.json            # commit v0 (one JSON action per line)
+    00000000000000000001.json            # commit v1
+    00000000000000000010.checkpoint.parquet   # checkpoint at v10
+  dt=2024-01-01/part-0.parquet
+  dt=2024-01-02/part-1.parquet
+```
+
+Each `.json` line is one serialized action, e.g.
+`{"add": {"path": "...", "partitionValues": {...}, "size": ..., "stats": "..."}}`.
+
+### Configuration and quality types
+
+```python
+class Layer(Enum):
+    BRONZE = "bronze"; SILVER = "silver"; GOLD = "gold"
+
+@dataclass
+class LakehouseConfig:
+    lakehouse_path: str
+    checkpoint_path: str
+    spark_master: str = "local[*]"
+    app_name: str = "data-lakehouse"
+    enable_change_data_feed: bool = True
     auto_compact: bool = True
     optimize_write: bool = True
-
-    # Retention settings
     log_retention_days: int = 30
-    deleted_file_retention_hours: int = 168  # 7 days
+    deleted_file_retention_hours: int = 168          # 7 days
 
-    # Quality constraints
-    constraints: Dict[str, str] = None  # CHECK constraints
-
-    def to_table_properties(self) -> Dict[str, str]:
-        return {
-            "delta.enableChangeDataFeed": str(self.enable_change_data_feed).lower(),
-            "delta.autoOptimize.autoCompact": str(self.auto_compact).lower(),
-            "delta.autoOptimize.optimizeWrite": str(self.optimize_write).lower(),
-            "delta.logRetentionDuration": f"interval {self.log_retention_days} days",
-            "delta.deletedFileRetentionDuration": f"interval {self.deleted_file_retention_hours} hours",
-        }
+    def get_layer_path(self, layer: Layer) -> str:
+        return f"{self.lakehouse_path}/{layer.value}"
 
 @dataclass
-class IncrementalConfig:
-    """Configuration for incremental processing"""
-    watermark_column: str
-    merge_keys: List[str]
-    scd_type: int = 1  # 1 for Type 1 (overwrite), 2 for Type 2 (history)
+class ValidationResult:
+    success: bool
+    results: List[ExpectationResult]
+    statistics: Dict[str, Any]
 
-    # For SCD Type 2
-    effective_date_col: str = "effective_date"
-    end_date_col: str = "end_date"
-    current_flag_col: str = "is_current"
-
-@dataclass
-class QualityRule:
-    """Data quality rule definition"""
-    name: str
-    column: str
-    expectation_type: str  # e.g., "not_null", "unique", "in_set"
-    expectation_kwargs: Dict
-    severity: str = "error"  # error, warning
-
-@dataclass
-class TableLineage:
-    """Track table dependencies"""
-    table_name: str
-    upstream_tables: List[str]
-    downstream_tables: List[str]
-    transformation_query: str
-    refresh_schedule: str
+    @property
+    def failed_expectations(self) -> List[ExpectationResult]:
+        return [r for r in self.results if not r.success]
 ```
 
-### Column Statistics
+### Lineage types
 
 ```python
-@dataclass
-class ColumnStats:
-    """Column-level statistics for query optimization"""
-    column_name: str
-    data_type: str
-    num_nulls: int
-    min_value: any
-    max_value: any
-    num_distinct: int = None
-    avg_length: float = None
-
-    # For numeric columns
-    mean: float = None
-    stddev: float = None
-
-    # For string columns
-    top_k_values: List[tuple] = None  # (value, count)
+class LineageType(Enum):
+    DIRECT = "direct"; DERIVED = "derived"; FILTERED = "filtered"
+    JOINED = "joined"; AGGREGATED = "aggregated"
 
 @dataclass
-class FileStats:
-    """File-level statistics stored in Delta Log"""
-    path: str
-    partition_values: Dict[str, str]
-    size_bytes: int
-    num_records: int
-    column_stats: Dict[str, ColumnStats]
+class ColumnLineage:
+    source_table: str
+    source_column: str
+    target_table: str
+    target_column: str
+    lineage_type: LineageType
+    transformation: Optional[str] = None
 ```
-
----
 
 ## API Design
 
-### Python SDK
+### DeltaLog (pure Python — no external services)
 
 ```python
-class LakehouseClient:
-    """High-level client for Lakehouse operations"""
+class DeltaLog:
+    def __init__(self, table_path: str): ...
+    @property
+    def current_version(self) -> int: ...
+    @property
+    def snapshot(self) -> List[Action]: ...
 
-    def __init__(self, config: LakehouseConfig):
-        self.spark = self._init_spark(config)
-        self.catalog = Catalog(config.metastore_uri)
-        self.quality_engine = QualityEngine(config.great_expectations_root)
-
-    # Table Management
-    def create_table(self, config: DeltaTableConfig) -> None:
-        """Create a new Delta table with configuration"""
-        pass
-
-    def get_table(self, table_name: str) -> DeltaTable:
-        """Get a Delta table by name"""
-        pass
-
-    def drop_table(self, table_name: str, purge: bool = False) -> None:
-        """Drop a table, optionally purging files"""
-        pass
-
-    # Time Travel
-    def read_version(self, table_name: str, version: int) -> DataFrame:
-        """Read a specific version of a table"""
-        return self.spark.read.format("delta") \
-            .option("versionAsOf", version) \
-            .table(table_name)
-
-    def read_timestamp(self, table_name: str, timestamp: str) -> DataFrame:
-        """Read table as of a specific timestamp"""
-        return self.spark.read.format("delta") \
-            .option("timestampAsOf", timestamp) \
-            .table(table_name)
-
-    def restore_version(self, table_name: str, version: int) -> None:
-        """Restore a table to a previous version"""
-        table = DeltaTable.forName(self.spark, table_name)
-        table.restoreToVersion(version)
-
-    # Optimization
-    def optimize(
-        self,
-        table_name: str,
-        partition_filter: str = None,
-        z_order_by: List[str] = None
-    ) -> Dict:
-        """Optimize table files with optional Z-ordering"""
-        table = DeltaTable.forName(self.spark, table_name)
-
-        optimize_builder = table.optimize()
-
-        if partition_filter:
-            optimize_builder = optimize_builder.where(partition_filter)
-
-        if z_order_by:
-            metrics = optimize_builder.zOrderBy(z_order_by).executeCompaction()
-        else:
-            metrics = optimize_builder.executeCompaction()
-
-        return metrics
-
-    def vacuum(self, table_name: str, retention_hours: int = 168) -> None:
-        """Remove old files not in current table state"""
-        table = DeltaTable.forName(self.spark, table_name)
-        table.vacuum(retention_hours)
-
-    # Change Data Feed
-    def read_changes(
-        self,
-        table_name: str,
-        start_version: int = None,
-        end_version: int = None,
-        start_timestamp: str = None,
-        end_timestamp: str = None
-    ) -> DataFrame:
-        """Read change data feed for a table"""
-        reader = self.spark.read.format("delta") \
-            .option("readChangeFeed", "true")
-
-        if start_version:
-            reader = reader.option("startingVersion", start_version)
-        if end_version:
-            reader = reader.option("endingVersion", end_version)
-        if start_timestamp:
-            reader = reader.option("startingTimestamp", start_timestamp)
-        if end_timestamp:
-            reader = reader.option("endingTimestamp", end_timestamp)
-
-        return reader.table(table_name)
-
-    # Data Quality
-    def validate(
-        self,
-        df: DataFrame,
-        expectation_suite: str
-    ) -> ValidationResult:
-        """Validate DataFrame against expectation suite"""
-        return self.quality_engine.validate(df, expectation_suite)
-
-    # Lineage
-    def get_lineage(self, table_name: str) -> TableLineage:
-        """Get upstream and downstream dependencies"""
-        pass
-
-    # History
-    def get_history(
-        self,
-        table_name: str,
-        limit: int = None
-    ) -> DataFrame:
-        """Get table history"""
-        table = DeltaTable.forName(self.spark, table_name)
-        return table.history(limit)
+    def commit(self, actions: List[Action], max_retries: int = 3) -> int: ...
+    def get_snapshot(self, version: Optional[int] = None) -> Snapshot: ...
+    def read_version(self, version: int) -> List[Dict[str, Any]]: ...
+    def time_travel(self, version: int) -> List[AddFile]: ...
+    def create_checkpoint(self) -> None: ...
+    def get_active_files(self) -> List[AddFile]: ...
+    def get_partitions(self) -> Dict[str, List[AddFile]]: ...
+    def get_table_properties(self) -> Dict[str, Any]: ...
+    def vacuum(self, retention_hours: int = 168) -> List[str]: ...
+    def optimize_z_order(self, columns: List[str]) -> List[AddFile]: ...   # placeholder
+    def collect_stats(self) -> Dict[str, Any]: ...
 ```
 
-### REST API
-
-```yaml
-openapi: 3.0.0
-info:
-  title: Lakehouse API
-  version: 1.0.0
-
-paths:
-  /tables:
-    get:
-      summary: List all tables
-      parameters:
-        - name: layer
-          in: query
-          schema:
-            type: string
-            enum: [bronze, silver, gold]
-    post:
-      summary: Create a new table
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TableConfig'
-
-  /tables/{table_name}:
-    get:
-      summary: Get table metadata
-    delete:
-      summary: Drop table
-
-  /tables/{table_name}/query:
-    post:
-      summary: Query table data
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                sql:
-                  type: string
-                version:
-                  type: integer
-                timestamp:
-                  type: string
-
-  /tables/{table_name}/history:
-    get:
-      summary: Get table history
-      parameters:
-        - name: limit
-          in: query
-          schema:
-            type: integer
-
-  /tables/{table_name}/optimize:
-    post:
-      summary: Optimize table
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                partition_filter:
-                  type: string
-                z_order_columns:
-                  type: array
-                  items:
-                    type: string
-
-  /tables/{table_name}/vacuum:
-    post:
-      summary: Vacuum old files
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                retention_hours:
-                  type: integer
-                  default: 168
-
-  /tables/{table_name}/changes:
-    get:
-      summary: Read change data feed
-      parameters:
-        - name: start_version
-          in: query
-          schema:
-            type: integer
-        - name: end_version
-          in: query
-          schema:
-            type: integer
-```
-
----
-
-## Enterprise Features
-
-### 1. Workflow Orchestration (Airflow Integration)
+### LakehouseProcessor (requires pyspark)
 
 ```python
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
-from datetime import datetime, timedelta
-
-default_args = {
-    'owner': 'data-platform',
-    'depends_on_past': True,
-    'email_on_failure': True,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-}
-
-with DAG(
-    'lakehouse_daily_etl',
-    default_args=default_args,
-    schedule_interval='0 6 * * *',
-    start_date=datetime(2024, 1, 1),
-    catchup=False,
-    tags=['lakehouse', 'production'],
-) as dag:
-
-    # Bronze ingestion tasks
-    ingest_events = SparkSubmitOperator(
-        task_id='ingest_events_to_bronze',
-        application='/opt/spark/jobs/bronze_ingestion.py',
-        conf={
-            'spark.sql.extensions': 'io.delta.sql.DeltaSparkSessionExtension',
-            'spark.sql.catalog.spark_catalog': 'org.apache.spark.sql.delta.catalog.DeltaCatalog',
-        },
-        application_args=[
-            '--source', 's3://raw-data/events/{{ ds }}/',
-            '--target', 's3://lakehouse/bronze/events/',
-        ],
-    )
-
-    # Silver transformation tasks
-    transform_events = SparkSubmitOperator(
-        task_id='transform_events_to_silver',
-        application='/opt/spark/jobs/silver_transformation.py',
-        application_args=[
-            '--bronze-path', 's3://lakehouse/bronze/events/',
-            '--silver-path', 's3://lakehouse/silver/events/',
-            '--date', '{{ ds }}',
-        ],
-    )
-
-    # Data quality check
-    quality_check = PythonOperator(
-        task_id='quality_check_silver',
-        python_callable=run_quality_checks,
-        op_kwargs={
-            'table': 'silver.events',
-            'suite': 'events_quality_suite',
-        },
-    )
-
-    # Gold aggregation
-    build_gold = SparkSubmitOperator(
-        task_id='build_gold_aggregations',
-        application='/opt/spark/jobs/gold_aggregation.py',
-        application_args=[
-            '--silver-tables', 'events,users,products',
-            '--gold-path', 's3://lakehouse/gold/user_metrics/',
-        ],
-    )
-
-    # Optimization
-    optimize_tables = PythonOperator(
-        task_id='optimize_delta_tables',
-        python_callable=optimize_lakehouse_tables,
-        op_kwargs={
-            'tables': ['silver.events', 'gold.user_metrics'],
-        },
-    )
-
-    # Dependencies
-    ingest_events >> transform_events >> quality_check >> build_gold >> optimize_tables
+class LakehouseProcessor:
+    def __init__(self, spark, config: Optional[LakehouseConfig] = None): ...
+    def bronze_ingestion(self, source_path, bronze_path, source_name,
+                         schema=None, file_format="json") -> None: ...
+    def bronze_ingestion_df(self, df, bronze_path, source_name) -> None: ...
+    def bronze_to_silver(self, bronze_path, silver_path, dedup_keys,
+                         watermark_col, transformations=None) -> None: ...
+    def silver_to_gold(self, silver_tables, gold_path,
+                       aggregation_query, z_order_cols=None) -> None: ...
+    def apply_scd_type2(self, silver_path, updates_df, key_columns,
+                        track_columns, ...) -> None: ...
+    def read_table(self, path, version=None, timestamp=None): ...
+    def optimize_table(self, path, partition_filter=None, z_order_by=None) -> Dict: ...
+    def vacuum_table(self, path, retention_hours=168) -> None: ...
+    def get_table_history(self, path, limit=None): ...
+    def restore_table(self, path, version) -> None: ...
+    def merge_delta_tables(self, target_path, source_df, merge_keys,
+                           update_columns=None, delete_condition=None) -> Dict: ...
 ```
 
-### 2. Data Quality (Great Expectations)
+### QualityEngine (fluent, evaluation requires pyspark)
 
 ```python
-import great_expectations as gx
-from great_expectations.core.batch import BatchRequest
-from great_expectations.checkpoint import SimpleCheckpoint
-
-class LakehouseQualityEngine:
-    def __init__(self, ge_root: str):
-        self.context = gx.get_context(context_root_dir=ge_root)
-
-    def create_expectation_suite(
-        self,
-        suite_name: str,
-        expectations: List[dict]
-    ):
-        """Create an expectation suite programmatically"""
-        suite = self.context.create_expectation_suite(suite_name)
-
-        for exp in expectations:
-            suite.add_expectation(
-                expectation_configuration=gx.core.ExpectationConfiguration(
-                    expectation_type=exp['type'],
-                    kwargs=exp['kwargs'],
-                    meta=exp.get('meta', {})
-                )
-            )
-
-        self.context.save_expectation_suite(suite)
-
-    def validate_delta_table(
-        self,
-        table_path: str,
-        suite_name: str
-    ) -> ValidationResult:
-        """Validate a Delta table against an expectation suite"""
-
-        # Create batch request for Delta table
-        batch_request = BatchRequest(
-            datasource_name="lakehouse",
-            data_connector_name="delta_connector",
-            data_asset_name=table_path,
-        )
-
-        # Run checkpoint
-        checkpoint = SimpleCheckpoint(
-            name=f"validate_{suite_name}",
-            data_context=self.context,
-            validations=[{
-                "batch_request": batch_request,
-                "expectation_suite_name": suite_name,
-            }]
-        )
-
-        result = checkpoint.run()
-
-        return result
-
-# Example expectation suite for Silver events
-events_expectations = [
-    {
-        "type": "expect_column_to_exist",
-        "kwargs": {"column": "event_id"}
-    },
-    {
-        "type": "expect_column_values_to_not_be_null",
-        "kwargs": {"column": "event_id"}
-    },
-    {
-        "type": "expect_column_values_to_be_unique",
-        "kwargs": {"column": "event_id"}
-    },
-    {
-        "type": "expect_column_values_to_be_in_set",
-        "kwargs": {
-            "column": "event_type",
-            "value_set": ["click", "view", "purchase", "signup"]
-        }
-    },
-    {
-        "type": "expect_column_values_to_be_between",
-        "kwargs": {
-            "column": "amount",
-            "min_value": 0,
-            "max_value": 100000
-        }
-    },
-    {
-        "type": "expect_table_row_count_to_be_between",
-        "kwargs": {
-            "min_value": 1000,
-            "max_value": 10000000
-        }
-    },
-]
+class QualityEngine:
+    def expect_column_to_exist(self, column) -> "QualityEngine": ...
+    def expect_column_values_to_not_be_null(self, column) -> "QualityEngine": ...
+    def expect_column_values_to_be_unique(self, column) -> "QualityEngine": ...
+    def expect_column_values_to_be_in_set(self, column, value_set) -> "QualityEngine": ...
+    def expect_column_values_to_be_between(self, column, min_value=None,
+                                           max_value=None) -> "QualityEngine": ...
+    def expect_table_row_count_to_be_between(self, min_value, max_value) -> "QualityEngine": ...
+    def validate(self, df) -> ValidationResult: ...
+    def clear_expectations(self) -> None: ...
 ```
 
-### 3. Cost Optimization
-
-```python
-class LakehouseCostOptimizer:
-    """Optimize storage and compute costs"""
-
-    def __init__(self, client: LakehouseClient):
-        self.client = client
-
-    def analyze_storage_costs(self, table_name: str) -> StorageReport:
-        """Analyze storage efficiency of a table"""
-        table = self.client.get_table(table_name)
-
-        # Get file statistics
-        files = table.toDF().select("_metadata.file_path", "_metadata.file_size")
-
-        total_size = files.agg(sum("file_size")).collect()[0][0]
-        file_count = files.count()
-        avg_file_size = total_size / file_count if file_count > 0 else 0
-
-        # Get version history size
-        history = table.history()
-        versions = history.count()
-
-        # Identify small files (< 128MB)
-        small_files = files.filter(col("file_size") < 128 * 1024 * 1024).count()
-
-        return StorageReport(
-            total_size_bytes=total_size,
-            file_count=file_count,
-            avg_file_size_bytes=avg_file_size,
-            small_file_count=small_files,
-            version_count=versions,
-            recommendations=self._generate_recommendations(
-                avg_file_size, small_files, versions
-            )
-        )
-
-    def optimize_storage(
-        self,
-        table_name: str,
-        target_file_size_mb: int = 1024
-    ):
-        """Optimize storage by compacting files"""
-        table = self.client.get_table(table_name)
-
-        # Enable optimized writes for future
-        self.client.spark.sql(f"""
-            ALTER TABLE {table_name}
-            SET TBLPROPERTIES (
-                'delta.autoOptimize.optimizeWrite' = 'true',
-                'delta.autoOptimize.autoCompact' = 'true',
-                'delta.targetFileSize' = '{target_file_size_mb * 1024 * 1024}'
-            )
-        """)
-
-        # Compact existing files
-        table.optimize().executeCompaction()
-
-    def setup_lifecycle_policies(
-        self,
-        table_name: str,
-        log_retention_days: int = 30,
-        vacuum_retention_hours: int = 168
-    ):
-        """Configure lifecycle policies for automatic cleanup"""
-        self.client.spark.sql(f"""
-            ALTER TABLE {table_name}
-            SET TBLPROPERTIES (
-                'delta.logRetentionDuration' = 'interval {log_retention_days} days',
-                'delta.deletedFileRetentionDuration' = 'interval {vacuum_retention_hours} hours'
-            )
-        """)
-
-    def schedule_vacuum(self, table_name: str, retention_hours: int = 168):
-        """Vacuum table to remove old files"""
-        table = self.client.get_table(table_name)
-        table.vacuum(retention_hours)
-```
-
----
-
-## Performance Considerations
-
-### Z-Order Optimization
-
-```python
-def apply_z_order(
-    table: DeltaTable,
-    columns: List[str],
-    partition_filter: str = None
-):
-    """
-    Apply Z-ordering for multi-dimensional clustering.
-    Improves query performance for filters on multiple columns.
-    """
-    optimizer = table.optimize()
-
-    if partition_filter:
-        optimizer = optimizer.where(partition_filter)
-
-    # Z-order interleaves bits from multiple columns
-    # to preserve locality in multi-dimensional space
-    metrics = optimizer.zOrderBy(columns).executeCompaction()
-
-    return metrics
-
-# Best practices:
-# - Z-order on columns frequently used together in filters
-# - Limit to 3-4 columns (diminishing returns beyond)
-# - High-cardinality columns benefit most
-# - Re-run after significant data changes
-```
-
-### Partition Pruning
-
-```python
-def design_partition_strategy(
-    table_name: str,
-    query_patterns: List[str],
-    data_characteristics: dict
-) -> List[str]:
-    """
-    Design optimal partition strategy based on query patterns.
-    """
-    recommendations = []
-
-    # Analyze query patterns for common filters
-    filter_columns = extract_filter_columns(query_patterns)
-
-    # Check cardinality
-    for col in filter_columns:
-        cardinality = data_characteristics.get(f"{col}_cardinality", 0)
-
-        # Ideal: 10K-100K files after partitioning
-        if cardinality < 1000:
-            recommendations.append(col)
-        elif cardinality < 10000:
-            # Consider composite partitioning
-            recommendations.append(f"date_trunc('month', {col})")
-
-    return recommendations
-
-# Partition pruning in action
-def query_with_pruning(spark, table_path: str, date: str, region: str):
-    """
-    Query that leverages partition pruning.
-    Only reads files matching partition predicates.
-    """
-    return spark.read.format("delta") \
-        .load(table_path) \
-        .filter(f"date = '{date}' AND region = '{region}'")  # Pruned!
-```
-
-### Compaction Strategy
-
-```python
-class CompactionManager:
-    """Manage file compaction for optimal performance"""
-
-    def __init__(self, spark: SparkSession):
-        self.spark = spark
-
-    def auto_compact_strategy(
-        self,
-        table_path: str,
-        target_size_mb: int = 1024
-    ):
-        """
-        Implement auto-compaction strategy.
-        Triggers when:
-        - Too many small files in a partition
-        - Average file size drops below threshold
-        """
-        table = DeltaTable.forPath(self.spark, table_path)
-
-        # Analyze current state
-        files_df = self.spark.sql(f"""
-            DESCRIBE DETAIL delta.`{table_path}`
-        """)
-
-        num_files = files_df.select("numFiles").collect()[0][0]
-        size_bytes = files_df.select("sizeInBytes").collect()[0][0]
-
-        avg_size_mb = (size_bytes / num_files) / (1024 * 1024)
-
-        # Compact if average file size is less than 50% of target
-        if avg_size_mb < target_size_mb * 0.5:
-            table.optimize().executeCompaction()
-            return True
-
-        return False
-```
-
----
-
-## Stretch Goals
-
-### 1. Auto-Compaction Service
-
-```python
-class AutoCompactionService:
-    """Background service for automatic table compaction"""
-
-    def __init__(self, config: CompactionConfig):
-        self.config = config
-        self.scheduler = BackgroundScheduler()
-
-    def start(self):
-        """Start the auto-compaction service"""
-        self.scheduler.add_job(
-            self._compaction_job,
-            'interval',
-            hours=self.config.check_interval_hours,
-            id='auto_compaction'
-        )
-        self.scheduler.start()
-
-    def _compaction_job(self):
-        """Check and compact tables that need it"""
-        for table in self.config.managed_tables:
-            if self._needs_compaction(table):
-                self._compact_table(table)
-
-    def _needs_compaction(self, table: str) -> bool:
-        """Check if table needs compaction based on heuristics"""
-        metrics = self._get_table_metrics(table)
-
-        # Trigger if:
-        # 1. More than N small files
-        # 2. Average file size below threshold
-        # 3. More than N versions since last compaction
-        return (
-            metrics.small_file_count > self.config.max_small_files or
-            metrics.avg_file_size_mb < self.config.min_file_size_mb or
-            metrics.versions_since_compact > self.config.max_versions
-        )
-```
-
-### 2. Change Data Feed (CDF) Tracking
-
-```python
-class ChangeDataFeedProcessor:
-    """Process and propagate change data feeds"""
-
-    def __init__(self, spark: SparkSession):
-        self.spark = spark
-
-    def enable_cdf(self, table_name: str):
-        """Enable change data feed on a table"""
-        self.spark.sql(f"""
-            ALTER TABLE {table_name}
-            SET TBLPROPERTIES (delta.enableChangeDataFeed = true)
-        """)
-
-    def read_changes(
-        self,
-        table_name: str,
-        start_version: int,
-        end_version: int = None
-    ) -> DataFrame:
-        """Read changes between versions"""
-        reader = self.spark.read.format("delta") \
-            .option("readChangeFeed", "true") \
-            .option("startingVersion", start_version)
-
-        if end_version:
-            reader = reader.option("endingVersion", end_version)
-
-        return reader.table(table_name)
-
-    def propagate_changes(
-        self,
-        source_table: str,
-        target_table: str,
-        transform_fn: Callable[[DataFrame], DataFrame] = None
-    ):
-        """Propagate changes from source to target table"""
-        # Get last processed version
-        last_version = self._get_last_processed_version(source_table, target_table)
-
-        # Read changes
-        changes = self.read_changes(source_table, last_version + 1)
-
-        if changes.count() == 0:
-            return
-
-        # Apply transformation
-        if transform_fn:
-            changes = transform_fn(changes)
-
-        # Process by change type
-        inserts = changes.filter("_change_type = 'insert'").drop("_change_type", "_commit_version", "_commit_timestamp")
-        updates = changes.filter("_change_type = 'update_postimage'").drop("_change_type", "_commit_version", "_commit_timestamp")
-        deletes = changes.filter("_change_type = 'delete'")
-
-        # Apply to target
-        target = DeltaTable.forName(self.spark, target_table)
-        # ... merge logic
-```
-
-### 3. Streaming Joins
-
-```python
-class StreamingJoinProcessor:
-    """Handle streaming joins with state management"""
-
-    def __init__(self, spark: SparkSession):
-        self.spark = spark
-
-    def stream_stream_join(
-        self,
-        left_stream_path: str,
-        right_stream_path: str,
-        join_key: str,
-        watermark_delay: str,
-        output_path: str
-    ):
-        """Join two streams with watermarking"""
-        # Read left stream with watermark
-        left = self.spark.readStream \
-            .format("delta") \
-            .load(left_stream_path) \
-            .withWatermark("event_time", watermark_delay)
-
-        # Read right stream with watermark
-        right = self.spark.readStream \
-            .format("delta") \
-            .load(right_stream_path) \
-            .withWatermark("event_time", watermark_delay)
-
-        # Join with time constraint
-        joined = left.join(
-            right,
-            on=join_key,
-            how="inner"
-        ).filter(
-            abs(left.event_time - right.event_time) < expr("interval 1 hour")
-        )
-
-        # Write to output
-        query = joined.writeStream \
-            .format("delta") \
-            .outputMode("append") \
-            .option("checkpointLocation", f"{output_path}/_checkpoint") \
-            .start(output_path)
-
-        return query
-```
-
----
+The full method-by-method reference (signatures, parameters, return shapes for every
+module) lives in [API.md](API.md); deployment instructions are in
+[DEPLOYMENT.md](DEPLOYMENT.md) and deeper architecture notes in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Performance
+
+Performance numbers here describe the design's intent and the heuristics that are actually
+coded; they are not benchmark measurements.
+
+- **Bounded read cost via checkpoints.** Without checkpoints, reconstructing the table at
+  version *N* replays *N+1* JSON files — O(N) log reads. `create_checkpoint()` collapses the
+  active-file set into a single parquet file so `get_snapshot` only replays commits *after*
+  the latest checkpoint, bounding read amplification regardless of history depth.
+- **Commit cost.** A commit is a single exclusive file write plus a directory listing to
+  find the latest version; conflicts cost one extra listing + write per retry, up to
+  `max_retries` (default 3).
+- **Active-file resolution** is a single pass over the in-memory action snapshot
+  (`get_active_files`), so partition grouping and stats are linear in the number of actions.
+- **File-size targets.** The optimizer treats files under **128 MB** as "small" and targets
+  roughly **1 GB** compacted files (`_generate_recommendations`, `analyze_storage`).
+  `CompactionScheduler.should_compact` triggers when small files exceed a threshold, average
+  file size drops below the minimum, or the version count grows large (default >50).
+- **Partition vs Z-order guidance.** `PartitionOptimizer` recommends partitioning for
+  columns with cardinality under ~100, coarser granularity up to ~1000, and Z-ordering
+  instead for higher cardinality; `ZOrderOptimizer` favors low-selectivity columns and caps
+  Z-order at 4 columns.
+- **Adaptive compaction targets.** `CompactionStrategy.adapt_target_size` shrinks target
+  file size for streaming workloads (down to 32 MB for high-frequency) and grows it for
+  low-frequency batch (up to 256 MB), trading write latency against scan throughput.
+- **Cost estimation is parametric, not measured.** `CostOptimizer` uses a configurable
+  `storage_cost_per_gb` (default $0.023, S3-like) for monthly storage and a
+  `cost_per_tb_scanned` (default $5.00) for query cost; `OptimizationPlan.estimate_cost`
+  models compute-hours per operation type (compaction scales with file count and size,
+  Z-order with size, vacuum cheaply with size) plus 2× I/O for read+write. These are
+  transparent formulas meant to *rank* tables and operations, not to predict a cloud bill.
+- **Recommendation thresholds.** `StorageReport` recommendations fire at concrete cutoffs:
+  average file size below 50% of the 1 GB target suggests `OPTIMIZE`, more than 10 small
+  files suggests auto-compaction, and more than 100 versions suggests `VACUUM`. The same
+  cutoffs drive `CompactionScheduler.should_compact`, so analysis and action stay consistent.
 
 ## Testing Strategy
 
-### Unit Tests
+The suite (~200 tests across `tests/`) is split by whether `pyspark` is required.
+`tests/conftest.py` lists the pyspark-free test files and, when `pyspark` is not installed,
+applies a skip marker to every other test — so the transaction-log core is always
+verifiable in a plain Python environment.
 
-```python
-import pytest
-from pyspark.sql import SparkSession
-from delta import configure_spark_with_delta_pip
+**Unit tests — transaction log.** `test_delta_log_comprehensive.py`, `test_delta_log.py`,
+and `test_checkpoint.py` import `delta_log.py` directly (bypassing the package `__init__`
+to avoid the pyspark import) and exercise action serialization round-trips, commit/version
+sequencing, snapshot replay, active-file resolution after add/remove, partition grouping,
+checkpoint creation/detection (parquet and JSON-fallback), vacuum retention, and stats.
 
-@pytest.fixture(scope="session")
-def spark():
-    builder = SparkSession.builder \
-        .appName("lakehouse-tests") \
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-        .master("local[*]")
+**Concurrency tests.** `test_transactions.py` drives `commit()` from multiple threads and a
+`ThreadPoolExecutor`, asserting that optimistic concurrency control produces a contiguous,
+conflict-free version sequence and that atomic put-if-absent writes hold under contention.
 
-    spark = configure_spark_with_delta_pip(builder).getOrCreate()
-    yield spark
-    spark.stop()
+**Time-travel tests.** `test_time_travel.py` checks version- and timestamp-oriented reads,
+restore semantics, history queries, and snapshot consistency by reconstructing state at
+historical versions and comparing against expected file sets.
 
-class TestBronzeIngestion:
-    def test_adds_metadata_columns(self, spark, tmp_path):
-        # Create test data
-        df = spark.createDataFrame([
-            {"id": 1, "value": "test"}
-        ])
+**Optimizer tests.** `test_optimizer.py` covers the pure-Python helpers — small-file
+identification, bin-packing into compaction groups, adaptive target sizing, incremental
+selection, and plan creation/prioritization/cost estimation — none of which need Spark.
 
-        # Ingest
-        processor = LakehouseProcessor(spark)
-        bronze_path = str(tmp_path / "bronze")
-        processor.bronze_ingestion(df, bronze_path, "test_source")
+**Query and processor tests.** `test_query_processing.py` and `test_processor*.py` use mock
+Spark sessions / import-level checks so they run without a JVM; the genuinely
+Spark-dependent assertions are skipped when `pyspark` is absent.
 
-        # Verify
-        result = spark.read.format("delta").load(bronze_path)
-        assert "_source" in result.columns
-        assert "_ingestion_ts" in result.columns
-        assert result.filter("_source = 'test_source'").count() == 1
+**Integration tests.** `test_integration.py` walks a Bronze→Silver→Gold flow to verify the
+layers compose (skipped without pyspark).
 
-class TestSilverTransformation:
-    def test_deduplication(self, spark, tmp_path):
-        # Create bronze with duplicates
-        bronze_df = spark.createDataFrame([
-            {"id": 1, "value": "old", "ts": "2024-01-01"},
-            {"id": 1, "value": "new", "ts": "2024-01-02"},
-        ])
+**Edge cases covered.** Empty tables and empty commits, replaying past the latest version,
+removing a file added in the same logical history, retention boundary at
+`retention_hours == 0`, checkpoint detection when only the JSON fallback exists, and
+canonicalized partition-value keys.
 
-        # Transform
-        processor = LakehouseProcessor(spark)
-        silver_path = str(tmp_path / "silver")
-        processor.bronze_to_silver(
-            bronze_df,
-            silver_path,
-            dedup_keys=["id"],
-            watermark_col="ts"
-        )
+**Why the core tests bypass the package `__init__`.** The pyspark-free test files load
+`delta_log.py` with `importlib.util.spec_from_file_location` rather than `from lakehouse import
+DeltaLog`. This is deliberate: the package `__init__` imports the Spark-backed modules, so a
+normal import would pull in (or stub out) `pyspark`. Loading the module file directly proves
+the transaction log has *no* hidden Spark dependency and keeps the core test run fast and
+hermetic. `conftest.py` reinforces this by listing the pyspark-free files in
+`NO_PYSPARK_REQUIRED` and skipping everything else when `pyspark` is absent, so
+`pytest tests/` is green on a bare Python install and exercises the full Spark surface only
+when the optional dependencies are present.
 
-        # Verify
-        result = spark.read.format("delta").load(silver_path)
-        assert result.count() == 1
-        assert result.collect()[0]["value"] == "new"
+**What the Spark tests stand in for.** `test_processor*.py` and `test_query_processing.py` use
+mock Spark sessions and import-level assertions so they can verify wiring (method signatures,
+argument plumbing, that `_require_pyspark` raises cleanly) without a JVM, while the genuine
+DataFrame behavior is validated only under a real `pyspark` install. This keeps the boundary
+between "tested everywhere" and "tested with Spark" explicit and intentional.
+
+Run the suite with:
+
+```bash
+pytest tests/ -v
+# with coverage:
+pytest tests/ --cov=lakehouse --cov-report=term
 ```
-
-### Integration Tests
-
-```python
-class TestEndToEndPipeline:
-    def test_bronze_silver_gold_flow(self, spark, tmp_path):
-        """Test complete medallion architecture flow"""
-        # Setup paths
-        bronze = str(tmp_path / "bronze")
-        silver = str(tmp_path / "silver")
-        gold = str(tmp_path / "gold")
-
-        processor = LakehouseProcessor(spark)
-
-        # Bronze ingestion
-        raw_data = spark.createDataFrame([
-            {"user_id": 1, "event": "click", "amount": 10.0, "ts": "2024-01-01"},
-            {"user_id": 1, "event": "purchase", "amount": 50.0, "ts": "2024-01-02"},
-            {"user_id": 2, "event": "click", "amount": 5.0, "ts": "2024-01-01"},
-        ])
-        processor.bronze_ingestion(raw_data, bronze, "events")
-
-        # Silver transformation
-        processor.bronze_to_silver(
-            bronze, silver,
-            dedup_keys=["user_id", "ts"],
-            watermark_col="ts",
-            transformations=[clean_data, validate_schema]
-        )
-
-        # Gold aggregation
-        processor.silver_to_gold(
-            {"events": silver},
-            gold,
-            """
-            SELECT
-                user_id,
-                COUNT(*) as event_count,
-                SUM(amount) as total_amount
-            FROM events
-            GROUP BY user_id
-            """
-        )
-
-        # Verify gold
-        gold_df = spark.read.format("delta").load(gold)
-        assert gold_df.count() == 2
-
-        user_1 = gold_df.filter("user_id = 1").collect()[0]
-        assert user_1["event_count"] == 2
-        assert user_1["total_amount"] == 60.0
-```
-
-### Performance Tests
-
-```python
-class TestPerformance:
-    def test_query_with_z_order(self, spark, large_dataset):
-        """Verify Z-ordering improves query performance"""
-        # Create table without Z-order
-        unoptimized_path = "/tmp/unoptimized"
-        large_dataset.write.format("delta").save(unoptimized_path)
-
-        # Create table with Z-order
-        optimized_path = "/tmp/optimized"
-        large_dataset.write.format("delta").save(optimized_path)
-        DeltaTable.forPath(spark, optimized_path) \
-            .optimize() \
-            .zOrderBy(["user_id", "event_date"]) \
-            .executeCompaction()
-
-        # Benchmark query
-        query = "SELECT * FROM table WHERE user_id = 12345 AND event_date = '2024-01-15'"
-
-        unoptimized_time = benchmark_query(spark, unoptimized_path, query)
-        optimized_time = benchmark_query(spark, optimized_path, query)
-
-        # Z-ordered should be at least 2x faster
-        assert optimized_time < unoptimized_time * 0.5
-```
-
----
-
-## Implementation Phases
-
-### Phase 1: Foundation (Weeks 1-2)
-- Set up Spark cluster with Delta Lake
-- Implement basic medallion architecture
-- Bronze ingestion for batch sources
-- Simple Silver transformations
-
-### Phase 2: Core Features (Weeks 3-4)
-- Schema enforcement and evolution
-- Incremental processing with watermarks
-- Time travel implementation
-- Basic data quality checks
-
-### Phase 3: Optimization (Weeks 5-6)
-- Z-ordering implementation
-- Partition pruning strategies
-- Auto-compaction
-- Vacuum scheduling
-
-### Phase 4: Enterprise Features (Weeks 7-8)
-- Airflow/Dagster orchestration
-- Great Expectations integration
-- Monitoring and alerting
-- Cost optimization tools
-
-### Phase 5: Advanced Features (Weeks 9-10)
-- Streaming ingestion with Flink
-- Change data feed
-- Streaming joins
-- Multi-cluster deployment
-
----
 
 ## References
 
-- [Delta Lake Documentation](https://docs.delta.io/)
-- [Delta Lake Protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
-- [Apache Spark Documentation](https://spark.apache.org/docs/latest/)
-- [Apache Flink Documentation](https://flink.apache.org/docs/)
-- [Great Expectations](https://docs.greatexpectations.io/)
-- [Databricks Medallion Architecture](https://www.databricks.com/glossary/medallion-architecture)
+- Delta Lake — <https://delta.io/>
+- Delta Lake transaction protocol — <https://github.com/delta-io/delta/blob/master/PROTOCOL.md>
+- Apache Spark Structured Streaming — <https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html>
+- Databricks medallion architecture — <https://www.databricks.com/glossary/medallion-architecture>
+- Slowly Changing Dimensions (Kimball) — <https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/>
+- Apache Parquet — <https://parquet.apache.org/>
+- Optimistic concurrency control — <https://en.wikipedia.org/wiki/Optimistic_concurrency_control>
+- Bin packing problem — <https://en.wikipedia.org/wiki/Bin_packing_problem>

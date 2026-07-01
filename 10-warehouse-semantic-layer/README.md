@@ -1,396 +1,153 @@
 # Warehouse Semantic Layer
 
-> **Concepts covered:** §02 data-engineering — `03-data-warehousing`, `06-infrastructure`
-
-[![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](tests/)
-[![Coverage](https://img.shields.io/badge/coverage-85%25-yellowgreen.svg)](tests/)
-
-A powerful semantic layer for data warehouses that provides a unified interface for defining, managing, and querying business metrics. Built with Python and dbt, it supports multiple data warehouses including Snowflake, BigQuery, Redshift, and PostgreSQL.
+A metrics-as-code semantic layer for data warehouses, built from scratch in Python. It defines governed business metrics once, translates metric queries into warehouse-specific SQL (Snowflake, BigQuery, Postgres/Redshift, SQLite), and ships supporting building blocks for dimensional modeling, dbt integration, query optimization, and governance.
 
 ## Features
 
-- **Unified Metrics Definition**: Define metrics once, use everywhere
-- **Multi-Warehouse Support**: Works with Snowflake, BigQuery, Redshift, PostgreSQL
-- **dbt Integration**: Seamlessly integrates with your dbt models
-- **SQL Generation**: Automatically generates optimized SQL for your warehouse
-- **Caching**: Built-in caching for improved performance
-- **API-First**: RESTful API for easy integration
-- **Enterprise Ready**: Multi-tenancy, access control, audit logging
+- **Metrics-as-code catalog** — register `MetricDefinition` objects (sum / count / count_distinct / average / min / max / derived) in a `MetricCatalog`, list and search them (`query_engine.py`).
+- **Semantic-to-SQL translation** — `SemanticQueryEngine.generate_sql` builds `SELECT … GROUP BY` SQL with per-warehouse `DATE_TRUNC` and expands derived metric references like `{{ metric('total_revenue') }}` (`query_engine.py`).
+- **Warehouse adapters** — a `WarehouseAdapter` hierarchy with `SnowflakeAdapter`, `BigQueryAdapter`, `PostgresAdapter` (also Redshift), `SQLiteAdapter`, and `InMemoryAdapter`, plus a `create_adapter` factory (`query_engine.py`).
+- **Dimensional modeling** — typed `DimensionModel` / `FactModel` builders with prebuilt `DimCustomers`, `DimProducts`, `DimDates` (date-spine generator), `FctOrders`, `FctRevenue`, `FctCosts`, each emitting dbt SQL and schema YAML (`dimensions.py`, `facts.py`).
+- **Programmatic API** — `SemanticLayerAPI` and `MetricRegistry` to list/get/query metrics, validate definitions, and import/export metric YAML (`api.py`).
+- **Query optimization** — cost-based `QueryPlanner` with pre-aggregate routing, optimization rules, an in-memory `QueryCache` (TTL + LRU), optional `RedisCache`, and a `MaterializedViewAdvisor` (`optimization.py`).
+- **Governance** — column-level `LineageTracker`, `FreshnessMonitor` with SLAs, role-based `AccessController`, and a `DocumentationGenerator` (`enterprise.py`).
+- **dbt integration** — parse `manifest.json`, sync metrics, and shell out to the `dbt` CLI via `DbtRunner` (`dbt_integration.py`, requires `pyyaml`).
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Client(Caller / SemanticLayerAPI) --> Catalog(MetricCatalog)
+    Client --> Engine(SemanticQueryEngine)
+    Catalog --> Engine
+    Engine --> Optimizer(QueryPlanner + QueryCache)
+    Optimizer --> Adapter(WarehouseAdapter)
+    Adapter --> WH[(Data Warehouse)]
+    Models(Dimension and Fact builders) --> Dbt(dbt models and YAML)
+    Governance(Lineage, Freshness, Access) --> Catalog
+```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Metric catalog | `query_engine.py` | Register, look up, list, and search metric definitions |
+| Query engine | `query_engine.py` | Translate `MetricQuery` to warehouse SQL; expand derived metrics |
+| Warehouse adapters | `query_engine.py` | Execute SQL against Snowflake / BigQuery / Postgres / SQLite / in-memory |
+| Dimension + fact builders | `dimensions.py`, `facts.py` | Define star-schema models, generate dbt SQL and schema YAML |
+| API + registry | `api.py` | Public query/validate surface; YAML import/export |
+| Optimization | `optimization.py` | Cost estimation, plan rewriting, caching, MV advice |
+| Governance | `enterprise.py` | Lineage, freshness SLAs, access control, doc generation |
+| dbt integration | `dbt_integration.py` | Manifest parsing, metric sync, `dbt` CLI runner |
 
 ## Quick Start
+
+### Prerequisites
+
+- Python 3.9+
+- No external services are required to run the tests. Executing against a real warehouse requires the corresponding driver (e.g. `snowflake-connector-python`, `google-cloud-bigquery`, `psycopg2`) and credentials. `RedisCache` requires `redis`; dbt integration requires `pyyaml` (a core dependency) and the `dbt` CLI.
 
 ### Installation
 
 ```bash
-# Using pip
-pip install warehouse-semantic-layer
-
-# From source
-git clone https://github.com/your-org/warehouse-semantic-layer.git
-cd warehouse-semantic-layer
-pip install -e .
+pip install -e ".[dev]"
 ```
 
-### Basic Usage
+### Running
+
+This project is a library, not a server. Import it and drive it from Python:
+
+```bash
+python -c "import semantic_layer; print(semantic_layer.__version__)"
+```
+
+## Usage
 
 ```python
-from semantic_layer import SemanticLayer
-
-# Initialize the semantic layer
-sl = SemanticLayer(
-    warehouse_type="snowflake",
-    connection_params={
-        "account": "your-account",
-        "user": "your-user",
-        "password": "your-password",
-        "warehouse": "compute_wh",
-        "database": "analytics",
-        "schema": "semantic"
-    }
+from semantic_layer import (
+    CalculationMethod,
+    MetricCatalog,
+    MetricDefinition,
+    MetricQuery,
+    SemanticQueryEngine,
+    TimeGrain,
 )
 
-# Define a metric
-sl.create_metric(
-    name="total_revenue",
-    label="Total Revenue",
-    description="Sum of all revenue",
-    model="orders",
-    calculation_method="sum",
-    expression="order_amount",
-    timestamp="order_date",
-    time_grains=["day", "week", "month"],
-    dimensions=["customer_segment", "region"]
+catalog = MetricCatalog()
+catalog.add_metric(
+    MetricDefinition(
+        name="total_revenue",
+        label="Total Revenue",
+        description="Sum of all order totals",
+        model="fct_orders",
+        calculation_method=CalculationMethod.SUM,
+        expression="order_total",
+        timestamp="order_date",
+        time_grains=[TimeGrain.DAY, TimeGrain.MONTH],
+        dimensions=["country_code"],
+    )
 )
 
-# Query the metric
-result = sl.query(
+engine = SemanticQueryEngine(catalog, warehouse_type="snowflake")
+query = MetricQuery(
     metrics=["total_revenue"],
-    dimensions=["region"],
-    start_date="2024-01-01",
-    end_date="2024-12-31",
-    time_grain="month"
-)
-
-print(result.data)
-# [
-#     {"period": "2024-01-01", "region": "NA", "total_revenue": 1500000},
-#     {"period": "2024-01-01", "region": "EU", "total_revenue": 1200000},
-#     ...
-# ]
-```
-
-### Using the API
-
-```python
-import requests
-
-# List available metrics
-response = requests.get(
-    "http://localhost:8080/api/v1/metrics",
-    headers={"Authorization": "Bearer YOUR_API_KEY"}
-)
-metrics = response.json()
-
-# Query metrics
-query = {
-    "metrics": ["total_revenue", "order_count"],
-    "dimensions": ["customer_segment"],
-    "time_grain": "week",
-    "start_date": "2024-01-01",
-    "end_date": "2024-03-31"
-}
-
-response = requests.post(
-    "http://localhost:8080/api/v1/query",
-    json=query,
-    headers={"Authorization": "Bearer YOUR_API_KEY"}
-)
-result = response.json()
-```
-
-## Examples
-
-### Define Metrics from YAML
-
-```yaml
-# metrics.yaml
-version: 2
-
-metrics:
-  - name: revenue
-    label: "Revenue"
-    description: "Total revenue from orders"
-    model: ref('fact_orders')
-    calculation_method: sum
-    expression: order_amount
-    timestamp: order_date
-    time_grains: [day, week, month, quarter, year]
-    dimensions:
-      - customer_type
-      - product_category
-      - region
-
-  - name: average_order_value
-    label: "Average Order Value"
-    description: "Average revenue per order"
-    model: ref('fact_orders')
-    calculation_method: derived
-    expression: "{{ metric('revenue') }} / {{ metric('order_count') }}"
-    timestamp: order_date
-    time_grains: [month, quarter, year]
-```
-
-Load metrics:
-```python
-sl.import_metrics("metrics.yaml")
-```
-
-### Complex Queries with Filters
-
-```python
-# Query with multiple filters and dimensions
-result = sl.query(
-    metrics=["revenue", "order_count", "average_order_value"],
-    dimensions=["customer_type", "region"],
-    filters=[
-        {"field": "region", "operator": "in", "value": ["NA", "EU"]},
-        {"field": "customer_type", "operator": "!=", "value": "test"},
-        {"field": "order_amount", "operator": ">", "value": 100}
-    ],
+    dimensions=["country_code"],
+    filters=[],
     time_grain="month",
     start_date="2024-01-01",
     end_date="2024-12-31",
-    limit=100
 )
 
-# Convert to DataFrame for analysis
-import pandas as pd
-df = pd.DataFrame(result.data)
-print(df.head())
+print(engine.generate_sql(query))
+# SELECT
+#     DATE_TRUNC('month', order_date) as period, country_code, SUM(order_total) as total_revenue
+# FROM fct_orders
+# WHERE order_date >= '2024-01-01' AND order_date < '2024-12-31'
+# GROUP BY period, country_code
+# ORDER BY period
 ```
 
-### Working with Derived Metrics
+Execute against a warehouse with a `QueryExecutor` and any adapter (the in-memory adapter needs no driver):
 
 ```python
-# Create base metrics
-sl.create_metric(
-    name="gross_revenue",
-    calculation_method="sum",
-    expression="gross_amount",
-    # ... other parameters
-)
+import asyncio
+from semantic_layer import QueryExecutor
 
-sl.create_metric(
-    name="discounts",
-    calculation_method="sum",
-    expression="discount_amount",
-    # ... other parameters
-)
-
-# Create derived metric
-sl.create_metric(
-    name="net_revenue",
-    calculation_method="derived",
-    expression="{{ metric('gross_revenue') }} - {{ metric('discounts') }}",
-    # ... other parameters
-)
-
-# Query derived metric - automatically expands references
-result = sl.query(metrics=["net_revenue"])
+executor = QueryExecutor(connection={"fct_orders": [{"period": "2024-01", "total_revenue": 1500}]},
+                         warehouse_type="memory")
+result = asyncio.run(executor.execute_metric_query(engine, query))
+print(result.data, result.row_count)
 ```
+
+## What's Real vs Simulated
+
+- **Real:** metric catalog, semantic-to-SQL generation (including per-warehouse `DATE_TRUNC` and derived-metric expansion), query validation, dimension/fact model definitions with generated dbt SQL and YAML, the date-spine generator, metric YAML import/export, cost estimation, the query planner and optimization rules, the in-memory TTL/LRU cache, lineage tracking, freshness SLA evaluation, and access-control logic. These are exercised end-to-end by the test suite using the `InMemoryAdapter`.
+- **Simulated / requires credentials:** the `InMemoryAdapter` does naive table extraction, not real SQL execution. `SnowflakeAdapter`, `BigQueryAdapter`, and `PostgresAdapter` wrap real driver connections you must supply — running queries needs those drivers plus credentials. `RedisCache` is a no-op until a reachable Redis is available. `DbtRunner` shells out to an installed `dbt` binary. CI/CD helpers emit workflow YAML text but do not run pipelines.
 
 ## Testing
 
-### Run Tests
-
 ```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=semantic_layer --cov-report=html
-
-# Run specific test module
-pytest tests/test_query_engine.py
-
-# Run integration tests
-pytest tests/test_integration.py -v
+pytest tests/ -v
 ```
 
-### Test Coverage
+The suite (~350 tests across 11 modules) covers models, adapters, the query engine, dimensions, facts, the API, optimization, governance, dbt-style testing helpers, config, and an integration flow. No external services are required — warehouse execution is exercised through the in-memory adapter.
 
-Current test coverage: **85%**
+## Project Structure
 
-- Models: 95%
-- Query Engine: 88%
-- API: 82%
-- Integration: 78%
-
-## Configuration
-
-### Environment Variables
-
-```bash
-# Required
-WAREHOUSE_TYPE=snowflake
-WAREHOUSE_ACCOUNT=your-account
-WAREHOUSE_USER=semantic_user
-WAREHOUSE_PASSWORD=secure_password
-WAREHOUSE_DATABASE=analytics
-WAREHOUSE_SCHEMA=semantic
-
-# Optional
-CACHE_ENABLED=true
-REDIS_URL=redis://localhost:6379
-LOG_LEVEL=INFO
-API_KEY=your-api-key
 ```
-
-### Configuration File
-
-```python
-# config.py
-SEMANTIC_LAYER_CONFIG = {
-    "warehouse": {
-        "type": "snowflake",
-        "connection_params": {
-            # ... connection details
-        }
-    },
-    "cache": {
-        "enabled": True,
-        "ttl": 3600,
-        "backend": "redis"
-    },
-    "api": {
-        "host": "0.0.0.0",
-        "port": 8080,
-        "workers": 4
-    }
-}
+10-warehouse-semantic-layer/
+  src/semantic_layer/
+    models.py          # core dataclasses + CalculationMethod / TimeGrain enums
+    config.py          # warehouse / model / source configuration
+    query_engine.py    # catalog, SQL generation, warehouse adapters, executor
+    dimensions.py      # dimension models, builders, date spine
+    facts.py           # fact models and builders
+    api.py             # SemanticLayerAPI, MetricRegistry, validators
+    optimization.py    # planner, cost estimator, caches, MV advisor
+    enterprise.py      # lineage, freshness, access control, docs
+    dbt_integration.py # manifest parsing, metric sync, dbt CLI runner
+  tests/               # ~350 pytest tests
+  docs/                # BLUEPRINT.md (+ ARCHITECTURE, API, DEPLOYMENT, CONTRIBUTING)
 ```
-
-## Architecture
-
-The semantic layer consists of several key components:
-
-- **Metric Catalog**: Central registry for metric definitions
-- **Query Engine**: Translates semantic queries to SQL
-- **API Layer**: RESTful API for external access
-- **Cache Layer**: Performance optimization
-- **Warehouse Connectors**: Database-specific adapters
-
-See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture documentation.
-
-## API Documentation
-
-Full API documentation is available at [API.md](docs/API.md).
-
-Key endpoints:
-- `GET /metrics` - List available metrics
-- `POST /query` - Execute metric queries
-- `GET /dimensions` - List available dimensions
-- `POST /metrics` - Create new metrics
-
-## Deployment
-
-### Docker
-
-```bash
-# Build image
-docker build -t semantic-layer .
-
-# Run container
-docker run -p 8080:8080 --env-file .env semantic-layer
-```
-
-### Kubernetes
-
-```bash
-kubectl apply -f deployment/kubernetes/
-```
-
-### Cloud Platforms
-
-- **AWS**: Deploy using ECS, Lambda, or EC2
-- **GCP**: Deploy using Cloud Run or GKE
-- **Azure**: Deploy using Container Instances or AKS
-
-See [DEPLOYMENT.md](docs/DEPLOYMENT.md) for detailed deployment instructions.
-
-## Performance
-
-### Benchmarks
-
-| Query Type | Records | Time (ms) | Cache Hit |
-|------------|---------|-----------|-----------|
-| Simple aggregation | 1M | 450 | No |
-| Simple aggregation | 1M | 12 | Yes |
-| Complex with 5 dims | 10M | 2,100 | No |
-| Complex with 5 dims | 10M | 45 | Yes |
-| Derived metrics | 5M | 1,800 | No |
-
-### Optimization Tips
-
-1. **Use appropriate time grains**: Coarser grains = faster queries
-2. **Limit dimensions**: Only query necessary dimensions
-3. **Enable caching**: Dramatically improves repeat query performance
-4. **Use filters**: Reduce data scanned with targeted filters
-5. **Batch queries**: Combine multiple metrics in single queries
-
-## Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
-
-### Development Setup
-
-```bash
-# Clone repository
-git clone https://github.com/your-org/warehouse-semantic-layer.git
-cd warehouse-semantic-layer
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements-dev.txt
-
-# Run tests
-pytest
-```
-
-## Roadmap
-
-- [x] Core metric definition and querying
-- [x] Multi-warehouse support
-- [x] API layer
-- [x] Caching system
-- [ ] Real-time streaming metrics
-- [ ] Natural language queries
-- [ ] Automated anomaly detection
-- [ ] Cost-based query optimization
-- [ ] GraphQL API support
-
-## Support
-
-- **Documentation**: [https://docs.semantic-layer.io](https://docs.semantic-layer.io)
-- **Issues**: [GitHub Issues](https://github.com/your-org/warehouse-semantic-layer/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-org/warehouse-semantic-layer/discussions)
-- **Slack**: [Join our Slack](https://semantic-layer.slack.com)
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Built with inspiration from dbt's metrics layer
-- Thanks to all contributors and the open-source community
-- Special thanks to the data engineering community for feedback and ideas
-
----
-
-**Note**: This is an active project under development. APIs may change between versions. Please pin to specific versions in production.
+MIT — see [../LICENSE](../LICENSE).

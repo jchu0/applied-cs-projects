@@ -1,591 +1,193 @@
 # SaaS Web Platform
 
-> A full-featured, production-ready SaaS web application built with Django REST Framework and Next.js, designed for scalability, security, and developer productivity.
+A multi-tenant SaaS web platform built from scratch with a Django REST Framework
+backend and a Next.js 14 frontend. It implements the cross-cutting machinery every
+SaaS product needs — token and API-key authentication, organization-scoped role-based
+access control, Stripe billing, audit logging, background task scheduling, and admin
+dashboards — plus GPU/compute resource and ML training orchestration apps.
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
-[![Django](https://img.shields.io/badge/django-4.2-green.svg)](https://www.djangoproject.com/)
-[![Next.js](https://img.shields.io/badge/next.js-14-black.svg)](https://nextjs.org/)
-[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
-[![Test Coverage](https://img.shields.io/badge/coverage-60%25+-green.svg)](./tests)
+## Features
 
-## 🚀 Features
+- **JWT + API-key authentication** — HS256 tokens issued with PyJWT, short-lived access
+  plus long-lived refresh tokens, and SHA-256-hashed API keys (`apps.users.authentication`).
+- **Custom user model** — email-as-username `User` with Argon2 password hashing and UUID
+  primary keys (`apps.users.models`).
+- **Multi-tenancy** — `Tenant`, `TenantMembership`, and `Invitation` models with per-request
+  tenant resolution from header, query param, or subdomain (`apps.core.middleware.TenantMiddleware`).
+- **Role-based access control** — owner/admin/member/viewer roles enforced by DRF permission
+  classes `IsTenantMember`, `IsTenantAdmin`, `IsTenantOwner`, and `HasAPIKeyScope`
+  (`apps.core.permissions`).
+- **Stripe billing** — subscriptions, plans, invoices, payment methods, usage records,
+  checkout/portal sessions, and webhook handling (`apps.billing`).
+- **Audit logging** — thread-local request context feeds an `AuditLog` of create/update/
+  delete/login/logout actions (`apps.core.audit`).
+- **Background scheduling** — `ScheduledTask`/`TaskExecution` over Celery with once/interval/
+  cron schedules and retry tracking (`apps.scheduler`).
+- **Resource + training orchestration** — GPU compute nodes, allocations, quotas, and
+  distributed ML training jobs, experiments, and sweeps (`apps.resources`, `apps.training`).
+- **Next.js frontend** — App Router with auth, dashboard, and admin route groups, React
+  Query, Zustand, and Zod (`frontend/`).
 
-### Core Functionality
+## Architecture
 
-#### 🔐 **Authentication & Security**
-- JWT-based authentication with refresh tokens
-- API key authentication for programmatic access
-- OAuth2 integration (Google, GitHub)
-- Two-factor authentication (TOTP)
-- Password policies and secure reset flow
-- Session management with automatic renewal
-- Rate limiting and brute-force protection
+```mermaid
+flowchart TD
+    Browser[Next.js 14 Frontend] --> MW[TenantMiddleware + RequestContext]
+    MW --> Auth[JWT / API-Key Auth]
+    Auth --> DRF[Django REST Framework Views]
+    DRF --> Perms[RBAC Permission Classes]
+    Perms --> Apps[App Modules: users, tenants, billing, scheduler, resources, training]
+    Apps --> PG[(PostgreSQL)]
+    Apps --> Audit[Audit Log]
+    DRF --> Stripe[Stripe API]
+    Apps --> Celery[Celery Workers]
+    Celery --> Redis[(Redis Broker)]
+```
 
-#### 🏢 **Multi-Tenancy & Organizations**
-- Complete organization/workspace management
-- Team member invitation system with email notifications
-- Granular role-based access control (RBAC)
-  - Owner: Full control
-  - Admin: Management capabilities
-  - Editor: Content modification
-  - Viewer: Read-only access
-- Per-tenant data isolation
-- Custom branding and white-labeling support
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Authentication | `apps.users.authentication` | JWT and API-key auth classes, token creation |
+| Users | `apps.users.models` | Custom `User`, `APIKey` |
+| Tenancy | `apps.tenants.models` | `Tenant`, `TenantMembership`, `Invitation` |
+| Tenant context | `apps.core.middleware` | Resolve tenant per request, thread-local context |
+| RBAC | `apps.core.permissions` | Role and scope permission classes |
+| Billing | `apps.billing` | Stripe service, models, webhook handlers |
+| Audit | `apps.core.audit` | `AuditService` writing `AuditLog` entries |
+| Scheduler | `apps.scheduler` | Celery-backed scheduled tasks and executions |
+| Resources | `apps.resources` | Compute nodes, GPUs, allocations, quotas |
+| Training | `apps.training` | Distributed training jobs, experiments, sweeps |
+| Frontend | `frontend/app` | Next.js App Router pages and route groups |
 
-#### 💳 **Billing & Subscriptions**
-- Stripe integration for secure payments
-- Flexible subscription plans (Free, Pro, Enterprise)
-- Usage-based billing and metering
-- Automated invoice generation and delivery
-- Customer billing portal
-- Webhook handling for real-time payment events
-- Proration and plan switching
-- Trial periods and discount codes
-
-#### 📊 **Analytics & Monitoring**
-- Real-time usage analytics
-- Custom dashboards and reporting
-- User activity tracking
-- Performance metrics and monitoring
-- Error tracking with Sentry integration
-- Audit logging for compliance
-
-#### 🛠️ **Developer Experience**
-- Comprehensive RESTful API
-- GraphQL support (beta)
-- TypeScript throughout frontend
-- OpenAPI/Swagger documentation
-- SDK libraries for multiple languages
-- Webhook system for integrations
-- API versioning and deprecation handling
-
-## 🛠️ Tech Stack
-
-### Backend
-- **Framework**: Django 4.2 LTS with Django REST Framework
-- **Language**: Python 3.11+
-- **Database**: PostgreSQL 15
-- **Cache**: Redis 7
-- **Task Queue**: Celery with Redis broker
-- **WebSockets**: Django Channels
-- **Testing**: pytest, Factory Boy, coverage.py
-
-### Frontend
-- **Framework**: Next.js 14 with App Router
-- **Language**: TypeScript 5
-- **Styling**: Tailwind CSS + CSS Modules
-- **State Management**: Redux Toolkit + RTK Query
-- **UI Components**: Radix UI + Custom components
-- **Forms**: React Hook Form with Zod validation
-- **Testing**: Jest, React Testing Library
-
-### Infrastructure & DevOps
-- **Containerization**: Docker & Docker Compose
-- **CI/CD**: GitHub Actions / GitLab CI
-- **Web Server**: Nginx (reverse proxy)
-- **Monitoring**: Prometheus + Grafana
-- **Logging**: ELK Stack
-- **Cloud**: AWS / GCP / Azure ready
-
-## ⚡ Quick Start
+## Quick Start
 
 ### Prerequisites
-- **Python** 3.11+ with pip
-- **Node.js** 18+ with npm 9+
-- **PostgreSQL** 15+
-- **Redis** 7+
-- **Docker** 24.0+ and Docker Compose 2.20+ (recommended)
-- **Git** 2.30+
 
-### 🐳 Using Docker (Recommended)
+- Python 3.11+
+- Node.js 18+ (for the frontend)
+- PostgreSQL 15+ and Redis 7+ (or use Docker Compose)
+- Stripe test keys are only needed to exercise live billing calls
+
+### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-org/saas-platform.git
-cd saas-platform
-
-# Copy and configure environment variables
-cp .env.example .env
-# Edit .env with your configuration (Stripe keys, etc.)
-
-# Start all services
-docker-compose up -d
-
-# Initialize the database
-docker-compose exec backend python manage.py migrate
-
-# Create an admin user
-docker-compose exec backend python manage.py createsuperuser
-
-# Load sample data (optional)
-docker-compose exec backend python manage.py loaddata fixtures/sample_data.json
-
-# Access the application
-```
-
-The application will be available at:
-- 🌐 **Frontend**: http://localhost:3000
-- 🔧 **Backend API**: http://localhost:8000/api
-- 👤 **Admin Panel**: http://localhost:8000/admin
-- 📚 **API Documentation**: http://localhost:8000/api/docs
-- 📊 **Redis Commander**: http://localhost:8081
-
-### 🔧 Manual Setup
-
-#### Backend Setup
-```bash
-# Navigate to backend directory
+# Backend
 cd backend
-
-# Create and activate virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
 pip install -r requirements.txt
-pip install -r requirements-dev.txt  # For development
-
-# Set up environment variables
-cp .env.example .env
-# Edit .env with your database credentials
-
-# Initialize database
-python manage.py migrate
-python manage.py createsuperuser
-
-# Start development server
-python manage.py runserver
-
-# In another terminal, start Celery worker
-celery -A config worker -l info
-
-# Start Celery beat for scheduled tasks
-celery -A config beat -l info
-```
-
-#### Frontend Setup
-```bash
-# Navigate to frontend directory
-cd frontend
-
-# Install dependencies
-npm install
-
-# Set up environment variables
-cp .env.local.example .env.local
-# Edit .env.local with API URL
-
-# Start development server
-npm run dev
-
-# Or build for production
-npm run build
-npm start
-```
-
-## 📁 Project Structure
-
-```
-saas-platform/
-├── backend/                      # Django REST API
-│   ├── apps/
-│   │   ├── auth/                # Authentication & JWT
-│   │   ├── users/               # User management
-│   │   ├── organizations/       # Multi-tenancy
-│   │   ├── subscriptions/       # Billing & payments
-│   │   ├── projects/            # Core business logic
-│   │   ├── api/                 # API versioning
-│   │   └── admin_dashboard/     # Admin features
-│   ├── config/                  # Django configuration
-│   │   ├── settings/
-│   │   │   ├── base.py
-│   │   │   ├── development.py
-│   │   │   └── production.py
-│   │   ├── urls.py
-│   │   └── wsgi.py
-│   ├── static/                  # Static files
-│   ├── media/                   # User uploads
-│   └── requirements/
-│       ├── base.txt
-│       ├── development.txt
-│       └── production.txt
-│
-├── frontend/                    # Next.js application
-│   ├── app/                     # App router pages
-│   │   ├── (auth)/             # Auth layout group
-│   │   ├── (dashboard)/        # Dashboard layout
-│   │   └── (marketing)/        # Public pages
-│   ├── components/
-│   │   ├── ui/                 # Base UI components
-│   │   ├── forms/              # Form components
-│   │   └── layouts/            # Layout components
-│   ├── lib/
-│   │   ├── api/                # API client
-│   │   ├── hooks/              # Custom React hooks
-│   │   └── utils/              # Utility functions
-│   ├── public/                 # Static assets
-│   └── styles/                 # Global styles
-│
-├── tests/                       # Test suites
-│   ├── backend/                # Django tests
-│   ├── frontend/               # React tests
-│   └── integration/            # E2E tests
-│
-├── docs/                        # Documentation
-│   ├── ARCHITECTURE.md
-│   ├── API.md
-│   ├── DEPLOYMENT.md
-│   └── CONTRIBUTING.md
-│
-├── scripts/                     # Utility scripts
-│   ├── setup.sh
-│   ├── backup.sh
-│   └── deploy.sh
-│
-├── k8s/                        # Kubernetes manifests
-│   ├── base/
-│   └── overlays/
-│
-├── .github/
-│   └── workflows/              # GitHub Actions
-│       ├── ci.yml
-│       ├── deploy.yml
-│       └── security.yml
-│
-├── docker-compose.yml          # Local development
-├── docker-compose.prod.yml     # Production config
-├── Dockerfile                  # Multi-stage build
-├── Makefile                    # Common commands
-├── .env.example               # Environment template
-└── README.md                  # This file
-```
-
-## API Endpoints
-
-### Authentication
-- `POST /api/v1/auth/register/` - Register new user
-- `POST /api/v1/auth/login/` - Login
-- `POST /api/v1/auth/logout/` - Logout
-- `GET /api/v1/auth/me/` - Current user
-- `PATCH /api/v1/auth/me/` - Update profile
-- `POST /api/v1/auth/password/change/` - Change password
-
-### Tenants
-- `GET /api/v1/tenants/` - List user's tenants
-- `POST /api/v1/tenants/` - Create tenant
-- `GET /api/v1/tenants/{id}/` - Get tenant
-- `PATCH /api/v1/tenants/{id}/` - Update tenant
-- `DELETE /api/v1/tenants/{id}/` - Delete tenant
-- `GET /api/v1/tenants/{id}/members/` - List members
-- `POST /api/v1/tenants/{id}/members/` - Invite member
-
-### Billing
-- `GET /api/v1/billing/plans/` - List plans
-- `GET /api/v1/billing/tenants/{id}/subscription/` - Get subscription
-- `POST /api/v1/billing/tenants/{id}/subscription/` - Create subscription
-- `POST /api/v1/billing/tenants/{id}/checkout/` - Create checkout session
-- `POST /api/v1/billing/tenants/{id}/portal/` - Billing portal
-
-## Configuration
-
-Key environment variables:
-
-```bash
-# Django
-SECRET_KEY=your-secret-key
-DEBUG=False
-ALLOWED_HOSTS=yourdomain.com
-
-# Database
-DATABASE_URL=postgres://user:pass@host:5432/dbname
-
-# Redis
-REDIS_URL=redis://host:6379/0
-
-# Stripe
-STRIPE_SECRET_KEY=sk_live_xxx
-STRIPE_WEBHOOK_SECRET=whsec_xxx
 
 # Frontend
-FRONTEND_URL=https://yourdomain.com
+cd ../frontend
+npm install
 ```
 
-## 🧪 Testing
-
-The project maintains 60%+ test coverage across both frontend and backend.
-
-### Running Tests
+### Running
 
 ```bash
-# Run all tests
-make test
-
-# Backend tests with coverage
-cd backend
-pytest --cov=apps --cov-report=html
-# View coverage report at backend/htmlcov/index.html
-
-# Frontend tests with coverage
-cd frontend
-npm test -- --coverage
-# View coverage report at frontend/coverage/index.html
-
-# Integration tests
-npm run test:e2e
-```
-
-### Test Structure
-- **Unit Tests**: Test individual components and functions
-- **Integration Tests**: Test API endpoints and database operations
-- **E2E Tests**: Test complete user workflows
-- **Performance Tests**: Load testing and benchmarks
-
-## 🛠️ Development
-
-### Code Quality
-
-```bash
-# Format code
-make format
-
-# Run linters
-make lint
-
-# Type checking
-make typecheck
-
-# Security scanning
-make security-scan
-```
-
-### Database Management
-
-```bash
-# Create new migration
-python manage.py makemigrations
-
-# Apply migrations
-python manage.py migrate
-
-# Rollback migration
-python manage.py migrate app_name migration_number
-
-# Database shell
-python manage.py dbshell
-```
-
-### Useful Commands
-
-```bash
-# Create superuser
-make superuser
-
-# Generate API documentation
-make docs
-
-# Run development servers
+# Start Postgres + Redis, then both dev servers
 make dev
 
-# Clean up containers and volumes
-make clean
+# Or run the backend alone
+cd backend
+python manage.py migrate
+python manage.py runserver
 ```
 
-## 🚀 Deployment
+The backend serves under `/api/v1/`; the frontend dev server runs on
+`http://localhost:3000`. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for Docker and
+production deployment.
 
-### Production Deployment
+## Usage
 
-See [DEPLOYMENT.md](./docs/DEPLOYMENT.md) for detailed deployment instructions.
-
-#### Quick Deploy with Docker
+Register a user and call an authenticated endpoint:
 
 ```bash
-# Build production images
-docker-compose -f docker-compose.prod.yml build
+# Register — returns access_token and refresh_token
+curl -X POST http://localhost:8000/api/v1/auth/register/ \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"dev@example.com","password":"DevPass123!","first_name":"Dev"}'
 
-# Deploy with environment variables
-docker-compose -f docker-compose.prod.yml up -d
+# Use the access token
+curl http://localhost:8000/api/v1/auth/me/ \
+  -H 'Authorization: Bearer <access_token>'
 
-# Scale services
-docker-compose -f docker-compose.prod.yml up -d --scale backend=3 --scale worker=2
+# Create a tenant (the creator becomes owner)
+curl -X POST http://localhost:8000/api/v1/tenants/ \
+  -H 'Authorization: Bearer <access_token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Acme","slug":"acme"}'
 ```
 
-#### Kubernetes Deployment
+Mint a JWT directly against the real auth helper:
+
+```python
+from apps.users.models import User
+from apps.users.authentication import create_jwt_token
+
+user = User.objects.create_user(email="dev@example.com", password="DevPass123!")
+access = create_jwt_token(user, expires_in_hours=1)
+refresh = create_jwt_token(user, expires_in_hours=24 * 7)
+```
+
+See [`docs/API.md`](docs/API.md) for the full endpoint reference and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the system design.
+
+## What's Real vs Simulated
+
+- **Real:** The custom user model, JWT/API-key authentication, tenant resolution
+  middleware, RBAC permission classes, audit logging, and the relational models for
+  tenants, billing, scheduler, resources, and training. Django/DRF wiring, URL routing,
+  and serializers are fully implemented and exercised by the test suite.
+- **Simulated / requires credentials:** Stripe calls (`apps.billing.services.StripeService`)
+  hit the live Stripe API and require `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`; tests
+  mock them. Celery task execution requires a running Redis broker and workers. Password-reset
+  email delivery is stubbed (the view returns success without sending). Resource and training
+  apps model and track orchestration state but do not provision real GPUs or launch real jobs.
+
+## Testing
 
 ```bash
-# Apply configurations
-kubectl apply -f k8s/
-
-# Check deployment status
-kubectl get pods -n saas-platform
-
-# View logs
-kubectl logs -f deployment/backend -n saas-platform
+cd backend
+pytest                       # or: make test  (backend + frontend)
 ```
 
-### Environment Variables
+The backend suite (`tests/backend/`) covers authentication and JWT handling,
+subscriptions, scheduler, resources, and training. Tests auto-skip when Django is not
+installed (`tests/backend/conftest.py`); Stripe and Celery are mocked. Frontend tests run
+under Jest (`tests/frontend/`).
 
-Key configuration variables (see `.env.example` for full list):
+## Project Structure
 
-```bash
-# Application
-SECRET_KEY=your-secret-key
-DEBUG=False
-ALLOWED_HOSTS=yourdomain.com
-
-# Database
-DATABASE_URL=postgresql://user:pass@localhost/db
-
-# Redis
-REDIS_URL=redis://localhost:6379/0
-
-# Email
-EMAIL_HOST=smtp.sendgrid.net
-EMAIL_HOST_USER=apikey
-EMAIL_HOST_PASSWORD=your-sendgrid-key
-
-# Stripe
-STRIPE_SECRET_KEY=sk_live_xxx
-STRIPE_WEBHOOK_SECRET=whsec_xxx
-
-# AWS (for file storage)
-AWS_ACCESS_KEY_ID=xxx
-AWS_SECRET_ACCESS_KEY=xxx
-AWS_STORAGE_BUCKET_NAME=saas-platform
+```
+05-saas-web-platform/
+├── backend/
+│   ├── apps/
+│   │   ├── users/          # User, APIKey, JWT + API-key auth
+│   │   ├── tenants/        # Tenant, membership, invitation
+│   │   ├── billing/        # Stripe service, models, webhooks
+│   │   ├── core/           # middleware, permissions, audit, exceptions
+│   │   ├── scheduler/      # Celery-backed scheduled tasks
+│   │   ├── resources/      # GPU/compute nodes, allocations, quotas
+│   │   ├── training/       # distributed ML training jobs
+│   │   └── admin_dashboard/# admin stats and audit endpoints
+│   └── config/             # Django settings, urls, celery
+├── frontend/               # Next.js 14 App Router app
+├── tests/                  # backend (pytest), frontend (jest), integration
+└── docs/
+    ├── BLUEPRINT.md        # Full architecture and design
+    ├── API.md              # Full endpoint reference
+    ├── ARCHITECTURE.md     # Deeper architecture notes
+    └── DEPLOYMENT.md       # Deployment runbook
 ```
 
-## 📊 Performance
+## API Reference
 
-### Benchmarks
-- **API Response Time**: < 100ms (p95)
-- **Page Load Time**: < 2s (initial), < 500ms (subsequent)
-- **Database Queries**: Optimized with select_related and prefetch_related
-- **Concurrent Users**: Supports 10,000+ concurrent users
-- **Uptime**: 99.9% SLA
+Core route groups (full detail in [`docs/API.md`](docs/API.md)):
 
-### Optimization Techniques
-- Database query optimization with indexes
-- Redis caching for frequently accessed data
-- CDN for static assets
-- Image optimization and lazy loading
-- Code splitting and tree shaking
-- HTTP/2 and compression
+- `auth/` — register, login, logout, me, password change/reset, token refresh
+- `tenants/` — list/create tenants, members, invitation acceptance
+- `billing/` — plans, subscription, invoices, payment methods, checkout, portal, webhook
+- `scheduler/`, `resources/`, `training/` — DRF ViewSet routers
+- `admin/` — dashboard stats, users, tenants, audit logs
 
-## 🔒 Security
+## License
 
-### Security Features
-- JWT tokens with refresh rotation
-- Rate limiting on all endpoints
-- SQL injection prevention
-- XSS protection
-- CSRF protection
-- Content Security Policy (CSP)
-- HTTPS enforcement
-- Secure password hashing (Argon2)
-- Two-factor authentication
-- API key scoping
-- Audit logging
-
-### Compliance
-- GDPR compliant with data export and deletion
-- SOC 2 Type II ready
-- PCI DSS compliant payment processing
-- HIPAA compliant infrastructure available
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](./docs/CONTRIBUTING.md) for details.
-
-### Development Workflow
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Write tests
-5. Submit a pull request
-
-### Code Style
-- Python: Black, isort, flake8
-- JavaScript/TypeScript: ESLint, Prettier
-- Commit messages: Conventional Commits
-
-## 📚 Documentation
-
-- [Architecture Overview](./docs/ARCHITECTURE.md)
-- [API Documentation](./docs/API.md)
-- [Deployment Guide](./docs/DEPLOYMENT.md)
-- [Contributing Guide](./docs/CONTRIBUTING.md)
-- [Security Policy](./SECURITY.md)
-
-### External Resources
-- [API Reference](https://api.saas-platform.com/docs)
-- [User Guide](https://docs.saas-platform.com)
-- [Video Tutorials](https://youtube.com/saas-platform)
-- [Blog](https://blog.saas-platform.com)
-
-## 🌟 Showcase
-
-### Who's Using This Platform
-- 500+ active organizations
-- 50,000+ registered users
-- Processing $1M+ monthly transactions
-- 99.9% uptime over the last year
-
-### Success Stories
-- **TechStartup Inc**: Reduced development time by 70%
-- **Enterprise Corp**: Scaled from 10 to 1000 users seamlessly
-- **SaaS Company**: Integrated billing in just 2 days
-
-## 🗺️ Roadmap
-
-### Q1 2025
-- [ ] Advanced analytics dashboard
-- [ ] Mobile applications (iOS/Android)
-- [ ] AI-powered insights
-- [ ] Advanced workflow automation
-
-### Q2 2025
-- [ ] GraphQL API (stable release)
-- [ ] Real-time collaboration features
-- [ ] Advanced permission templates
-- [ ] Marketplace for integrations
-
-### Future
-- Blockchain integration for audit logs
-- ML-based fraud detection
-- Edge computing support
-- Multi-region deployment
-
-## 📝 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Django and Django REST Framework communities
-- Next.js and Vercel teams
-- All our contributors and users
-- Open source projects that made this possible
-
-## 💬 Support
-
-### Getting Help
-- 📧 Email: support@saas-platform.com
-- 💬 Discord: [Join our community](https://discord.gg/saas-platform)
-- 🐛 Issues: [GitHub Issues](https://github.com/your-org/saas-platform/issues)
-- 📖 Docs: [Documentation](https://docs.saas-platform.com)
-
-### Professional Support
-- Enterprise support plans available
-- Custom development services
-- Training and onboarding
-- SLA guarantees
-
----
-
-<p align="center">
-  Built with ❤️ by the SaaS Platform Team
-  <br>
-  <a href="https://saas-platform.com">Website</a> •
-  <a href="https://twitter.com/saasplatform">Twitter</a> •
-  <a href="https://linkedin.com/company/saas-platform">LinkedIn</a>
-</p>
+MIT — see [../LICENSE](../LICENSE).

@@ -951,11 +951,6 @@ Interactive API documentation: https://api.saas-platform.com/playground
 
 ## Support
 
-### Contact
-- Email: api-support@saas-platform.com
-- Developer Portal: https://developers.saas-platform.com
-- Status Page: https://status.saas-platform.com
-
 ### Changelog
 View API changelog: https://developers.saas-platform.com/changelog
 

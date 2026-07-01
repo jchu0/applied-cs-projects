@@ -1,212 +1,185 @@
 # Microservice Platform
 
-A complete microservice platform with Auth, Billing, Notifications, and User management services.
+A multi-tenant microservice platform built from scratch in Go, centered on user
+management and JWT authentication with gRPC inter-service communication, Redis-backed
+sessions, PostgreSQL row-level security for tenant isolation, and a NATS JetStream event
+bus. Billing (Stripe) and notification (multi-channel) services are included as
+additional, credential-gated components.
 
-## Overview
+## Features
 
-This project implements a production-ready microservice architecture featuring:
-
-- **User Service** - User CRUD operations with multi-tenant support
-- **Auth Service** - JWT-based authentication with RS256 signing
-- **gRPC Communication** - High-performance inter-service communication
-- **Multi-Tenant Architecture** - Row-level security for data isolation
-- **Redis Sessions** - Scalable session management
+- **RS256 JWT auth** — access/refresh token pairs signed with RSA, with claims for user,
+  tenant, roles, permissions, and session (`JWTManager` / `internal/auth/jwt.go`).
+- **Password authentication** — bcrypt verification on login and hashing on user creation
+  (`internal/auth/service.go`, `internal/user/service.go`).
+- **Redis session store** — sessions persisted with TTL and indexed per user for listing
+  and bulk revocation (`SessionRepository` / `internal/auth/session.go`).
+- **User CRUD** — create, get, update, delete, list (paginated), and lookup-by-email over
+  a `pgx` connection pool (`Repository` / `internal/user/repository.go`).
+- **Multi-tenant isolation** — every query is keyed by `tenant_id`, backed by PostgreSQL
+  row-level security policies using `app.current_tenant` (`internal/common/database.go`,
+  `migrations/user/000001_init_schema.up.sql`).
+- **gRPC services** — user and auth services run gRPC servers with logging interceptors,
+  health checks, and reflection (`cmd/user-service`, `cmd/auth-service`).
+- **Event bus** — domain events (`user.*`, `auth.*`, `billing.*`) published to and consumed
+  from NATS JetStream (`EventBus` / `pkg/events/eventbus.go`).
+- **Structured logging** — `slog`-based logger with tenant/user/context enrichment
+  (`Logger` / `internal/common/logger.go`).
+- **Protobuf IDLs** — service contracts for user, auth, billing, notification, and common
+  types (`proto/`).
+- **Billing service** — Stripe SDK integration for customers, subscriptions, invoices, and
+  payment methods (`services/billing-service/internal/stripe`).
+- **Notification service** — async Python service rendering templates and dispatching over
+  email/SMS/webhook providers (`services/notification-service`).
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    Client(Client) --> GW(API Gateway - Kong)
+    GW --> Auth(Auth Service - gRPC)
+    GW --> User(User Service - gRPC)
+    GW --> Billing(Billing Service)
+    Auth --> User
+    Auth --> Redis[(Redis sessions)]
+    User --> PG[(PostgreSQL - RLS)]
+    Billing --> Stripe(Stripe - external)
+    Auth --> Bus(NATS JetStream)
+    User --> Bus
+    Billing --> Bus
+    Bus --> Notify(Notification Service)
 ```
-┌─────────────────┐
-│   API Gateway   │
-└────────┬────────┘
-         │
-    ┌────┼────┐
-    │    │    │
-┌───▼──┐ ┌▼──┐ ┌▼────┐
-│ User │ │Auth│ │Billing│
-│  Svc │ │Svc │ │ Svc  │
-└──┬───┘ └─┬─┘ └──┬───┘
-   │       │      │
-┌──▼───────▼──────▼──┐
-│     PostgreSQL     │
-│       Redis        │
-└────────────────────┘
-```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Auth service | `internal/auth`, `cmd/auth-service` | Login, register, refresh, validate, logout |
+| JWT manager | `internal/auth/jwt.go` | RS256 token issuance and verification |
+| Session store | `internal/auth/session.go` | Redis-backed session lifecycle |
+| User service | `internal/user`, `cmd/user-service` | User CRUD and email lookup |
+| User repository | `internal/user/repository.go` | `pgx` data access, pagination, roles |
+| Common | `internal/common` | Config, logger, database pool, tenant context |
+| Event bus | `pkg/events/eventbus.go` | NATS JetStream publish/subscribe |
+| Billing | `services/billing-service` | Stripe customers, subscriptions, invoices |
+| Notification | `services/notification-service` | Multi-channel async delivery |
 
 ## Quick Start
 
 ### Prerequisites
 
-- Go 1.21+
-- Docker & Docker Compose
-- Protocol Buffers compiler (protoc)
+- Go 1.23+
+- Docker and Docker Compose (for PostgreSQL, Redis, NATS, and optional Kong/observability)
+- `protoc` with the Go and gRPC plugins (only needed to regenerate protobuf code)
 
-### Development Setup
+The unit tests run with no external services. PostgreSQL, Redis, and NATS are only required
+to run the services end to end.
 
-1. **Start infrastructure services:**
-   ```bash
-   make docker-up
-   ```
+### Installation
 
-2. **Run database migrations:**
-   ```bash
-   make migrate-up
-   ```
+```bash
+cd 02-microservice-platform
+go mod download
+```
 
-3. **Run services:**
-   ```bash
-   # Terminal 1 - User Service
-   make run-user
+### Running
 
-   # Terminal 2 - Auth Service
-   make run-auth
-   ```
+```bash
+# Start infrastructure (databases, redis, nats, jaeger, prometheus, grafana)
+make infra-up
 
-### Configuration
+# Run a service directly
+go run ./cmd/auth-service     # gRPC on :9090 by default
+go run ./cmd/user-service     # gRPC on :9090 by default
+```
 
-Services are configured via environment variables:
+## Usage
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `GRPC_PORT` | gRPC server port | 9090 |
-| `HTTP_PORT` | HTTP server port | 8080 |
-| `DATABASE_URL` | PostgreSQL connection string | postgres://localhost/users |
-| `REDIS_URL` | Redis connection string | redis://localhost:6379 |
-| `JWT_SECRET` | JWT signing secret | (development key) |
-| `ENVIRONMENT` | Environment name | development |
+The auth and JWT logic are exercised directly as a Go package. Minimal example using the
+real `JWTManager` public API:
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/mlai/microservice-platform/internal/auth"
+)
+
+func main() {
+	// nil keys => a development RSA key pair is generated in-process
+	mgr, err := auth.NewJWTManager(nil, nil, 15*time.Minute, 7*24*time.Hour)
+	if err != nil {
+		panic(err)
+	}
+
+	pair, err := mgr.GenerateTokenPair(
+		"user-123", "tenant-456", "user@example.com", "session-789",
+		[]string{"admin"}, []string{"read", "write"},
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	claims, err := mgr.ValidateToken(pair.AccessToken)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(claims.UserID, claims.TenantID, claims.TokenType) // user-123 tenant-456 access
+}
+```
+
+## What's Real vs Simulated
+
+- **Real:** JWT generation/validation/refresh (RS256), bcrypt password hashing and
+  verification, the user repository against PostgreSQL via `pgx`, the Redis session
+  repository, configuration and structured logging, the NATS JetStream event bus, and the
+  Stripe client wrapper in the billing service. Multi-tenant row-level security is defined
+  in the migrations and applied by setting `app.current_tenant`.
+- **Simulated / requires credentials:** The gRPC servers in `cmd/` register only the
+  health service — protobuf service registration is a placeholder (the request/response
+  types in `internal/{auth,user}/service.go` stand in for generated code), and the auth
+  service's user client is a mock. The API gateway is external Kong configuration, not Go
+  code. Billing needs a Stripe API key; the notification service needs SendGrid/Twilio/FCM
+  credentials and falls back to placeholder addresses when Redis is absent. There is a
+  second, larger `src/` service tree (auth/user/billing/notification/gateway) that is not
+  built or tested by the top-level module.
+
+## Testing
+
+```bash
+# Unit tests for the top-level module (no external services needed)
+go test ./internal/... -v
+
+# Benchmarks for token generation/validation
+go test ./internal/auth -bench=.
+```
+
+The suite covers JWT generation, validation, refresh, invalid/expired tokens, user CRUD
+and tenant-isolation logic (via an in-memory mock repository), and configuration loading.
+The `make test` target instead builds and tests the separate `services/` Go modules.
 
 ## Project Structure
 
 ```
 02-microservice-platform/
-├── cmd/
-│   ├── user-service/      # User service entry point
-│   └── auth-service/      # Auth service entry point
-├── internal/
-│   ├── common/            # Shared utilities
-│   │   ├── config.go      # Configuration loading
-│   │   ├── database.go    # PostgreSQL connection
-│   │   └── logger.go      # Structured logging
-│   ├── user/              # User service implementation
-│   │   ├── repository.go  # Data access layer
-│   │   └── service.go     # Business logic
-│   └── auth/              # Auth service implementation
-│       ├── jwt.go         # JWT token management
-│       ├── service.go     # Auth business logic
-│       └── session.go     # Redis session store
-├── proto/                 # Protocol buffer definitions
-│   ├── common/            # Shared types
-│   ├── user/              # User service API
-│   └── auth/              # Auth service API
-├── migrations/            # Database migrations
-│   ├── user/              # User DB migrations
-│   └── auth/              # Auth DB migrations
-├── deployments/           # Docker and deployment configs
-│   ├── docker-compose.yml
-│   ├── Dockerfile.user
-│   └── Dockerfile.auth
-├── go.mod
-├── Makefile
-└── README.md
+  cmd/
+    user-service/      # User gRPC server entry point
+    auth-service/      # Auth gRPC server entry point
+  internal/
+    common/            # Config, logger, pgx pool, tenant context
+    user/              # User service, repository, tests
+    auth/              # JWT, session store, auth service, tests
+  pkg/events/          # NATS JetStream event bus
+  proto/               # Protobuf IDLs (user, auth, billing, notification, common)
+  migrations/          # PostgreSQL schemas (user, auth)
+  services/            # Standalone billing (Go) and notification (Python) services
+  deployments/         # Dockerfiles and compose configs
+  src/                 # Expanded service tree (gateway, OPA, tracing, k8s/helm)
+  docs/BLUEPRINT.md    # Full architecture and design
 ```
-
-## API Overview
-
-### User Service (gRPC)
-
-```protobuf
-service UserService {
-    rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
-    rpc GetUser(GetUserRequest) returns (GetUserResponse);
-    rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
-    rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
-    rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
-    rpc GetUserByEmail(GetUserByEmailRequest) returns (GetUserByEmailResponse);
-}
-```
-
-### Auth Service (gRPC)
-
-```protobuf
-service AuthService {
-    rpc Login(LoginRequest) returns (LoginResponse);
-    rpc Logout(LogoutRequest) returns (LogoutResponse);
-    rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
-    rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
-    rpc Register(RegisterRequest) returns (RegisterResponse);
-}
-```
-
-## Testing
-
-```bash
-# Run all tests
-make test
-
-# Run with coverage
-make test-coverage
-```
-
-## Multi-Tenant Support
-
-The platform supports multiple tenants with complete data isolation:
-
-1. **Row-Level Security (RLS)** - PostgreSQL policies enforce tenant isolation
-2. **Tenant Context** - Every request includes tenant identification
-3. **Composite Keys** - Unique constraints include tenant_id
-
-Example query with tenant isolation:
-```sql
--- RLS automatically filters to current tenant
-SELECT * FROM users WHERE email = 'user@example.com';
-```
-
-## Security Features
-
-- **JWT Authentication** - RS256 signed tokens
-- **Password Hashing** - bcrypt with configurable cost
-- **Session Management** - Redis-backed with expiry
-- **RBAC** - Role-based access control
-- **Audit Logging** - Track all auth events
-
-## Development Commands
-
-```bash
-# Build all services
-make build
-
-# Generate protobuf code
-make proto
-
-# Format code
-make fmt
-
-# Run linter
-make lint
-
-# Clean build artifacts
-make clean
-```
-
-## Phase 1 Implementation Status
-
-- [x] Project structure and build system
-- [x] Protocol buffer schemas
-- [x] User Service CRUD operations
-- [x] Auth Service (login, JWT)
-- [x] PostgreSQL migrations
-- [x] Docker Compose setup
-- [x] Unit tests
-
-## Next Steps (Phase 2)
-
-- [ ] Complete Auth Service (refresh, logout)
-- [ ] Add session management
-- [ ] Implement Billing Service
-- [ ] Integrate Stripe API
-- [ ] Build Notification Service
-- [ ] Set up message broker (NATS)
-- [ ] Implement event publishing
 
 ## License
 
-MIT
+MIT — see ../LICENSE

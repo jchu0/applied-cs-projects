@@ -177,7 +177,6 @@ from typing import List, Optional
 
 from semantic_layer.models import MetricDefinition
 
-
 class MetricProcessor:
     """Process metric definitions for optimization.
 
@@ -294,7 +293,6 @@ import pytest
 from unittest.mock import Mock, patch
 
 from semantic_layer.query_engine import SemanticQueryEngine
-
 
 class TestSemanticQueryEngine:
     """Test the semantic query engine."""
@@ -485,13 +483,6 @@ Closes #123
 - **GitHub Discussions**: General discussions and questions
 - **Slack**: [Join our Slack](https://semantic-layer.slack.com)
 - **Email**: semantic-layer@example.com
-
-### Getting Help
-
-- Check the [documentation](https://docs.semantic-layer.io)
-- Search existing issues and discussions
-- Ask in the Slack channel
-- Create a new issue with the `question` label
 
 ### Recognition
 

@@ -8,38 +8,15 @@ This data lakehouse implementation combines the best features of data lakes and 
 
 ### Core Components
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Data Sources                            │
-│  (Files, APIs, Streams, Databases, IoT Devices)             │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Bronze Layer (Raw)                         │
-│  • Raw data ingestion                                        │
-│  • Schema inference                                          │
-│  • Metadata enrichment                                       │
-│  • Immutable append-only                                     │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  Silver Layer (Refined)                      │
-│  • Data cleansing & validation                              │
-│  • Deduplication                                            │
-│  • Type casting & standardization                           │
-│  • SCD Type 2 implementation                                │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Gold Layer (Business)                      │
-│  • Business aggregations                                     │
-│  • KPI calculations                                         │
-│  • Feature engineering                                      │
-│  • ML-ready datasets                                        │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    DS[Data Sources<br/>Files, APIs, Streams, Databases, IoT Devices]
+    Bronze[Bronze Layer - Raw<br/>Raw data ingestion<br/>Schema inference<br/>Metadata enrichment<br/>Immutable append-only]
+    Silver[Silver Layer - Refined<br/>Data cleansing & validation<br/>Deduplication<br/>Type casting & standardization<br/>SCD Type 2 implementation]
+    Gold[Gold Layer - Business<br/>Business aggregations<br/>KPI calculations<br/>Feature engineering<br/>ML-ready datasets]
+    DS --> Bronze
+    Bronze --> Silver
+    Silver --> Gold
 ```
 
 ### Component Details
@@ -146,23 +123,27 @@ Enterprise-grade capabilities for production deployments.
 ## Data Flow
 
 ### 1. Ingestion Flow
-```
-Source → Schema Detection → Bronze Write → Metadata Update → Checkpoint
+```mermaid
+flowchart LR
+    Source --> SchemaDetection[Schema Detection] --> BronzeWrite[Bronze Write] --> MetadataUpdate[Metadata Update] --> Checkpoint
 ```
 
 ### 2. Transformation Flow
-```
-Bronze Read → Quality Check → Transform → Deduplicate → Silver Write → Optimize
+```mermaid
+flowchart LR
+    BronzeRead[Bronze Read] --> QualityCheck[Quality Check] --> Transform --> Deduplicate --> SilverWrite[Silver Write] --> Optimize
 ```
 
 ### 3. Aggregation Flow
-```
-Silver Read → Business Logic → Aggregate → Gold Write → Statistics Update
+```mermaid
+flowchart LR
+    SilverRead[Silver Read] --> BusinessLogic[Business Logic] --> Aggregate --> GoldWrite[Gold Write] --> StatisticsUpdate[Statistics Update]
 ```
 
 ### 4. Query Flow
-```
-Query → Optimizer → Predicate Pushdown → Partition Pruning → Data Skipping → Result
+```mermaid
+flowchart LR
+    Query --> Optimizer --> PredicatePushdown[Predicate Pushdown] --> PartitionPruning[Partition Pruning] --> DataSkipping[Data Skipping] --> Result
 ```
 
 ## Storage Layout
@@ -345,11 +326,3 @@ spark = SparkSession.builder \
 - **ML Platforms**: MLflow, SageMaker, Vertex AI
 - **Applications**: REST APIs, GraphQL endpoints
 - **Data Science**: Jupyter, Databricks notebooks
-
-## Future Enhancements
-
-1. **Lakehouse Federation**: Query across multiple lakehouses
-2. **Real-time OLAP**: Sub-second analytical queries
-3. **Auto-optimization**: ML-driven optimization decisions
-4. **Semantic Layer**: Business-friendly data models
-5. **Data Mesh Integration**: Domain-oriented architecture

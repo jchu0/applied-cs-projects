@@ -1,377 +1,483 @@
-# Real-Time Streaming Platform (Kafka/Flink) - Technical Blueprint
+# Streaming Platform
 
-## Executive Summary
+## Overview
 
-This project implements a production-grade real-time streaming platform built on Apache Kafka (or Redpanda) and Apache Flink. It demonstrates mastery of streaming semantics, event-time processing, stateful stream processing, and fault-tolerant distributed systems. The platform supports exactly-once processing, complex event processing patterns, and enterprise-grade features like schema registry and multi-region replication.
+The Streaming Platform is a Kafka- and Flink-style stream-processing engine built
+from scratch in Python. It has two clearly separated halves that mirror how real
+streaming systems are layered:
 
-> **Concepts covered:** [§02 Kafka streaming](../../../02-data-engineering/04-streaming/kafka/kafka-streaming.md) · [§02 Flink streaming](../../../02-data-engineering/04-streaming/flink/flink-streaming.md) · [§02 Real-time analytics](../../../02-data-engineering/04-streaming/real-time-analytics/real-time-analytics.md). For the Kafka-internals view, see [Project 12 (distributed log)](../../12-distributed-log-system/) and [Project 51 (message queue)](../../51-message-queue/); for the Flink-internals view, [Project 36 (streaming analytics)](../../36-distributed-streaming-analytics/). Map: [`CONCEPT_TO_PROJECT_MAP.md`](../../CONCEPT_TO_PROJECT_MAP.md).
+- A **transport layer** that wraps `confluent-kafka` with reliability-first producer
+  and consumer clients — idempotent and transactional publishing, manual-commit
+  consumption, rebalance-aware offset management, and Confluent-wire-format Avro
+  serialization.
+- An **event-time processing layer** implemented as pure-Python data structures:
+  window assigners, watermark generators, a windowed aggregation operator, keyed
+  value/list/map state over a pluggable backend, event-time and processing-time
+  timers, checkpoint coordination, streaming patterns (deduplication, debouncing,
+  sessionization, complex event processing, and stream joins), and statistical
+  anomaly detection.
 
-**Primary Goals:**
-- Build a complete streaming infrastructure with Kafka/Redpanda as the backbone
-- Implement stateful stream processing with Apache Flink
-- Achieve exactly-once semantics end-to-end
-- Support complex event processing patterns (windowing, sessionization, joins)
+The design goal is that everything above the broker runs and is unit-tested
+in-process. You can construct a `WindowOperator`, feed it elements, advance a
+watermark, and observe windows firing without a running Kafka cluster or Flink
+job manager. The Kafka clients are real `confluent-kafka` objects and talk to a
+real broker when one is available, but their tests mock the underlying client so
+the suite runs anywhere the library is installed.
 
----
+**Concepts this project teaches:**
 
-## System Architecture
+- Event time vs. processing time, and why watermarks are the mechanism that
+  reconciles them.
+- Window assignment strategies: tumbling (fixed, non-overlapping), sliding
+  (overlapping), and session (gap-based, mergeable).
+- Watermark-driven window firing and the trade-off between latency and
+  completeness under bounded out-of-orderness.
+- Keyed state as the foundation of stateful stream processing, and how a
+  checkpoint coordinator turns in-memory state into a fault-tolerant snapshot.
+- Exactly-once semantics assembled from idempotent producers, Kafka transactions,
+  the consume-transform-produce pattern, and read-committed isolation.
+- Streaming patterns that are built on top of state and time: dedup, debounce,
+  sessionization, CEP, and windowed / interval joins.
+- The Confluent Schema Registry wire format (a one-byte magic header plus a
+  four-byte schema ID) and Avro schemaless encoding.
 
-### High-Level Architecture
+**Scope.** This is a single-process library plus a docker-compose stack for a real
+Kafka / Schema Registry / Flink environment. It is not a distributed runtime: there
+is no scheduler that shards operators across task managers, and the `FlinkJobBuilder`
+emits job specifications and PyFlink DDL rather than submitting jobs. Those
+boundaries are stated explicitly in the "What's Real vs Simulated" section of the
+README and reflected in every simulated component below.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Data Sources                                 │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐            │
-│  │   CDC    │  │   APIs   │  │   IoT    │  │   Logs   │            │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘            │
-│       │             │             │             │                   │
-└───────┴─────────────┴─────────────┴─────────────┴───────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Kafka / Redpanda Cluster                         │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  Topics: raw.events, enriched.events, aggregated.metrics    │   │
-│  │  Partitions │ Replication │ Compaction │ Retention          │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │Schema Registry│  │ Kafka Connect│  │   Streams   │              │
-│  │  (Avro/Proto) │  │  (Sources/   │  │   Metadata  │              │
-│  │              │  │   Sinks)     │  │   Store     │              │
-│  └──────────────┘  └──────────────┘  └──────────────┘              │
-└────────────────────────────┬────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Apache Flink Cluster                             │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │                   Job Manager (HA)                           │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐       │
-│  │Task Manager│ │Task Manager│ │Task Manager│ │Task Manager│       │
-│  │  Slots: 4  │ │  Slots: 4  │ │  Slots: 4  │ │  Slots: 4  │       │
-│  └───────────┘  └───────────┘  └───────────┘  └───────────┘       │
-│                                                                     │
-│  State Backend: RocksDB │ Checkpoints: S3 │ Savepoints            │
-└────────────────────────────┬────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Data Sinks                                   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐            │
-│  │  Kafka   │  │   S3     │  │   JDBC   │  │  Redis   │            │
-│  │ (output) │  │ (archive)│  │   (DW)   │  │ (cache)  │            │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘            │
-└─────────────────────────────────────────────────────────────────────┘
-```
+## Architecture
 
-### Event Processing Flow
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Event Time Processing                          │
-│                                                                    │
-│  Event Time    ──┬── Watermark ──┬── Window ──┬── Output ──┬──   │
-│  Assignment      │   Generation   │   Trigger   │  Results   │     │
-│                  │                │             │            │     │
-│  [10:00:01]      │   W=09:59:55   │             │            │     │
-│  [10:00:03]      │   W=09:59:58   │             │            │     │
-│  [10:00:02]      │   W=09:59:57   │  [10:00]    │  Results   │     │
-│  [10:00:05]      │   W=10:00:00   │  Window     │  for 10:00 │     │
-│                  │                │  Fires      │            │     │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Producer(StreamingProducer / TransactionalProducer) --> Broker[(Kafka broker)]
+    Broker --> Consumer(StreamingConsumer / ConsumerGroup)
+    Consumer --> Serde(Avro / JSON serializers)
+    Serde --> Windows(Window assigners + WindowOperator)
+    Windows --> Watermark(Watermark generators)
+    Windows --> State(Keyed state + TimerService)
+    State --> Checkpoint(CheckpointCoordinator)
+    Serde --> Patterns(Dedup / Debounce / Sessions / CEP / Joins)
+    Windows --> Anomaly(Anomaly detectors)
+    Patterns --> Sink[(Output topic)]
+    Anomaly --> Alerter(AnomalyAlerter / AlertManager)
+    Flink(FlinkJobBuilder) --> JobSpec(Job spec dict + PyFlink DDL)
+    Enterprise(SchemaRegistry / MirrorMaker / Autoscaler) --> Ops(Config + metrics)
 ```
 
----
+The system is organized around the flow of a record from producer to sink:
 
-## Core Internals
+- **Transport (`producer.py`, `consumer.py`, `serializers.py`).** A record is
+  serialized (Avro or JSON), published by `StreamingProducer` with idempotence and
+  `acks=all`, and later pulled by `StreamingConsumer` in manual-commit batches. The
+  producer optionally runs inside a Kafka transaction for exactly-once; the consumer
+  runs at `read_committed` isolation so it never sees aborted records.
 
-### Kafka Producer API
+- **Event-time core (`windowing.py`, `state.py`).** Deserialized values flow into a
+  `WindowOperator`, which assigns each element to windows and buffers them keyed by
+  `(key, window_start)`. A `WatermarkGenerator` tracks event-time progress; when the
+  watermark passes a window's end, the operator fires that window through an
+  aggregation function. Keyed state (`ValueState`, `ListState`, `MapState`) and a
+  `TimerService` provide the primitives that stateful process functions need, and a
+  `CheckpointCoordinator` snapshots that state for recovery.
 
-```java
-import org.apache.kafka.clients.producer.*;
-import org.apache.kafka.common.serialization.StringSerializer;
-import io.confluent.kafka.serializers.KafkaAvroSerializer;
+- **Patterns (`patterns.py`).** Higher-level operators compose state and time:
+  `Deduplicator` and `Debouncer` use time-windowed maps, `SessionProcessor` groups
+  events by activity gaps, `CEPEngine` matches sequences of conditions within a time
+  bound, and `StreamJoiner` / `IntervalJoiner` buffer two streams and emit matched
+  pairs.
 
-public class StreamingProducer {
-    private final KafkaProducer<String, GenericRecord> producer;
-    private final String topic;
+- **Observability (`anomaly_detection.py`, part of `enterprise.py`).** Metric values
+  feed statistical, EMA, and threshold detectors; detected anomalies pass through a
+  rate-limiting `AnomalyAlerter`. `MetricsCollector` and `AlertManager` provide a
+  Prometheus export and a rule-based alert layer.
 
-    public StreamingProducer(String bootstrapServers, String schemaRegistryUrl, String topic) {
-        this.topic = topic;
+- **Job orchestration and enterprise (`flink_jobs.py`, `enterprise.py`).**
+  `FlinkJobBuilder` accumulates source/sink/transform specs and emits a job-spec dict
+  or generates PyFlink DDL. `enterprise.py` adds an in-process schema registry,
+  MirrorMaker 2 config generation, compacted-topic management, and a Flink autoscaler.
 
-        Properties props = new Properties();
-        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class);
+- **Configuration (`config.py`).** Frozen-ish dataclasses (`ProducerConfig`,
+  `ConsumerConfig`, `FlinkConfig`, `TopicConfig`, `SchemaRegistryConfig`) hold the
+  tunables and expose `to_dict()` methods that map onto the exact `confluent-kafka`
+  and topic property keys.
 
-        // Schema Registry
-        props.put("schema.registry.url", schemaRegistryUrl);
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Producer | `producer.py` | Idempotent and transactional publishing, topic admin |
+| Consumer | `consumer.py` | Manual-commit consumption, rebalance handling, offset control |
+| Serialization | `serializers.py` | Avro (registry wire format) and JSON encode/decode |
+| Windowing | `windowing.py` | Window assignment, watermarks, windowed aggregation |
+| State | `state.py` | Keyed value/list/map state, timers, checkpoints |
+| Patterns | `patterns.py` | Dedup, debounce, sessions, CEP, stream joins |
+| Anomaly detection | `anomaly_detection.py` | Z-score / MAD / EMA detection and alert aggregation |
+| Flink jobs | `flink_jobs.py` | Job-spec builder and PyFlink DDL generation |
+| Enterprise | `enterprise.py` | Schema registry, replication, metrics, autoscaling |
+| Config | `config.py` | Dataclass config mapped to confluent-kafka properties |
 
-        // Exactly-once semantics
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
-        props.put(ProducerConfig.ACKS_CONFIG, "all");
-        props.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
-        props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+## Core Components
 
-        // Batching for throughput
-        props.put(ProducerConfig.BATCH_SIZE_CONFIG, 16384);
-        props.put(ProducerConfig.LINGER_MS_CONFIG, 10);
-        props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "lz4");
+### StreamingProducer and TransactionalProducer
 
-        // Buffer memory
-        props.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 33554432);
+`StreamingProducer` (`producer.py`) wraps `confluent_kafka.Producer`, constructing it
+from `ProducerConfig.to_dict()`. The config defaults are reliability-first:
+`enable.idempotence=True`, `acks=all`, `retries=2147483647`,
+`max.in.flight.requests.per.connection=5`, `linger.ms=10`, `compression.type=lz4`,
+and a 32 MiB buffer. If `transactional_id` is set, the constructor calls
+`init_transactions()` immediately.
 
-        this.producer = new KafkaProducer<>(props);
-    }
+The core `produce()` method encodes string keys, converts a headers dict into
+`confluent-kafka`'s list-of-tuples form, and delegates to the underlying producer. Its
+notable behavior is **buffer-full back-off**: if the client raises `BufferError`
+because the local queue is full, `produce()` flushes with a 30-second timeout and
+retries the same record once. Delivery outcomes are tracked by a `DeliveryReport`
+whose `callback` increments success/error counters and records error strings.
 
-    public CompletableFuture<RecordMetadata> sendAsync(String key, GenericRecord value) {
-        CompletableFuture<RecordMetadata> future = new CompletableFuture<>();
+`produce_batch()` iterates a list of `{key, value, headers?, timestamp?}` messages,
+calling `poll(0)` every `poll_interval` records to service delivery callbacks, then
+does a final `flush()` and returns a fresh `DeliveryReport`.
 
-        ProducerRecord<String, GenericRecord> record = new ProducerRecord<>(topic, key, value);
+Transaction support is exposed as thin methods — `begin_transaction()`,
+`commit_transaction()`, `abort_transaction()`, and `send_offsets_to_transaction()` —
+each guarding on `transactional_id` being configured.
+`TransactionalProducer` subclasses `StreamingProducer`, requires a
+`transactional_id`, and adds `produce_transactionally(messages)` which wraps a
+begin / produce-all / commit sequence and aborts on `KafkaException`.
 
-        producer.send(record, (metadata, exception) -> {
-            if (exception != null) {
-                future.completeExceptionally(exception);
-            } else {
-                future.complete(metadata);
-            }
-        });
+### TopicManager
 
-        return future;
-    }
+`TopicManager` wraps `confluent_kafka.admin.AdminClient`. `create_topic()` builds a
+`NewTopic` from a `TopicConfig` (partitions, replication factor, and the property
+dict from `TopicConfig.to_dict()`), submits it, and treats
+`TOPIC_ALREADY_EXISTS` as success so creation is idempotent. It also provides
+`delete_topic()`, `list_topics()`, and `topic_exists()`.
 
-    public void sendWithCallback(String key, GenericRecord value, Callback callback) {
-        ProducerRecord<String, GenericRecord> record = new ProducerRecord<>(topic, key, value);
-        producer.send(record, callback);
-    }
+### StreamingConsumer and ConsumerGroup
 
-    public void close() {
-        producer.flush();
-        producer.close();
-    }
-}
-```
+`StreamingConsumer` (`consumer.py`) wraps `confluent_kafka.Consumer` built from
+`ConsumerConfig.to_dict()`, which defaults to `enable.auto.commit=False`,
+`auto.offset.reset=earliest`, and `isolation.level=read_committed`. Every raw Kafka
+message is normalized into a `Message` dataclass (topic, partition, offset, key,
+value bytes, timestamp, headers) via `_wrap_message()`, which decodes the key and
+header bytes and reads the message timestamp only when the timestamp type is set.
 
-### Kafka Consumer API
+Consumption comes in three shapes:
 
-```java
-import org.apache.kafka.clients.consumer.*;
-import org.apache.kafka.common.TopicPartition;
+- `poll(timeout)` returns a single `Message` or `None`, translating
+  `_PARTITION_EOF` into `None` and raising `KafkaException` on real errors.
+- `consume_batch(num_messages, timeout)` returns a list of `Message`, skipping EOF
+  markers.
+- `consume(handler, batch_size, poll_timeout, commit_interval)` is the continuous
+  loop: it processes each message through `handler`, commits every `commit_interval`
+  messages, commits any remainder at the end of each batch, and closes the consumer
+  in a `finally` block. `shutdown()` flips the `_running` flag to break the loop.
 
-public class StreamingConsumer {
-    private final KafkaConsumer<String, GenericRecord> consumer;
-    private final List<String> topics;
-    private volatile boolean running = true;
+Offset and partition control is first-class: manual `commit()` (whole-assignment or a
+specific `Message`, which commits `offset + 1`), `get_committed()`, `get_position()`,
+`seek()`, `seek_to_beginning()`, `seek_to_end()` (using `get_watermark_offsets`), and
+`pause()` / `resume()`.
 
-    public StreamingConsumer(String bootstrapServers, String groupId, List<String> topics) {
-        this.topics = topics;
+The `RebalanceListener` is wired into `subscribe()`. On revocation it performs a
+synchronous commit before partitions are taken away — the standard technique to avoid
+reprocessing after a rebalance — and then invokes any user callback. `ConsumerGroup`
+is a small helper that spins up `num_consumers` `StreamingConsumer` instances
+subscribed to the same topics for parallel processing.
 
-        Properties props = new Properties();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, KafkaAvroDeserializer.class);
+### Serializers
 
-        // Schema Registry
-        props.put("schema.registry.url", schemaRegistryUrl);
-        props.put("specific.avro.reader", true);
+`serializers.py` implements the Confluent wire format directly. `AvroSerializer`
+parses the schema with `fastavro.schema.parse_schema`, and `serialize()` writes the
+5-byte header — `struct.pack(">bI", MAGIC_BYTE, schema_id)` where `MAGIC_BYTE == 0` —
+only when a `schema_id` is supplied, then appends the Avro body via
+`fastavro.schemaless_writer`. `AvroDeserializer` mirrors this: with
+`expect_registry_format=True` it validates the magic byte, reads the 4-byte schema
+ID, and then runs `schemaless_reader`; `extract_schema_id()` pulls the ID out of the
+first five bytes. `JsonSerializer` / `JsonDeserializer` are UTF-8 JSON. Three prebuilt
+schemas ship as module constants — `EVENT_SCHEMA`, `METRIC_SCHEMA`,
+`AGGREGATION_SCHEMA` — with `create_event_serializer()` and friends as factories.
 
-        // Consumer configuration
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);  // Manual commits
-        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 500);
-        props.put(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300000);
+### Windowing and watermarks
 
-        // Isolation level for exactly-once
-        props.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
+`windowing.py` is the heart of the event-time layer.
 
-        this.consumer = new KafkaConsumer<>(props);
-    }
+A `Window` is a half-open `[start, end)` interval in milliseconds with a `contains()`
+predicate and a `duration_ms` property. Three assigners derive from `WindowAssigner`:
 
-    public void consume(RecordProcessor processor) {
-        consumer.subscribe(topics, new RebalanceListener());
+- `TumblingWindowAssigner(size_ms)` maps a timestamp to the single window
+  `[(t // size) * size, +size)`.
+- `SlidingWindowAssigner(size_ms, slide_ms)` returns every window that contains the
+  timestamp by walking back from the last window start in `slide_ms` steps.
+- `SessionWindowAssigner(gap_ms)` initially emits `[t, t + gap)` per event and
+  exposes `merge_windows()`, which sorts windows by start and coalesces any that
+  overlap, implementing gap-based session merging.
 
-        try {
-            while (running) {
-                ConsumerRecords<String, GenericRecord> records = consumer.poll(Duration.ofMillis(100));
+`WatermarkGenerator(max_out_of_orderness_ms)` tracks `current_max_timestamp` via
+`on_event()` and emits `Watermark(current_max - max_out_of_orderness)`.
+`BoundedOutOfOrdernessGenerator` is the standard bounded-lateness variant.
+`IdleAwareWatermarkGenerator` additionally records wall-clock arrival time and, when a
+source has been silent longer than `idle_timeout_ms`, advances the watermark to
+`now - max_out_of_orderness` so idle partitions do not stall downstream windows.
 
-                for (ConsumerRecord<String, GenericRecord> record : records) {
-                    try {
-                        processor.process(record);
-                    } catch (Exception e) {
-                        handleProcessingError(record, e);
-                    }
-                }
+`WindowOperator(assigner, aggregator)` ties these together. `process_element(key,
+value, timestamp)` updates the watermark generator, assigns the element to windows,
+and appends the value into per-`(key, window_start)` `WindowState`. Windows do **not**
+fire on element arrival — this operator uses explicit watermark advancement.
+`advance_watermark(timestamp)` sets the generator's max timestamp and, for every key,
+fires each window whose `end <= watermark`, applying the aggregator to the buffered
+elements, emitting a `WindowedValue`, and deleting the fired window's state. A set of
+aggregation functions is provided — `count_aggregator`, `sum_aggregator`,
+`avg_aggregator`, `min_aggregator`, `max_aggregator`, and `full_aggregator` (which
+returns an `AggregationResult` with count/sum/min/max/avg).
 
-                // Commit after processing batch
-                consumer.commitSync();
-            }
-        } finally {
-            consumer.close();
-        }
-    }
+### Keyed state, timers, and checkpoints
 
-    private class RebalanceListener implements ConsumerRebalanceListener {
-        @Override
-        public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
-            // Commit current offsets before rebalance
-            consumer.commitSync();
-        }
+`state.py` provides the stateful-processing primitives. `StateBackend` is an abstract
+`get`/`put`/`delete`/`keys` interface; `InMemoryStateBackend` implements it over a
+dict and adds `clear()`. Three keyed state types layer on top, each namespacing its
+storage key as `"{name}:{key}"` and defaulting to pickle serialization:
 
-        @Override
-        public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
-            // Optionally seek to specific offsets
-        }
-    }
+- `ValueState` — a single value per key (`value()`, `update()`, `clear()`).
+- `ListState` — an appendable list (`get()`, `add()`, `add_all()`, `update()`,
+  `clear()`).
+- `MapState` — a nested map (`get`, `put`, `remove`, `contains`, `keys`, `values`,
+  `items`, `clear`).
 
-    public void shutdown() {
-        running = false;
-        consumer.wakeup();
-    }
-}
-```
+`TimerService` maintains sorted per-key lists of event-time and processing-time
+timers. `advance_watermark(watermark)` pops and returns every event-time timer at or
+below the watermark; `advance_processing_time(timestamp)` does the same for
+processing-time timers. Timers can be registered and deleted individually — this is
+the mechanism a session-timeout process function would use.
 
-### Flink Stream Processing
+`CheckpointCoordinator` monotonically numbers checkpoints. `trigger_checkpoint()`
+writes a `{id, timestamp, completed: false}` record into the backend and returns
+`CheckpointMetadata`; `complete_checkpoint()` flips the completed flag;
+`get_latest_checkpoint()` scans backward for the newest completed checkpoint; and
+`restore_from_checkpoint()` validates that a checkpoint is completed before resetting
+the counter. `StateContext` is a convenience wrapper that lazily creates and caches
+value/list/map states for a given key.
 
-```java
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.windowing.time.Time;
-import org.apache.flink.streaming.api.windowing.assigners.*;
-import org.apache.flink.streaming.connectors.kafka.*;
+### Streaming patterns
 
-public class StreamProcessor {
-    public static void main(String[] args) throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+`patterns.py` composes the primitives above into reusable operators:
 
-        // Checkpointing for exactly-once
-        env.enableCheckpointing(60000);
-        env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
-        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(30000);
-        env.getCheckpointConfig().setCheckpointTimeout(120000);
-        env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+- **`Deduplicator`** remembers event IDs (extracted by a configurable function) in a
+  map of `id -> timestamp`, evicting entries older than `window_ms` on each check.
+  `is_duplicate()` returns True for a repeat; `process()` returns the event or `None`.
+- **`Debouncer`** keeps the latest pending event per key and emits the previous one
+  only once a quiet period of `window_ms` has elapsed; `flush()` drains everything
+  pending.
+- **`SessionProcessor`** groups events per user into `Session` objects, closing a
+  session and starting a new one when the inter-event gap exceeds `gap_ms`.
+  `close_idle_sessions(current_time)` sweeps sessions that have gone quiet.
+- **`CEPEngine`** with the fluent `Pattern` / `PatternCondition` builder
+  (`begin().where().next()/.followed_by()`, plus `one` / `one_or_more` / `optional`
+  quantifiers and a `within(ms)` time bound). `process_event()` buffers events per
+  registered pattern, prunes events outside the time window, and attempts a sequential
+  match, emitting a `PatternMatch` when all conditions are satisfied.
+- **`StreamJoiner`** buffers left and right streams keyed by extractor functions and,
+  on each arriving event, emits pairs whose timestamps fall within `window_ms`, with
+  buffer cleanup based on twice the window. **`IntervalJoiner`** overrides the match
+  test to use asymmetric `[lower_bound_ms, upper_bound_ms]` interval bounds.
 
-        // State backend
-        env.setStateBackend(new EmbeddedRocksDBStateBackend());
-        env.getCheckpointConfig().setCheckpointStorage("s3://checkpoints/");
+### Anomaly detection
 
-        // Kafka source
-        KafkaSource<Event> source = KafkaSource.<Event>builder()
-            .setBootstrapServers("kafka:9092")
-            .setTopics("events")
-            .setGroupId("flink-processor")
-            .setStartingOffsets(OffsetsInitializer.committedOffsets(OffsetResetStrategy.EARLIEST))
-            .setDeserializer(new EventDeserializer())
-            .build();
+`anomaly_detection.py` implements online statistical detection. `RollingStatistics`
+maintains count, sum, sum-of-squares, min, and max plus a bounded `deque` of recent
+values, computing mean and variance via a Welford-style formula and median / MAD from
+the retained window. Three detectors share an `AnomalyEvent` output:
 
-        DataStream<Event> events = env.fromSource(
-            source,
-            WatermarkStrategy
-                .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(10))
-                .withTimestampAssigner((event, ts) -> event.getTimestamp()),
-            "Kafka Source"
-        );
+- `StatisticalDetector` flags a value when its Z-score exceeds `z_threshold` or its
+  MAD-based modified Z-score (scaled by `k = 0.6745`) exceeds `mad_threshold`, after a
+  `min_samples` warm-up. Severity escalates with the score.
+- `ExponentialMovingAverageDetector` tracks an EMA and EMA variance per metric and
+  flags deviations beyond `threshold_factor` standard deviations.
+- `ThresholdDetector` flags values outside static `(min, max)` bounds.
 
-        // Processing pipeline
-        DataStream<AggregatedMetric> metrics = events
-            .filter(event -> event.getType() != null)
-            .keyBy(Event::getUserId)
-            .window(TumblingEventTimeWindows.of(Time.minutes(5)))
-            .aggregate(new MetricsAggregator());
+`AnomalyAlerter` rate-limits alerts per `(metric, anomaly_type)` key, aggregating
+suppressed events, and keeps a bounded alert history. `StreamingAnomalyDetector` runs
+the statistical and EMA detectors (plus optional thresholds) together, picks the most
+severe event, and routes it through the alerter — returning an event only when an
+alert actually fires.
 
-        // Kafka sink with exactly-once
-        KafkaSink<AggregatedMetric> sink = KafkaSink.<AggregatedMetric>builder()
-            .setBootstrapServers("kafka:9092")
-            .setRecordSerializer(new MetricSerializer())
-            .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
-            .setTransactionalIdPrefix("flink-metrics")
-            .build();
+### Flink job builder
 
-        metrics.sinkTo(sink);
+`FlinkJobBuilder` (`flink_jobs.py`) is a fluent builder over `SourceConfig`,
+`SinkConfig`, and `WindowConfig`. `add_kafka_source()` / `add_kafka_sink()` accumulate
+connector specs (the sink defaulting to `exactly-once` delivery), and
+`add_filter()` / `add_map()` / `add_window_aggregation()` / `add_join()` append
+transformation descriptors. `build()` renders the whole job as a spec dict
+(job name, parallelism, checkpoint config, sources, sinks, transformations), and
+`generate_pyflink_code()` emits a runnable-looking PyFlink script with Kafka source
+and sink DDL. `create_simple_pipeline()` is a one-call helper that wires a
+source-to-sink passthrough.
 
-        env.execute("Stream Processing Job");
-    }
-}
-```
+### Enterprise features
 
-### Watermark Strategy
-
-```java
-public class EventWatermarkStrategy implements WatermarkStrategy<Event> {
-
-    @Override
-    public WatermarkGenerator<Event> createWatermarkGenerator(WatermarkGeneratorSupplier.Context context) {
-        return new BoundedOutOfOrdernessWatermarks<>(Duration.ofSeconds(10));
-    }
-
-    @Override
-    public TimestampAssigner<Event> createTimestampAssigner(TimestampAssignerSupplier.Context context) {
-        return (event, recordTimestamp) -> event.getEventTime();
-    }
-}
-
-// Custom watermark generator for handling idle partitions
-public class IdleAwareWatermarkGenerator implements WatermarkGenerator<Event> {
-    private final long maxOutOfOrderness;
-    private final long idleTimeout;
-    private long currentMaxTimestamp;
-    private long lastRecordTime;
-
-    public IdleAwareWatermarkGenerator(long maxOutOfOrderness, long idleTimeout) {
-        this.maxOutOfOrderness = maxOutOfOrderness;
-        this.idleTimeout = idleTimeout;
-        this.currentMaxTimestamp = Long.MIN_VALUE;
-        this.lastRecordTime = System.currentTimeMillis();
-    }
-
-    @Override
-    public void onEvent(Event event, long eventTimestamp, WatermarkOutput output) {
-        currentMaxTimestamp = Math.max(currentMaxTimestamp, eventTimestamp);
-        lastRecordTime = System.currentTimeMillis();
-    }
-
-    @Override
-    public void onPeriodicEmit(WatermarkOutput output) {
-        long now = System.currentTimeMillis();
-
-        if (now - lastRecordTime > idleTimeout) {
-            // Emit watermark at current time for idle sources
-            output.emitWatermark(new Watermark(now - maxOutOfOrderness));
-        } else if (currentMaxTimestamp != Long.MIN_VALUE) {
-            output.emitWatermark(new Watermark(currentMaxTimestamp - maxOutOfOrderness));
-        }
-    }
-}
-```
-
----
+`enterprise.py` bundles the operational layer. `SchemaRegistry` is an in-process cache
+that assigns schema IDs by hashing the schema string (no HTTP). `MirrorMaker` models
+clusters (`ClusterConfig`) and replication flows (`ReplicationFlow`) and generates a
+MirrorMaker 2 properties file. `CompactedTopicManager` records compacted-topic
+configuration and logs tombstones. `MetricsCollector` stores producer/consumer/job
+metrics and exports them in Prometheus text format, while `AlertManager` evaluates
+dot-path threshold rules. The autoscaling stack — `FlinkAutoscaler`, `ScalingPolicy`,
+`ScalingDecision`, `SavepointManager`, and `AutoscalingController` — evaluates
+metric-driven scaling with cooldowns and records a scaling history, but simulates the
+actual scale action unless a Kubernetes client is injected.
 
 ## Data Structures
 
-### Event Schema (Avro)
+### Configuration dataclasses
+
+```python
+@dataclass
+class ProducerConfig(KafkaConfig):
+    schema_registry_url: Optional[str] = None
+    acks: str = "all"
+    enable_idempotence: bool = True
+    retries: int = 2147483647
+    max_in_flight_requests: int = 5
+    batch_size: int = 16384
+    linger_ms: int = 10
+    compression_type: str = "lz4"
+    buffer_memory: int = 33554432
+    transactional_id: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        # maps onto confluent-kafka keys: acks, enable.idempotence, retries,
+        # max.in.flight.requests.per.connection, batch.size, linger.ms,
+        # compression.type, buffer.memory, and (if set) transactional.id
+        ...
+
+
+@dataclass
+class ConsumerConfig(KafkaConfig):
+    group_id: str = ""
+    auto_offset_reset: str = "earliest"
+    enable_auto_commit: bool = False
+    isolation_level: str = "read_committed"
+    max_poll_records: int = 500
+    max_poll_interval_ms: int = 300000
+```
+
+`TopicConfig` carries partitions, replication factor, retention, cleanup policy, and
+segment settings, exposing `to_dict()` with string-typed values ready for the Kafka
+admin API. `FlinkConfig` holds parallelism, checkpoint interval / timeout / mode,
+state backend, and restart strategy.
+
+### Window and windowed value
+
+```python
+@dataclass
+class Window:
+    start: int  # milliseconds
+    end: int    # milliseconds
+
+    @property
+    def duration_ms(self) -> int:
+        return self.end - self.start
+
+    def contains(self, timestamp: int) -> bool:
+        return self.start <= timestamp < self.end
+
+
+@dataclass
+class WindowedValue(Generic[T]):
+    window: Window
+    value: T
+    timestamp: int
+```
+
+`WindowState` holds the buffered `elements` for a window, and `AggregationResult`
+carries `count`, `sum`, `min`, `max`, and `avg` for the full aggregator.
+
+### Message and timers
+
+```python
+@dataclass
+class Message:
+    topic: str
+    partition: int
+    offset: int
+    key: Optional[str]
+    value: bytes
+    timestamp: int
+    headers: Dict[str, str]
+
+
+@dataclass
+class Timer:
+    timestamp: int
+    key: str
+    timer_type: str = "event_time"  # or "processing_time"
+
+
+@dataclass
+class CheckpointMetadata:
+    checkpoint_id: int
+    timestamp: int
+    completed: bool = False
+```
+
+### Session, pattern match, and anomaly event
+
+```python
+@dataclass
+class Session:
+    session_id: str
+    user_id: str
+    start_time: int
+    end_time: int
+    events: List[Any] = field(default_factory=list)
+    event_count: int = 0
+
+    @property
+    def duration_ms(self) -> int:
+        return self.end_time - self.start_time
+
+
+@dataclass
+class PatternMatch:
+    pattern_name: str
+    events: List[Any]
+    start_time: int
+    end_time: int
+
+
+@dataclass
+class AnomalyEvent:
+    timestamp: datetime
+    value: float
+    expected_value: float
+    anomaly_type: AnomalyType   # POINT / CONTEXTUAL / COLLECTIVE / TREND / SEASONAL
+    score: float
+    severity: AlertSeverity     # INFO / WARNING / CRITICAL
+    metric_name: str
+    context: Dict[str, Any] = field(default_factory=dict)
+```
+
+### Event Avro schema
+
+The prebuilt `EVENT_SCHEMA` used by `create_event_serializer()`:
 
 ```json
 {
   "type": "record",
   "name": "Event",
-  "namespace": "com.streaming.events",
+  "namespace": "streaming.events",
   "fields": [
     {"name": "event_id", "type": "string"},
     {"name": "event_type", "type": "string"},
-    {"name": "user_id", "type": "string"},
+    {"name": "user_id", "type": ["null", "string"], "default": null},
     {"name": "timestamp", "type": "long", "logicalType": "timestamp-millis"},
-    {"name": "payload", "type": {
-      "type": "map",
-      "values": "string"
-    }},
+    {"name": "payload", "type": {"type": "map", "values": "string"}},
     {"name": "metadata", "type": {
       "type": "record",
       "name": "Metadata",
       "fields": [
         {"name": "source", "type": "string"},
-        {"name": "version", "type": "int"},
+        {"name": "version", "type": "int", "default": 1},
         {"name": "correlation_id", "type": ["null", "string"], "default": null}
       ]
     }}
@@ -379,943 +485,256 @@ public class IdleAwareWatermarkGenerator implements WatermarkGenerator<Event> {
 }
 ```
 
-### State Management
+### Confluent Avro wire format
 
-```java
-// Keyed state for user sessions
-public class SessionProcessFunction
-    extends KeyedProcessFunction<String, Event, Session> {
+The serialized bytes for an Avro message with a schema ID follow the Confluent layout
+(a byte/field map, not a diagram):
 
-    private ValueState<Session> sessionState;
-    private ValueState<Long> timerState;
-    private final long sessionTimeout;
-
-    @Override
-    public void open(Configuration parameters) {
-        ValueStateDescriptor<Session> sessionDescriptor =
-            new ValueStateDescriptor<>("session", Session.class);
-        sessionState = getRuntimeContext().getState(sessionDescriptor);
-
-        ValueStateDescriptor<Long> timerDescriptor =
-            new ValueStateDescriptor<>("timer", Long.class);
-        timerState = getRuntimeContext().getState(timerDescriptor);
-    }
-
-    @Override
-    public void processElement(Event event, Context ctx, Collector<Session> out) throws Exception {
-        Session session = sessionState.value();
-
-        if (session == null) {
-            // New session
-            session = new Session(event.getUserId(), event.getTimestamp());
-        }
-
-        // Update session
-        session.addEvent(event);
-        sessionState.update(session);
-
-        // Reset session timeout timer
-        Long oldTimer = timerState.value();
-        if (oldTimer != null) {
-            ctx.timerService().deleteEventTimeTimer(oldTimer);
-        }
-
-        long newTimer = event.getTimestamp() + sessionTimeout;
-        ctx.timerService().registerEventTimeTimer(newTimer);
-        timerState.update(newTimer);
-    }
-
-    @Override
-    public void onTimer(long timestamp, OnTimerContext ctx, Collector<Session> out) throws Exception {
-        // Session timed out - emit and clear
-        Session session = sessionState.value();
-        if (session != null) {
-            session.close(timestamp);
-            out.collect(session);
-            sessionState.clear();
-            timerState.clear();
-        }
-    }
-}
+```
++---------+-------------------+---------------------------+
+| byte 0  | bytes 1..4        | bytes 5..N                |
+| magic=0 | schema_id (int32) | Avro schemaless body      |
++---------+-------------------+---------------------------+
 ```
 
-### Windowing Types
-
-```java
-// Tumbling windows - fixed size, non-overlapping
-events.keyBy(Event::getUserId)
-    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
-    .aggregate(new CountAggregator());
-
-// Sliding windows - overlapping windows
-events.keyBy(Event::getUserId)
-    .window(SlidingEventTimeWindows.of(Time.minutes(10), Time.minutes(5)))
-    .aggregate(new AverageAggregator());
-
-// Session windows - gap-based grouping
-events.keyBy(Event::getUserId)
-    .window(EventTimeSessionWindows.withGap(Time.minutes(30)))
-    .aggregate(new SessionAggregator());
-
-// Global windows with custom trigger
-events.keyBy(Event::getUserId)
-    .window(GlobalWindows.create())
-    .trigger(CountTrigger.of(100))
-    .evictor(CountEvictor.of(100))
-    .aggregate(new BatchAggregator());
-```
-
----
+The header is written by `struct.pack(">bI", 0, schema_id)`, big-endian, and read back
+by `AvroDeserializer.extract_schema_id()`.
 
 ## API Design
 
-### Producer API
+The public surface is what `streaming/__init__.py` re-exports. All examples run
+in-process except where a broker is noted.
+
+### Windowing
 
 ```python
-from dataclasses import dataclass
-from typing import Dict, Any, Optional
-from confluent_kafka import Producer
-from confluent_kafka.schema_registry import SchemaRegistryClient
-from confluent_kafka.schema_registry.avro import AvroSerializer
+from streaming.windowing import (
+    TumblingWindowAssigner, SlidingWindowAssigner, SessionWindowAssigner,
+    WindowOperator, BoundedOutOfOrdernessGenerator,
+    sum_aggregator, count_aggregator, full_aggregator,
+)
 
-class StreamingProducerClient:
-    """High-level producer with schema registry support"""
+op = WindowOperator(TumblingWindowAssigner(size_ms=5000), sum_aggregator)
+op.process_element("user-1", 10.0, timestamp=1000)
+op.process_element("user-1", 20.0, timestamp=2000)
+op.process_element("user-1", 5.0, timestamp=7000)   # next window
 
-    def __init__(self, config: ProducerConfig):
-        self.config = config
-        self.schema_registry = SchemaRegistryClient({
-            'url': config.schema_registry_url
-        })
-
-        # Create Avro serializers per topic
-        self.serializers: Dict[str, AvroSerializer] = {}
-
-        # Producer configuration
-        producer_config = {
-            'bootstrap.servers': config.bootstrap_servers,
-            'enable.idempotence': True,
-            'acks': 'all',
-            'retries': 10000000,
-            'max.in.flight.requests.per.connection': 5,
-            'compression.type': 'lz4',
-            'linger.ms': 10,
-            'batch.size': 16384,
-        }
-
-        self.producer = Producer(producer_config)
-
-    def send(
-        self,
-        topic: str,
-        key: str,
-        value: Dict[str, Any],
-        headers: Optional[Dict[str, str]] = None,
-        timestamp_ms: Optional[int] = None
-    ) -> None:
-        """Send a message to a topic"""
-
-        # Get or create serializer for topic
-        if topic not in self.serializers:
-            schema = self._get_schema(topic)
-            self.serializers[topic] = AvroSerializer(
-                self.schema_registry,
-                schema
-            )
-
-        # Serialize value
-        serialized = self.serializers[topic](value, None)
-
-        # Convert headers
-        kafka_headers = [(k, v.encode()) for k, v in (headers or {}).items()]
-
-        # Produce
-        self.producer.produce(
-            topic=topic,
-            key=key.encode(),
-            value=serialized,
-            headers=kafka_headers,
-            timestamp=timestamp_ms,
-            on_delivery=self._delivery_callback
-        )
-
-    def flush(self, timeout: float = 10.0) -> int:
-        """Flush pending messages"""
-        return self.producer.flush(timeout)
-
-    def _delivery_callback(self, err, msg):
-        if err:
-            logger.error(f"Delivery failed: {err}")
-        else:
-            logger.debug(f"Delivered to {msg.topic()} [{msg.partition()}] @ {msg.offset()}")
+results = op.advance_watermark(5000)   # fire the first window
+for r in results:
+    print(r.window, r.value)            # -> sum 30.0 for [0ms, 5000ms)
 ```
 
-### Consumer API
+### State and timers
 
 ```python
-from confluent_kafka import Consumer, KafkaError
-from confluent_kafka.schema_registry.avro import AvroDeserializer
+from streaming.state import (
+    InMemoryStateBackend, ValueState, ListState, MapState,
+    TimerService, CheckpointCoordinator,
+)
 
-class StreamingConsumerClient:
-    """High-level consumer with manual commit support"""
+backend = InMemoryStateBackend()
+count = ValueState[int]("count", backend, key="user-1")
+count.update((count.value() or 0) + 1)
 
-    def __init__(self, config: ConsumerConfig):
-        self.config = config
-        self.schema_registry = SchemaRegistryClient({
-            'url': config.schema_registry_url
-        })
+timers = TimerService()
+timers.register_event_time_timer("user-1", timestamp=9000)
+fired = timers.advance_watermark(10000)   # -> [Timer(9000, "user-1", "event_time")]
 
-        consumer_config = {
-            'bootstrap.servers': config.bootstrap_servers,
-            'group.id': config.group_id,
-            'auto.offset.reset': 'earliest',
-            'enable.auto.commit': False,
-            'isolation.level': 'read_committed',
-            'max.poll.interval.ms': 300000,
-        }
-
-        self.consumer = Consumer(consumer_config)
-        self.deserializers: Dict[str, AvroDeserializer] = {}
-        self.running = True
-
-    def subscribe(self, topics: List[str]) -> None:
-        """Subscribe to topics"""
-        self.consumer.subscribe(topics, on_assign=self._on_assign)
-
-    def consume(self, handler: Callable[[Message], None], batch_size: int = 100) -> None:
-        """Consume messages in batches"""
-        try:
-            while self.running:
-                messages = self.consumer.consume(batch_size, timeout=1.0)
-
-                for msg in messages:
-                    if msg.error():
-                        if msg.error().code() == KafkaError._PARTITION_EOF:
-                            continue
-                        else:
-                            raise KafkaException(msg.error())
-
-                    # Deserialize
-                    value = self._deserialize(msg)
-
-                    # Process
-                    handler(Message(
-                        topic=msg.topic(),
-                        partition=msg.partition(),
-                        offset=msg.offset(),
-                        key=msg.key().decode() if msg.key() else None,
-                        value=value,
-                        timestamp=msg.timestamp()[1],
-                        headers=dict(msg.headers() or [])
-                    ))
-
-                # Commit batch
-                self.consumer.commit()
-
-        finally:
-            self.consumer.close()
-
-    def shutdown(self) -> None:
-        """Graceful shutdown"""
-        self.running = False
+coordinator = CheckpointCoordinator(backend)
+meta = coordinator.trigger_checkpoint()
+coordinator.complete_checkpoint(meta.checkpoint_id)
 ```
 
-### Flink Job API
+### Patterns
 
 ```python
-from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.table import StreamTableEnvironment
+from streaming.patterns import (
+    Deduplicator, DeduplicationConfig,
+    SessionProcessor, StreamJoiner, JoinConfig,
+    CEPEngine, Pattern,
+)
 
-class FlinkJobBuilder:
-    """Builder for Flink streaming jobs"""
+dedup = Deduplicator(DeduplicationConfig(window_ms=60_000,
+                                         id_extractor=lambda e: e["id"]))
+assert dedup.process({"id": "a"}) is not None
+assert dedup.process({"id": "a"}) is None   # duplicate suppressed
 
-    def __init__(self, job_name: str):
-        self.job_name = job_name
-        self.env = StreamExecutionEnvironment.get_execution_environment()
-        self.t_env = StreamTableEnvironment.create(self.env)
-
-        # Default configuration
-        self.env.set_parallelism(4)
-        self.env.enable_checkpointing(60000)
-
-    def with_checkpoint_config(
-        self,
-        interval_ms: int,
-        mode: str = "EXACTLY_ONCE",
-        timeout_ms: int = 120000
-    ) -> 'FlinkJobBuilder':
-        """Configure checkpointing"""
-        self.env.enable_checkpointing(interval_ms)
-        config = self.env.get_checkpoint_config()
-        config.set_checkpoint_timeout(timeout_ms)
-        return self
-
-    def with_state_backend(
-        self,
-        backend_type: str = "rocksdb",
-        checkpoint_path: str = None
-    ) -> 'FlinkJobBuilder':
-        """Configure state backend"""
-        if backend_type == "rocksdb":
-            from pyflink.datastream import EmbeddedRocksDBStateBackend
-            self.env.set_state_backend(EmbeddedRocksDBStateBackend())
-        if checkpoint_path:
-            self.env.get_checkpoint_config().set_checkpoint_storage(checkpoint_path)
-        return self
-
-    def add_kafka_source(
-        self,
-        topic: str,
-        bootstrap_servers: str,
-        group_id: str,
-        schema: str
-    ) -> 'FlinkJobBuilder':
-        """Add Kafka source table"""
-        self.t_env.execute_sql(f"""
-            CREATE TABLE {topic}_source (
-                {schema},
-                event_time TIMESTAMP(3),
-                WATERMARK FOR event_time AS event_time - INTERVAL '10' SECOND
-            ) WITH (
-                'connector' = 'kafka',
-                'topic' = '{topic}',
-                'properties.bootstrap.servers' = '{bootstrap_servers}',
-                'properties.group.id' = '{group_id}',
-                'scan.startup.mode' = 'latest-offset',
-                'format' = 'avro-confluent',
-                'avro-confluent.url' = 'http://schema-registry:8081'
-            )
-        """)
-        return self
-
-    def execute(self) -> None:
-        """Execute the job"""
-        self.env.execute(self.job_name)
+joiner = StreamJoiner(JoinConfig(
+    left_key_extractor=lambda e: e["k"],
+    right_key_extractor=lambda e: e["k"],
+    window_ms=1000,
+))
+joiner.process_left({"k": "x", "side": "L"}, timestamp=100)
+pairs = joiner.process_right({"k": "x", "side": "R"}, timestamp=200)
 ```
 
----
-
-## Enterprise Features
-
-### 1. Schema Registry Integration
+### Serialization
 
 ```python
-from confluent_kafka.schema_registry import SchemaRegistryClient, Schema
+from streaming.serializers import create_event_serializer, create_event_deserializer
 
-class SchemaManager:
-    """Manage Avro/Protobuf schemas in Confluent Schema Registry"""
+ser = create_event_serializer(schema_id=42)      # writes 5-byte header
+de = create_event_deserializer(expect_registry=True)
 
-    def __init__(self, registry_url: str):
-        self.client = SchemaRegistryClient({'url': registry_url})
-
-    def register_schema(
-        self,
-        subject: str,
-        schema_str: str,
-        schema_type: str = "AVRO"
-    ) -> int:
-        """Register a new schema version"""
-        schema = Schema(schema_str, schema_type)
-        schema_id = self.client.register_schema(subject, schema)
-        return schema_id
-
-    def get_latest_schema(self, subject: str) -> Schema:
-        """Get the latest schema for a subject"""
-        return self.client.get_latest_version(subject)
-
-    def check_compatibility(
-        self,
-        subject: str,
-        schema_str: str,
-        schema_type: str = "AVRO"
-    ) -> bool:
-        """Check if schema is compatible with existing versions"""
-        schema = Schema(schema_str, schema_type)
-        return self.client.test_compatibility(subject, schema)
-
-    def set_compatibility(
-        self,
-        subject: str,
-        level: str = "BACKWARD"
-    ) -> None:
-        """Set compatibility level (BACKWARD, FORWARD, FULL, NONE)"""
-        self.client.set_compatibility(subject, level)
-
-    def get_schema_by_id(self, schema_id: int) -> Schema:
-        """Get schema by ID"""
-        return self.client.get_schema(schema_id)
+raw = ser.serialize({
+    "event_id": "e-1", "event_type": "click", "user_id": "u-1",
+    "timestamp": 1700000000000, "payload": {"page": "home"},
+    "metadata": {"source": "web", "version": 1, "correlation_id": None},
+})
+event = de.deserialize(raw)
 ```
 
-### 2. Exactly-Once Semantics
-
-```java
-// Kafka Transactions for exactly-once
-public class ExactlyOnceProducer {
-    private final KafkaProducer<String, String> producer;
-
-    public ExactlyOnceProducer(String bootstrapServers, String transactionalId) {
-        Properties props = new Properties();
-        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, transactionalId);
-        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
-        props.put(ProducerConfig.ACKS_CONFIG, "all");
-
-        this.producer = new KafkaProducer<>(props);
-        this.producer.initTransactions();
-    }
-
-    public void sendInTransaction(List<ProducerRecord<String, String>> records) {
-        try {
-            producer.beginTransaction();
-
-            for (ProducerRecord<String, String> record : records) {
-                producer.send(record);
-            }
-
-            producer.commitTransaction();
-        } catch (ProducerFencedException | OutOfOrderSequenceException e) {
-            // Fatal errors - cannot recover
-            producer.close();
-            throw e;
-        } catch (KafkaException e) {
-            // Abort and retry
-            producer.abortTransaction();
-            throw e;
-        }
-    }
-
-    // Consume-transform-produce pattern
-    public void consumeTransformProduce(
-        KafkaConsumer<String, String> consumer,
-        String outputTopic,
-        Function<String, String> transformer
-    ) {
-        while (true) {
-            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
-
-            if (!records.isEmpty()) {
-                producer.beginTransaction();
-
-                try {
-                    for (ConsumerRecord<String, String> record : records) {
-                        String transformed = transformer.apply(record.value());
-                        producer.send(new ProducerRecord<>(outputTopic, record.key(), transformed));
-                    }
-
-                    // Commit consumer offsets in transaction
-                    Map<TopicPartition, OffsetAndMetadata> offsets = getOffsetsToCommit(records);
-                    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
-
-                    producer.commitTransaction();
-                } catch (Exception e) {
-                    producer.abortTransaction();
-                }
-            }
-        }
-    }
-}
-```
-
-### 3. Multi-Region Replication
+### Producer and consumer (require a broker)
 
 ```python
-class MirrorMakerConfig:
-    """Configuration for Kafka MirrorMaker 2.0 replication"""
+from streaming.config import ProducerConfig, ConsumerConfig
+from streaming.producer import StreamingProducer
+from streaming.consumer import StreamingConsumer
 
-    def __init__(self):
-        self.clusters = {}
-        self.replications = []
+producer = StreamingProducer(ProducerConfig(bootstrap_servers="localhost:9092"))
+producer.produce(topic="raw.events", key="u-1", value=raw)
+producer.flush()
 
-    def add_cluster(
-        self,
-        name: str,
-        bootstrap_servers: str,
-        config: Dict[str, str] = None
-    ) -> 'MirrorMakerConfig':
-        self.clusters[name] = {
-            'bootstrap.servers': bootstrap_servers,
-            **(config or {})
-        }
-        return self
-
-    def add_replication(
-        self,
-        source: str,
-        target: str,
-        topics: str = ".*",
-        config: Dict[str, str] = None
-    ) -> 'MirrorMakerConfig':
-        self.replications.append({
-            'source': source,
-            'target': target,
-            'topics': topics,
-            'config': config or {}
-        })
-        return self
-
-    def generate_config(self) -> str:
-        """Generate MirrorMaker 2.0 configuration file"""
-        config_lines = []
-
-        # Cluster configurations
-        for name, cluster_config in self.clusters.items():
-            for key, value in cluster_config.items():
-                config_lines.append(f"{name}.{key} = {value}")
-
-        # Replication configurations
-        for repl in self.replications:
-            prefix = f"{repl['source']}->{repl['target']}"
-            config_lines.append(f"{prefix}.enabled = true")
-            config_lines.append(f"{prefix}.topics = {repl['topics']}")
-
-            for key, value in repl['config'].items():
-                config_lines.append(f"{prefix}.{key} = {value}")
-
-        return "\n".join(config_lines)
+consumer = StreamingConsumer(ConsumerConfig(bootstrap_servers="localhost:9092",
+                                            group_id="demo"))
+consumer.subscribe(["raw.events"])
+consumer.consume(handler=lambda msg: print(msg.key, msg.offset),
+                 commit_interval=100)
 ```
 
-### 4. Log Compaction
+### Flink job builder and anomaly detection
 
 ```python
-class CompactedTopicManager:
-    """Manage compacted topics for materialized views"""
+from streaming.flink_jobs import create_simple_pipeline
+from streaming.anomaly_detection import StreamingAnomalyDetector
 
-    def create_compacted_topic(
-        self,
-        topic: str,
-        partitions: int,
-        config: Dict[str, str] = None
-    ):
-        """Create a compacted topic"""
-        default_config = {
-            'cleanup.policy': 'compact',
-            'min.cleanable.dirty.ratio': '0.1',
-            'delete.retention.ms': '86400000',  # 1 day
-            'segment.ms': '604800000',  # 7 days
-            'min.compaction.lag.ms': '0',
-        }
-        default_config.update(config or {})
+builder = create_simple_pipeline(
+    job_name="passthrough", source_topic="in", sink_topic="out",
+    bootstrap_servers="localhost:9092", group_id="flink-demo",
+)
+spec = builder.build()               # job-spec dict
+code = builder.generate_pyflink_code()   # PyFlink DDL string
 
-        admin_client.create_topics([
-            NewTopic(topic, partitions, replication_factor=3, config=default_config)
-        ])
-
-    def tombstone(self, topic: str, key: str):
-        """Send tombstone (null value) to delete key"""
-        producer.send(ProducerRecord(topic, key, None))
+detector = StreamingAnomalyDetector(z_threshold=3.0, min_samples=30)
+for v in stream_of_values:
+    event = detector.process("latency_ms", v)
+    if event:
+        print(event.severity, event.score)
 ```
 
----
+### Key exports
 
-## Performance Considerations
-
-### Kafka Tuning
-
-```python
-# High-throughput producer configuration
-producer_config = {
-    'bootstrap.servers': 'kafka:9092',
-
-    # Batching
-    'batch.size': 65536,  # 64KB batches
-    'linger.ms': 50,  # Wait up to 50ms for batching
-
-    # Compression (lz4 for speed, zstd for ratio)
-    'compression.type': 'lz4',
-
-    # Buffer
-    'buffer.memory': 67108864,  # 64MB buffer
-
-    # Reliability
-    'acks': 'all',
-    'enable.idempotence': True,
-    'max.in.flight.requests.per.connection': 5,
-    'retries': 2147483647,
-    'delivery.timeout.ms': 120000,
-}
-
-# Low-latency producer configuration
-low_latency_config = {
-    'batch.size': 0,  # No batching
-    'linger.ms': 0,
-    'acks': 1,  # Leader ack only
-}
-
-# High-throughput consumer configuration
-consumer_config = {
-    'fetch.min.bytes': 1048576,  # 1MB min fetch
-    'fetch.max.wait.ms': 500,
-    'max.partition.fetch.bytes': 10485760,  # 10MB per partition
-    'max.poll.records': 1000,
-}
+```
+Config:     KafkaConfig, ProducerConfig, ConsumerConfig, FlinkConfig,
+            TopicConfig, SchemaRegistryConfig, StreamingPlatformConfig
+Producer:   StreamingProducer, TransactionalProducer, TopicManager, DeliveryReport
+Consumer:   StreamingConsumer, ConsumerGroup, Message
+Serializers: AvroSerializer, AvroDeserializer, JsonSerializer, JsonDeserializer,
+            create_event_serializer, create_event_deserializer
+Windowing:  Window, WindowedValue, TumblingWindowAssigner, SlidingWindowAssigner,
+            SessionWindowAssigner, Watermark, WatermarkGenerator,
+            BoundedOutOfOrdernessGenerator, WindowOperator, AggregationResult
+State:      StateBackend, InMemoryStateBackend, ValueState, ListState, MapState,
+            TimerService, Timer, CheckpointCoordinator, StateContext
+Patterns:   Deduplicator, Debouncer, Session, SessionProcessor, Pattern,
+            PatternMatch, CEPEngine, StreamJoiner, JoinConfig, IntervalJoiner
+Enterprise: SchemaRegistry, MirrorMaker, CompactedTopicManager, MetricsCollector,
+            AlertManager, FlinkAutoscaler, SavepointManager, AutoscalingController
+Anomaly:    AnomalyType, AlertSeverity, AnomalyEvent, RollingStatistics,
+            StatisticalDetector, ExponentialMovingAverageDetector,
+            ThresholdDetector, AnomalyAlerter, StreamingAnomalyDetector
 ```
 
-### Flink Optimization
+## Performance
 
-```java
-// Memory configuration
-Configuration config = new Configuration();
-config.set(TaskManagerOptions.MANAGED_MEMORY_SIZE, MemorySize.ofMebiBytes(1024));
-config.set(TaskManagerOptions.NETWORK_MEMORY_MIN, MemorySize.ofMebiBytes(64));
-config.set(TaskManagerOptions.NETWORK_MEMORY_MAX, MemorySize.ofMebiBytes(256));
+Because the processing layer is deliberately in-process, its performance is dominated
+by the data-structure choices rather than network or disk I/O. The design targets are
+qualitative and grounded in the implementation:
 
-// Parallelism tuning
-env.setParallelism(16);  // Match Kafka partitions
-env.setMaxParallelism(128);  // Allow scaling
+- **Producer reliability without collapsing throughput.** The default config keeps
+  idempotence and `acks=all` on while batching with `linger.ms=10`,
+  `batch.size=16384`, and `lz4` compression, and allows up to 5 in-flight requests per
+  connection — the maximum the idempotent producer supports while preserving ordering.
+  The buffer-full path flushes and retries rather than dropping records, trading a
+  brief stall for durability.
 
-// State backend tuning for RocksDB
-EmbeddedRocksDBStateBackend backend = new EmbeddedRocksDBStateBackend();
-backend.setNumberOfTransferThreads(4);
-backend.setNumberOfTransferingThreads(4);
+- **Consumer batch amortization.** `consume_batch()` pulls up to `num_messages` per
+  call and `consume()` commits only every `commit_interval` messages, amortizing the
+  commit round-trip. Manual commit at `read_committed` isolation is what makes
+  exactly-once end-to-end processing possible.
 
-// Checkpoint optimization
-CheckpointConfig checkpointConfig = env.getCheckpointConfig();
-checkpointConfig.setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
-checkpointConfig.setMinPauseBetweenCheckpoints(30000);
-checkpointConfig.setCheckpointTimeout(60000);
-checkpointConfig.setMaxConcurrentCheckpoints(1);
+- **Window operator memory.** State is a two-level dict keyed by
+  `key -> {window_start -> WindowState}`. Fired windows are deleted immediately after
+  emission in `_fire_windows()`, so memory is bounded by the number of open (not yet
+  watermark-passed) windows per key rather than by total event volume. Window firing
+  is O(open windows per key) per watermark advance.
 
-// Unaligned checkpoints for backpressure tolerance
-checkpointConfig.enableUnalignedCheckpoints();
-```
+- **Rolling statistics.** `RollingStatistics` keeps count/sum/sum-of-squares in O(1)
+  per update for mean and variance, while median and MAD are computed from a bounded
+  `deque` (default `maxlen` 1000), giving O(window log window) per computation with a
+  fixed memory ceiling regardless of stream length.
 
-### Partitioning Strategy
+- **Deduplication and join buffers.** `Deduplicator` evicts IDs older than `window_ms`
+  on every check, and `StreamJoiner._cleanup_buffer()` prunes events older than twice
+  the join window, keeping both structures bounded by the configured time window.
 
-```python
-class PartitioningStrategy:
-    """Strategies for distributing messages across partitions"""
-
-    @staticmethod
-    def by_key(key: str, num_partitions: int) -> int:
-        """Default: hash-based partitioning by key"""
-        return hash(key) % num_partitions
-
-    @staticmethod
-    def round_robin(counter: int, num_partitions: int) -> int:
-        """Round-robin for even distribution (no ordering)"""
-        return counter % num_partitions
-
-    @staticmethod
-    def by_timestamp(timestamp: int, num_partitions: int, bucket_ms: int) -> int:
-        """Time-bucket partitioning"""
-        bucket = timestamp // bucket_ms
-        return bucket % num_partitions
-
-    @staticmethod
-    def sticky(current_partition: int, batch_full: bool, num_partitions: int) -> int:
-        """Sticky partitioning for better batching"""
-        if batch_full:
-            return (current_partition + 1) % num_partitions
-        return current_partition
-```
-
----
-
-## Stretch Goals
-
-### 1. Real-Time Anomaly Detection
-
-```python
-class AnomalyDetector:
-    """Streaming anomaly detection using statistical methods"""
-
-    def __init__(self, window_size: int = 1000, num_std: float = 3.0):
-        self.window_size = window_size
-        self.num_std = num_std
-
-    def create_detector(self, env: StreamExecutionEnvironment):
-        """Create Flink anomaly detection job"""
-        events = env.from_source(kafka_source, watermark_strategy, "events")
-
-        # Calculate rolling statistics
-        stats = events \
-            .key_by(lambda e: e.metric_name) \
-            .window(SlidingEventTimeWindows.of(Time.minutes(10), Time.minutes(1))) \
-            .aggregate(StatisticsAggregator())
-
-        # Detect anomalies
-        anomalies = events \
-            .connect(stats.broadcast(StateBroadcastDescriptor())) \
-            .process(AnomalyProcessFunction(self.num_std))
-
-        return anomalies
-
-class AnomalyProcessFunction(KeyedBroadcastProcessFunction):
-    """Detect anomalies based on broadcast statistics"""
-
-    def process_element(self, value, ctx, out):
-        # Get statistics from broadcast state
-        stats = ctx.get_broadcast_state(self.stats_descriptor).get(value.metric_name)
-
-        if stats:
-            z_score = abs(value.value - stats.mean) / stats.stddev
-
-            if z_score > self.num_std:
-                out.collect(Anomaly(
-                    metric_name=value.metric_name,
-                    value=value.value,
-                    expected_range=(
-                        stats.mean - self.num_std * stats.stddev,
-                        stats.mean + self.num_std * stats.stddev
-                    ),
-                    z_score=z_score,
-                    timestamp=value.timestamp
-                ))
-
-    def process_broadcast_element(self, value, ctx, out):
-        # Update statistics
-        ctx.get_broadcast_state(self.stats_descriptor).put(value.metric_name, value)
-```
-
-### 2. Elastic Autoscaling
-
-```python
-class FlinkAutoscaler:
-    """Autoscale Flink job based on metrics"""
-
-    def __init__(self, flink_client: FlinkRestClient):
-        self.client = flink_client
-        self.metrics_history = []
-
-    def calculate_desired_parallelism(
-        self,
-        job_id: str,
-        current_parallelism: int
-    ) -> int:
-        """Calculate desired parallelism based on backpressure and throughput"""
-        metrics = self.client.get_job_metrics(job_id)
-
-        # Get backpressure metrics
-        backpressure = metrics.get('backpressure', 0)
-
-        # Get throughput metrics
-        input_rate = metrics.get('numRecordsInPerSecond', 0)
-        output_rate = metrics.get('numRecordsOutPerSecond', 0)
-
-        # Get consumer lag from Kafka
-        consumer_lag = self._get_consumer_lag(job_id)
-
-        # Scaling logic
-        if backpressure > 0.5 or consumer_lag > 100000:
-            # Scale up
-            return min(current_parallelism * 2, self.max_parallelism)
-        elif backpressure < 0.1 and consumer_lag < 1000:
-            # Scale down
-            return max(current_parallelism // 2, self.min_parallelism)
-
-        return current_parallelism
-
-    def rescale(self, job_id: str, new_parallelism: int):
-        """Rescale job with savepoint"""
-        # Take savepoint
-        savepoint_path = self.client.trigger_savepoint(job_id)
-
-        # Stop job
-        self.client.cancel_job(job_id)
-
-        # Restart with new parallelism
-        self.client.run_job(
-            job_id,
-            savepoint_path=savepoint_path,
-            parallelism=new_parallelism
-        )
-```
-
----
+The docker-compose stack (Kafka, Schema Registry, and an optional Flink cluster) exists
+to exercise the transport layer against a real broker; the repository does not ship
+recorded throughput or latency benchmarks, so no specific msgs/sec or p99 numbers are
+claimed here.
 
 ## Testing Strategy
 
-### Unit Tests
+Tests live under `tests/` as seven pytest modules. `conftest.py` prepends `src/` to
+`sys.path` and uses `pytest_collection_modifyitems` to skip the entire suite when
+`confluent_kafka` is not importable, so the library dependency is a hard gate but
+missing brokers are not.
 
-```python
-import pytest
-from unittest.mock import Mock, patch
-from testcontainers.kafka import KafkaContainer
+- **`test_producer.py`** covers `DeliveryReport` accounting, `StreamingProducer`
+  produce / batch / flush / poll behavior, transaction methods, `TransactionalProducer`,
+  `TopicManager` topic lifecycle, and `ProducerConfig` mapping. The underlying
+  `confluent_kafka.Producer` is mocked, so these run without a broker.
 
-@pytest.fixture(scope="module")
-def kafka_container():
-    with KafkaContainer() as kafka:
-        yield kafka
+- **`test_consumer.py`** covers `Message` wrapping, the `RebalanceListener` commit-on-
+  revoke path, `StreamingConsumer` poll / batch / continuous-consume / commit / seek /
+  pause-resume behavior, `ConsumerGroup`, and `ConsumerConfig` mapping — again against
+  a mocked consumer.
 
-class TestProducer:
-    def test_sends_message_to_kafka(self, kafka_container):
-        producer = StreamingProducerClient(ProducerConfig(
-            bootstrap_servers=kafka_container.get_bootstrap_server()
-        ))
+- **`test_windowing.py`** unit-tests each window assigner (tumbling alignment, sliding
+  overlap, session merging), the watermark generators including the idle-aware variant,
+  and the `WindowOperator` firing semantics (elements buffer, windows fire only on
+  `advance_watermark`, multiple keys and multiple windows).
 
-        producer.send("test-topic", "key", {"field": "value"})
-        producer.flush()
+- **`test_state.py`** exercises `InMemoryStateBackend`, all three keyed state types,
+  `TimerService` event- and processing-time firing, `CheckpointCoordinator`
+  trigger / complete / restore, `StateContext`, and a state-integration scenario.
 
-        # Verify message
-        consumer = create_consumer(kafka_container.get_bootstrap_server())
-        messages = list(consumer.consume("test-topic", timeout=5.0))
-        assert len(messages) == 1
-        assert messages[0].key == "key"
+- **`test_exactly_once.py`** validates the idempotent producer, transactional
+  exactly-once produce, consumer read-committed behavior, deduplication,
+  checkpoint-based exactly-once, an end-to-end exactly-once path, schema-registry
+  interaction, and delivery guarantees.
 
-class TestFlinkProcessing:
-    def test_window_aggregation(self):
-        env = StreamExecutionEnvironment.get_execution_environment()
-        env.set_parallelism(1)
+- **`test_patterns.py`** covers `Deduplicator`, `Debouncer`, `Session` /
+  `SessionProcessor`, the `Pattern` builder and `CEPEngine`, `StreamJoiner`,
+  `IntervalJoiner`, and a patterns-integration scenario.
 
-        # Create test data
-        test_events = [
-            Event("user1", 100, 1000),
-            Event("user1", 200, 2000),
-            Event("user2", 50, 1500),
-        ]
+- **`test_integration.py`** runs end-to-end pipelines against an in-process
+  `MockKafkaCluster` (with `MockStreamingProducer` / `MockStreamingConsumer`) when a
+  real broker or Testcontainers is unavailable. It covers produce/consume,
+  multi-topic and partition ordering, consumer-group offset tracking, transactional
+  commit / abort, failure recovery (restart from committed offset), rebalancing,
+  schema evolution, metrics, windowed processing, and deduplication.
 
-        # Process
-        result = env.from_collection(test_events) \
-            .key_by(lambda e: e.user_id) \
-            .window(TumblingEventTimeWindows.of(Time.seconds(5))) \
-            .aggregate(SumAggregator()) \
-            .execute_and_collect()
-
-        # Verify
-        results = list(result)
-        assert len(results) == 2
-```
-
-### Integration Tests
-
-```python
-class TestEndToEndPipeline:
-    @pytest.fixture
-    def streaming_env(self, kafka_container, flink_cluster):
-        return StreamingTestEnvironment(kafka_container, flink_cluster)
-
-    def test_exactly_once_delivery(self, streaming_env):
-        """Verify exactly-once semantics end-to-end"""
-        # Produce messages
-        producer = streaming_env.create_producer()
-        for i in range(1000):
-            producer.send("input", f"key-{i}", {"value": i})
-        producer.flush()
-
-        # Run Flink job
-        job = streaming_env.submit_job("exactly_once_job.jar")
-
-        # Wait for processing
-        streaming_env.wait_for_job_completion(job)
-
-        # Verify output
-        consumer = streaming_env.create_consumer()
-        output = list(consumer.consume("output", timeout=30.0))
-
-        # Check no duplicates
-        keys = [msg.key for msg in output]
-        assert len(keys) == len(set(keys)), "Duplicates found"
-        assert len(keys) == 1000, f"Expected 1000 messages, got {len(keys)}"
-
-    def test_failure_recovery(self, streaming_env):
-        """Verify recovery from failures"""
-        # Start job
-        job = streaming_env.submit_job("stateful_job.jar")
-
-        # Produce some messages
-        producer = streaming_env.create_producer()
-        for i in range(500):
-            producer.send("input", f"key-{i}", {"value": i})
-        producer.flush()
-
-        # Wait for checkpoint
-        streaming_env.wait_for_checkpoint(job)
-
-        # Kill task manager
-        streaming_env.kill_task_manager()
-
-        # Produce more messages
-        for i in range(500, 1000):
-            producer.send("input", f"key-{i}", {"value": i})
-        producer.flush()
-
-        # Wait for recovery and completion
-        streaming_env.wait_for_job_completion(job)
-
-        # Verify all messages processed
-        consumer = streaming_env.create_consumer()
-        output = list(consumer.consume("output", timeout=30.0))
-        assert len(output) == 1000
-```
-
-### Performance Tests
-
-```python
-class TestPerformance:
-    def test_throughput(self, streaming_env):
-        """Measure sustained throughput"""
-        producer = streaming_env.create_producer()
-
-        # Produce 1M messages
-        start = time.time()
-        for i in range(1_000_000):
-            producer.send("input", f"key-{i}", {"value": i})
-        producer.flush()
-        produce_time = time.time() - start
-
-        throughput = 1_000_000 / produce_time
-        print(f"Producer throughput: {throughput:.0f} msgs/sec")
-        assert throughput > 100_000  # At least 100K msgs/sec
-
-    def test_latency_p99(self, streaming_env):
-        """Measure end-to-end latency"""
-        latencies = []
-
-        for i in range(1000):
-            start = time.time()
-            producer.send("input", f"key-{i}", {"value": i, "ts": start})
-            producer.flush()
-
-            # Consume output
-            msg = consumer.consume_one("output", timeout=5.0)
-            end = time.time()
-
-            latencies.append(end - start)
-
-        p99 = np.percentile(latencies, 99)
-        print(f"P99 latency: {p99*1000:.0f}ms")
-        assert p99 < 1.0  # Less than 1 second
-```
-
----
-
-## Implementation Phases
-
-### Phase 1: Foundation (Weeks 1-2)
-- Set up Kafka/Redpanda cluster
-- Implement producer and consumer APIs
-- Basic Flink job structure
-- Simple streaming pipeline
-
-### Phase 2: Core Streaming (Weeks 3-4)
-- Watermark and event-time handling
-- Window operations (tumbling, sliding, session)
-- State management
-- Exactly-once checkpointing
-
-### Phase 3: Advanced Patterns (Weeks 5-6)
-- Debouncing and deduplication
-- Sessionization
-- Complex event processing
-- Stream-stream joins
-
-### Phase 4: Enterprise Features (Weeks 7-8)
-- Schema registry integration
-- Exactly-once sinks
-- Multi-region replication
-- Log compaction
-
-### Phase 5: Stretch Goals (Weeks 9-10)
-- Real-time anomaly detection
-- Elastic autoscaling
-- Performance optimization
-- Production hardening
-
----
+The overall approach is: pure event-time logic is tested directly and deterministically
+in-process; transport code is tested against mocks; and the integration module falls
+back to a mock cluster so the full pipeline can be exercised anywhere.
 
 ## References
 
 - [Apache Kafka Documentation](https://kafka.apache.org/documentation/)
 - [Apache Flink Documentation](https://flink.apache.org/docs/)
-- [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/)
-- [Designing Data-Intensive Applications](https://dataintensive.net/)
-- [Streaming Systems Book](https://www.oreilly.com/library/view/streaming-systems/9781491983867/)
+- [Confluent Schema Registry — Wire Format](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#wire-format)
+- [Kafka Transactions and Exactly-Once Semantics (KIP-98)](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging)
+- Tyler Akidau, Slava Chernyak, Reuven Lax — *Streaming Systems* (O'Reilly)
+- Martin Kleppmann — *Designing Data-Intensive Applications* (O'Reilly)
+- [MirrorMaker 2.0 (KIP-382)](https://cwiki.apache.org/confluence/display/KAFKA/KIP-382%3A+MirrorMaker+2.0)
