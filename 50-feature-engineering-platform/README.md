@@ -1,51 +1,169 @@
 # Feature Engineering Platform
 
-A production-grade ML feature engineering platform providing feature transformations, an online/offline feature store, DAG-based pipelines, feature validation, drift detection, and a REST API for serving.
+An ML feature engineering platform built from scratch in Python: a library of fit/transform
+feature transformers, an online/offline feature store with a registry, a DAG-based pipeline
+engine, schema/statistical/drift validation, feature discovery, and a FastAPI serving layer.
 
-> **Status:** reference implementation / teaching scaffold built to a strong blueprint — not production-grade. See [../PROJECTS_STATUS.md](../PROJECTS_STATUS.md) and the [2026-06 audit](../../docs/AUDIT_2026-06_public-readiness.md).
+## Features
 
-> **Concepts covered:** §03 Feature stores · §03 MLOps · §03 ML monitoring (drift detection) · §02 Data pipelines. Pairs with [P04 ML Training Orchestrator](../04-ml-training-orchestrator/) and [P09 Data Observability](../09-data-observability/). See [CONCEPT_TO_PROJECT_MAP.md](../CONCEPT_TO_PROJECT_MAP.md).
+- **Transformer library** — numeric (`StandardScaler`, `MinMaxScaler`, `RobustScaler`, `LogTransformer`, `PowerTransformer`, `Binner`, `QuantileTransformer`, `Normalizer`), categorical (one-hot, label, ordinal, target, frequency, binary, hashing), temporal (`DatePartsExtractor`, `CyclicalEncoder`, `RollingWindowFeatures`, `LagFeatures`, and more), and text (`TfidfVectorizer`, `CountVectorizer`, `HashingVectorizer`, `NGramExtractor`) — all sharing a `BaseTransformer` fit/transform/serialize contract.
+- **Composite transformers** — `Pipeline`, `FeatureUnion`, `ColumnTransformer`, and `SequentialTransformer` compose transformers (`transformers/composite.py`).
+- **Feature store facade** — `FeatureStore` unifies a registry, offline store, and online store behind `apply`, `write_to_offline_store`, `write_to_online_store`, `materialize`, `get_online_features`, `get_historical_features`, and `get_feature_vector` (`store/feature_store.py`).
+- **Offline + online stores** — `ParquetOfflineStore`/`DuckDBOfflineStore` for batch features and point-in-time joins; `InMemoryOnlineStore`/`RedisOnlineStore` for low-latency serving with TTLs.
+- **Feature registry** — `FeatureRegistry` stores entities, feature views, versions, and lineage and backs feature search.
+- **DAG pipelines** — `DAG`/`DAGExecutor` provide cycle detection, topological sort, level-based parallel execution, retries, and skip-on-failure (`pipeline/dag.py`).
+- **Validation** — `SchemaValidator`, `StatisticalValidator`, and a `DriftDetector` supporting PSI, KS, Chi-squared, Jensen-Shannon, and Wasserstein methods (`validation/`).
+- **Advanced drift** — streaming concept-drift detectors `DDMDetector`, `ADWINDetector`, `CUSUMDetector`, plus `WindowedDriftMonitor` and `MultivariateDriftDetector` (`validation/advanced_drift.py`).
+- **Discovery** — `FeatureSearchEngine`, `FeatureSimilarityEngine`, and `FeatureRecommender` for finding and recommending features.
+- **REST API** — FastAPI app exposing feature-view CRUD, online/historical serving, materialization, statistics, search, and validation (`api/main.py`).
 
----
+## Architecture
 
-## What's real vs simulated
-
-The core feature transformations (numeric, categorical, temporal, text), the offline store (DuckDB/Parquet), the in-memory online store, the feature registry, DAG pipeline execution, and drift detection are all fully implemented. The **Phase 5 ML framework wrappers** (scikit-learn Pipeline adapters, PyTorch Dataset integration, TensorFlow `tf.data` connectors) are not yet written — this is a known gap noted in [PROJECTS_STATUS.md](../PROJECTS_STATUS.md). Everything else in the blueprint is present.
-
----
-
-## Layout
-
+```mermaid
+flowchart TD
+    API[FastAPI app] --> FS[FeatureStore facade]
+    LIB[Transformer library] --> PIPE[DAG pipeline engine]
+    FS --> REG[FeatureRegistry]
+    FS --> OFF[(Offline store: Parquet / DuckDB)]
+    FS --> ON[(Online store: in-memory / Redis)]
+    OFF --> MAT[materialize]
+    MAT --> ON
+    FS --> VAL[Validation: schema / statistical / drift]
+    FS --> DISC[Discovery: search / similarity / recommend]
+    PIPE --> FS
 ```
-src/feature_platform/
-  api/            FastAPI REST endpoints for feature serving
-  core/           Feature definitions and base types
-  discovery/      Feature search and lineage
-  monitoring/     Drift detection, alerting, statistics
-  pipeline/       DAG execution engine
-  store/          Online (in-memory/Redis) and offline (DuckDB) stores
-  transformers/   Numeric, categorical, temporal, and text transformers
-  validation/     Schema and statistical validation, advanced drift
 
-tests/            ~274 tests across 7 files
-BLUEPRINT.md      Full technical design
-docs/             API and architecture documentation
-```
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Core models | `core/models.py` | `Entity`, `Feature`, `FeatureView`, `FeatureVector`, `DataType` |
+| Transformers | `transformers/` | fit/transform numeric, categorical, temporal, text, composite |
+| Feature store | `store/` | registry, offline/online stores, store facade |
+| Pipeline | `pipeline/` | DAG construction and execution |
+| Validation | `validation/` | schema, statistical, drift, advanced drift |
+| Discovery | `discovery/` | search, similarity, recommendations |
+| API | `api/` | FastAPI endpoints and request/response models |
 
----
+## Quick Start
 
-## Build and run
+### Prerequisites
+
+- Python 3.9+
+- Core dependencies (NumPy, SciPy, scikit-learn, pandas, pydantic, FastAPI) install with the
+  package. DuckDB and Redis are optional; the defaults are Parquet offline and in-memory online.
+
+### Installation
 
 ```bash
-conda activate dev
-cd 06-real-world-projects/50-feature-engineering-platform
 pip install -e ".[dev]"
+```
+
+### Running
+
+```bash
+# Run the REST API
+uvicorn feature_platform.api.main:app --reload
+# Interactive docs at http://localhost:8000/docs
+```
+
+## Usage
+
+Transform features with the library:
+
+```python
+import numpy as np
+from feature_platform import StandardScaler, OneHotEncoder, Pipeline
+
+X = np.array([[1.0], [2.0], [3.0], [4.0]])
+scaler = StandardScaler()
+scaled = scaler.fit_transform(X)          # zero mean, unit variance
+original = scaler.inverse_transform(scaled)
+```
+
+Register and serve features through the store:
+
+```python
+from datetime import timedelta
+from feature_platform import Entity, Feature, FeatureView, FeatureStore
+
+store = FeatureStore()  # Parquet offline + in-memory online by default
+
+user = Entity(name="user", join_keys=["user_id"])
+view = FeatureView(
+    name="user_features",
+    entities=[user],
+    schema=[Feature("age", dtype="float64"), Feature("total_purchases", dtype="float64")],
+    ttl=timedelta(days=1),
+)
+store.apply([user, view])
+
+store.write_to_online_store(
+    feature_view="user_features",
+    entity_id={"user_id": 1},
+    features={"age": 34.0, "total_purchases": 12.0},
+)
+
+result = store.get_online_features(
+    feature_refs=["user_features:age", "user_features:total_purchases"],
+    entity_ids={"user_id": [1]},
+)
+```
+
+Detect drift between a reference and current sample:
+
+```python
+import numpy as np
+from feature_platform import DriftDetector, DriftMethod
+
+ref = np.random.normal(0, 1, 1000)
+cur = np.random.normal(0.5, 1, 1000)
+detector = DriftDetector()
+result = detector.detect(ref, cur, method=DriftMethod.KS, column="x")
+print(result.is_drifted, result.score)
+```
+
+## What's Real vs Simulated
+
+- **Real:** All transformers (numeric, categorical, temporal, text, composite) with
+  fit/transform/inverse-transform and state serialization; the Parquet offline store and
+  in-memory online store; the feature registry and `FeatureStore` facade including
+  materialization and point-in-time retrieval; the DAG engine (cycle detection, topological
+  sort, parallel levels, retries); schema/statistical validation; PSI/KS/Chi-squared/JS/
+  Wasserstein drift and the streaming DDM/ADWIN/CUSUM detectors; discovery search, similarity,
+  and recommendations; and the full FastAPI surface.
+- **Simulated / requires credentials:** The Redis online store and DuckDB offline store require
+  those services/packages (the in-memory and Parquet implementations are the defaults). There
+  are no scikit-learn `Pipeline` adapters or PyTorch/TensorFlow dataset connectors — the
+  transformers are self-contained NumPy implementations rather than wrappers. `FeatureSource`
+  describes table/file/stream/api sources but does not connect to external warehouses.
+
+## Testing
+
+```bash
 pytest tests/ -v
 ```
 
-To run with the REST API:
+The suite has 264 tests across 7 files covering numeric, categorical, temporal, and text
+transformers, advanced drift detectors, feature discovery, and the REST API. The API tests
+need `httpx` (Starlette's test client); transformer and drift tests need only the core
+dependencies.
 
-```bash
-pip install -e ".[full]"
-uvicorn feature_platform.api.main:app --reload
+## Project Structure
+
 ```
+50-feature-engineering-platform/
+  src/feature_platform/
+    api/          # FastAPI app and request/response models
+    core/         # Entity, Feature, FeatureView, config
+    discovery/    # search, similarity, recommendations
+    monitoring/   # metrics and alerts
+    pipeline/     # DAG construction and execution
+    store/        # registry, offline/online stores, facade
+    transformers/ # numeric, categorical, temporal, text, composite
+    validation/   # schema, statistical, drift, advanced drift
+  tests/          # 264 tests across 7 files
+  docs/BLUEPRINT.md   # Full architecture and design
+```
+
+## License
+
+MIT — see ../LICENSE

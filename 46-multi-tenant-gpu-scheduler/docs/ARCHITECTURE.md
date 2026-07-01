@@ -6,34 +6,33 @@ The Multi-Tenant GPU Scheduler is a Kubernetes-inspired GPU resource management 
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     API Layer                            │
-│                 (Job Submission, Management)              │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────┐
-│                  Scheduler Core                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │Queue Manager │  │GPU Scheduler │  │  Preemption  │ │
-│  │              │  │              │  │   Manager    │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘ │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────┐
-│                  Resource Layer                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │  Allocator   │  │   Cluster    │  │   Monitor    │ │
-│  │              │  │    State     │  │              │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘ │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────┐
-│                  Infrastructure                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │    Nodes     │  │     GPUs     │  │   Storage    │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘ │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    API[API Layer - Job Submission, Management]
+    subgraph Scheduler Core
+        QM[Queue Manager]
+        GS[GPU Scheduler]
+        PM[Preemption Manager]
+    end
+    subgraph Resource Layer
+        AL[Allocator]
+        CS[Cluster State]
+        MO[Monitor]
+    end
+    subgraph Infrastructure
+        ND[Nodes]
+        GP[GPUs]
+        ST[Storage]
+    end
+    API --> QM
+    API --> GS
+    API --> PM
+    QM --> AL
+    GS --> CS
+    PM --> MO
+    AL --> ND
+    CS --> GP
+    MO --> ST
 ```
 
 ## Core Components
@@ -224,12 +223,3 @@ monitor:
     gpu_temp_threshold: 85
     utilization_threshold: 90
 ```
-
-## Future Enhancements
-
-1. **Distributed Scheduling**: Multiple scheduler instances for HA
-2. **Advanced Preemption**: Checkpoint-restore support
-3. **Dynamic Pricing**: Cost-based scheduling
-4. **ML-based Prediction**: Workload completion time estimation
-5. **Federation**: Multi-cluster scheduling
-6. **GPU Virtualization**: Full GPU virtualization support

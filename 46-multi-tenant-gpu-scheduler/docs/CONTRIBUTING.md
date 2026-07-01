@@ -637,13 +637,6 @@ with scheduler_lock:
 
 ---
 
-## Getting Help
-
-- **Discord**: [Join our Discord server](https://discord.gg/gpu-scheduler)
-- **GitHub Discussions**: Ask questions and share ideas
-- **Stack Overflow**: Tag questions with `gpu-scheduler`
-- **Email**: gpu-scheduler-dev@example.com
-
 ## Recognition
 
 Contributors will be recognized in:

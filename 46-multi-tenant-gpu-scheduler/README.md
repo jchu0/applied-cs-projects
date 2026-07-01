@@ -1,293 +1,166 @@
 # Multi-Tenant GPU Scheduler
 
-A Kubernetes-inspired GPU resource scheduler designed for efficient multi-tenant GPU cluster management. This system provides fair-share scheduling, resource quotas, preemption support, and comprehensive monitoring for GPU workloads.
+A Kubernetes-inspired GPU cluster scheduler for multi-tenant ML workloads, built from scratch in Python. It models nodes, GPUs, pods, jobs, queues, and tenants, then schedules pods onto GPUs using a pluggable scoring pipeline that is topology-aware (NVLink, NUMA, PCIe), supports gang scheduling and preemption, and exposes four GPU partitioning modes (exclusive, MIG, time-sharing, MPS).
 
 ## Features
 
-- **Multi-Tenant Support**: Resource isolation and fair-share scheduling across tenants
-- **Advanced Scheduling**: Multiple scheduling algorithms including gang scheduling and preemption
-- **GPU Partitioning**: Support for MIG (Multi-Instance GPU), MPS, and time-sharing
-- **Resource Quotas**: Enforce GPU, memory, and job limits per tenant/queue
-- **Comprehensive Monitoring**: Real-time GPU metrics, health checks, and alerting
-- **High Availability**: Leader election and state replication for production deployments
-- **Extensible Architecture**: Plugin-based scheduling and allocation strategies
+- **Resource model** — physical GPUs, compute nodes, containers, pods, jobs, queues, and tenants as dataclasses (`gpusched.core.resources`).
+- **Plugin-based scheduling** — a filter/score pipeline with weighted plugins: `NodeAffinityPlugin`, `GPUResourcePlugin`, `BinPackingPlugin`, `SpreadingPlugin`, `FairSharePlugin`, and `TopologyPlugin` (`GPUScheduler`).
+- **Topology-aware placement** — NVLink connected-component detection, NUMA-local selection, and per-pattern communication-cost scoring (`GPUTopology`, `TopologyAwareGPUSelector`).
+- **Gang scheduling** — all-or-nothing placement for distributed jobs (`GPUScheduler.schedule_gang`).
+- **Preemption** — higher-priority pods can displace lower-priority preemptible pods (`PreemptionScheduler`, `PreemptionManager`).
+- **Multi-queue fair sharing** — weighted, per-queue priority queues drained proportionally (`QueueScheduler`).
+- **GPU partitioning** — exclusive, MIG (A100/H100 profiles), time-sharing, and MPS allocators behind a `HybridAllocator`.
+- **Quotas** — per-queue and per-tenant GPU quota admission control (`Queue.can_admit`, `QuotaManager`).
+- **Monitoring** — metrics collection, aggregation, health checks, alerting, and JSON/Prometheus export (`ClusterMonitor`, `MetricsCollector`, `AlertManager`).
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Sub(Job and Pod submission) --> Cluster(Cluster state)
+    Cluster --> Sched(GPUScheduler filter and score)
+    Sched --> Plugins(Scheduling plugins)
+    Sched --> Topo(GPUTopology and selector)
+    Sched --> Decision(SchedulingDecision)
+    Decision --> Alloc(HybridAllocator)
+    Alloc --> Modes(Exclusive MIG TimeShare MPS)
+    Cluster --> Mon(ClusterMonitor)
+    Mon --> Metrics(Metrics health alerts)
+```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Resource model | `core/resources.py` | GPU, Node, Pod, Job, Queue, Tenant, Cluster types and helpers |
+| Scheduler | `scheduler/scheduler.py` | Filter/score pipeline, gang scheduling, queue and preemption schedulers |
+| Topology | `scheduler/topology.py` | NVLink/NUMA/PCIe analysis and topology-aware GPU selection |
+| Allocator | `allocator/allocator.py` | Exclusive, MIG, time-share, MPS, and hybrid allocation |
+| Monitor | `monitor/monitor.py` | Metrics, aggregation, health checks, alerts, export |
 
 ## Quick Start
+
+### Prerequisites
+
+- Python 3.9+
+- No external services or GPUs are required; the scheduler operates on an in-memory cluster model and the tests run on CPU.
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-org/multi-tenant-gpu-scheduler.git
-cd multi-tenant-gpu-scheduler
-
-# Create virtual environment
 python -m venv venv
 source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-pip install -e .
+pip install -e ".[dev]"
 ```
 
-### Basic Usage
+### Running
+
+The package is a library, not a server. Import it and drive a cluster in process:
+
+```bash
+python -c "import gpusched; print(gpusched.__all__)"
+```
+
+## Usage
 
 ```python
-from gpusched.core.resources import Cluster, create_node, create_training_job
-from gpusched.scheduler.scheduler import GPUScheduler
+from gpusched import (
+    Cluster, GPUType, PriorityClass, GPUScheduler,
+    create_node, create_training_job,
+)
 
-# Create cluster
-cluster = Cluster("my-cluster")
-
-# Add nodes with GPUs
+# Build a cluster with one 8-GPU A100 node (DGX-style NVLink topology)
+cluster = Cluster(cluster_id="demo")
 node = create_node("gpu-server-01", num_gpus=8, gpu_type=GPUType.A100)
 cluster.add_node(node)
 
-# Create scheduler
-scheduler = GPUScheduler(cluster)
-
-# Submit a job
+# Submit a 4-GPU training job
 job = create_training_job(
     name="bert-training",
     num_gpus=4,
     gpu_memory_gb=60.0,
-    priority=PriorityClass.HIGH
+    priority=PriorityClass.HIGH,
 )
 cluster.submit_job(job)
 
-# Schedule the job
+# Run one scheduling cycle over all pending pods
+scheduler = GPUScheduler(cluster)
 decisions = scheduler.run_scheduling_cycle()
+for d in decisions:
+    print(d.pod_id, d.success, d.node_id, d.gpu_ids, round(d.score, 1))
 ```
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                     API Layer                            │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────┐
-│                  Scheduler Core                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │Queue Manager │  │GPU Scheduler │  │  Preemption  │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘ │
-└────────────────────────┬────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────┐
-│                  Resource Layer                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
-│  │  Allocator   │  │   Cluster    │  │   Monitor    │ │
-│  └──────────────┘  └──────────────┘  └──────────────┘ │
-└──────────────────────────────────────────────────────────┘
-```
-
-## Core Components
-
-### Resource Management
-- **GPU**: Physical GPU device tracking
-- **Node**: Compute nodes with multiple GPUs
-- **Pod/Container**: Workload units with resource requirements
-- **Job**: Collections of pods for training/inference
-- **Cluster**: Overall cluster state management
-
-### Scheduling Engine
-- **Plugins**: Modular scheduling logic (affinity, resources, bin-packing, fair-share)
-- **Queue Management**: Multi-queue scheduling with priorities
-- **Gang Scheduling**: All-or-nothing scheduling for distributed jobs
-- **Preemption**: High-priority jobs can preempt lower-priority ones
-
-### GPU Allocation
-- **Exclusive Mode**: Entire GPU for one workload
-- **Shared Mode**: Time-sharing between multiple workloads
-- **MIG Mode**: Hardware partitioning (A100/H100)
-- **MPS Mode**: CUDA-level sharing
-
-### Monitoring
-- **Metrics Collection**: GPU utilization, temperature, power, memory
-- **Health Checking**: Automatic detection of unhealthy GPUs/nodes
-- **Alerting**: Configurable alerts for various conditions
-- **Export**: Prometheus/Grafana integration
-
-## Examples
-
-### Multi-Tenant Setup
+Gang scheduling for a distributed job:
 
 ```python
-from gpusched.core.resources import Tenant, Queue
-
-# Create tenants
-ml_tenant = Tenant("ml-team", "Machine Learning Team", total_gpu_quota=32)
-research_tenant = Tenant("research", "Research Team", total_gpu_quota=16)
-
-# Create queues
-training_queue = Queue(
-    name="ml-training",
-    tenant_id="ml-team",
-    gpu_quota=24,
-    priority_weight=2.0
-)
-
-# Configure cluster
-cluster.tenants["ml-team"] = ml_tenant
-cluster.queues["ml-training"] = training_queue
+job = create_training_job(name="ddp", num_gpus=2, parallelism=4)
+job.gang_schedule = True          # all 4 pods must place together
+cluster.submit_job(job)
+decisions = scheduler.schedule_gang(job)
 ```
 
-### Gang Scheduling
+Realizing a decision through the allocation manager:
 
 ```python
-# Create distributed training job
-distributed_job = create_training_job(
-    name="distributed-bert",
-    num_gpus=2,
-    parallelism=4,  # 4 pods with 2 GPUs each
-)
-distributed_job.gang_schedule = True  # All pods must start together
+from gpusched.allocator.allocator import AllocationManager
 
-cluster.submit_job(distributed_job)
-decisions = scheduler.run_scheduling_cycle()
+pod = job.pods[0]
+decision = scheduler.schedule_pod(pod)
+manager = AllocationManager(cluster)
+allocs = manager.allocate_pod(pod, decision.node_id, decision.gpu_ids)
+manager.release_pod(pod.pod_id)
 ```
 
-### Custom Scheduling Plugin
+Shared partitioning via the hybrid allocator (time-sharing, MIG, and MPS modes
+take a list of candidate GPU IDs):
 
 ```python
-from gpusched.scheduler.scheduler import SchedulingPlugin
+from gpusched import HybridAllocator, AllocationMode
 
-class LocalityPlugin(SchedulingPlugin):
-    def name(self) -> str:
-        return "DataLocality"
-
-    def score(self, ctx, node):
-        # Prefer nodes with local data
-        if node.labels.get("has_dataset") == ctx.pod.labels.get("dataset"):
-            return 100.0
-        return 0.0
-
-scheduler.add_plugin(LocalityPlugin(), weight=1.5)
+allocator = HybridAllocator(cluster)
+allocs = allocator.allocate(pod, node, [g.gpu_id for g in node.gpus],
+                            mode=AllocationMode.SHARED)
 ```
+
+Monitoring a cluster:
+
+```python
+from gpusched import ClusterMonitor
+
+monitor = ClusterMonitor(cluster, allocator)
+dashboard = monitor.run_monitoring_cycle()
+print(monitor.export_metrics("prometheus"))
+```
+
+## What's Real vs Simulated
+
+- **Real:** the scheduling pipeline (filtering, weighted scoring, best-node selection), gang scheduling, queue fair-sharing, preemption candidate selection, NVLink/NUMA topology analysis and communication-cost scoring, all four allocation modes with MIG-profile fitting, quota admission, and the monitoring/metrics/alert logic. All of this runs purely in memory and is exercised by the test suite.
+- **Simulated / requires credentials:** there is no real GPU or driver integration. GPU utilization, temperature, and power are read from in-memory fields (defaulting to 0) rather than NVML; the optional `gpu` extra (`pynvml`, `gputil`) and `observability` extra (`prometheus-client`) are declared but not wired into live collection. Preemption "stops" jobs by mutating state, not by signalling real processes. Cluster state is in-process only — there is no persistence, networking, or leader election.
 
 ## Testing
 
-Run the comprehensive test suite:
-
 ```bash
-# Run all tests
-pytest tests/
-
-# Run with coverage
-pytest --cov=gpusched tests/
-
-# Run specific test module
-pytest tests/test_scheduler.py
-
-# Run integration tests
-pytest tests/test_integration.py -v
+pytest tests/ -v
+pytest --cov=gpusched tests/        # with coverage
 ```
 
-The test suite includes:
-- Unit tests for all major components
-- Integration tests for end-to-end workflows
-- Test fixtures and mocking utilities
-- 60%+ code coverage target
+The suite has 150 tests across resources, scheduler, topology, allocator, monitor, and end-to-end integration (`tests/test_integration.py`). No external services or GPUs are needed.
 
-## Configuration
+## Project Structure
 
-Create `config.yaml`:
-
-```yaml
-scheduler:
-  interval: 10  # seconds
-  plugins:
-    - name: NodeAffinity
-      weight: 1.0
-    - name: GPUResource
-      weight: 2.0
-    - name: BinPacking
-      weight: 1.5
-
-allocator:
-  mode: auto  # auto|exclusive|shared|mig
-  max_sharing_factor: 4
-
-monitor:
-  interval: 60
-  alerts:
-    gpu_temperature_threshold: 85
-    gpu_utilization_threshold: 90
 ```
-
-## Documentation
-
-- [Architecture](docs/ARCHITECTURE.md) - System design and components
-- [API Reference](docs/API.md) - Complete API documentation
-- [Deployment Guide](docs/DEPLOYMENT.md) - Production deployment instructions
-- [Contributing](docs/CONTRIBUTING.md) - How to contribute to the project
-
-## Performance
-
-- Schedule 1000+ pods per second
-- Support 10,000+ GPUs per cluster
-- Sub-second scheduling decisions
-- Minimal memory overhead (<100MB per 1000 pods)
-
-## Supported GPUs
-
-- NVIDIA A100 (40GB/80GB)
-- NVIDIA H100 (80GB)
-- NVIDIA V100 (16GB/32GB)
-- NVIDIA T4 (16GB)
-- NVIDIA A10G (24GB)
-- NVIDIA L4 (24GB)
-
-## Requirements
-
-- Python 3.8+
-- NVIDIA Driver 470.x+
-- CUDA 11.4+
-- Linux (Ubuntu 20.04+, RHEL 8+)
-
-## Production Deployment
-
-For production deployments, see the [Deployment Guide](docs/DEPLOYMENT.md) which covers:
-- High availability setup
-- Kubernetes deployment
-- Monitoring integration
-- Security hardening
-- Backup and recovery
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for:
-- Code style guidelines
-- Testing requirements
-- Pull request process
-- Development setup
+46-multi-tenant-gpu-scheduler/
+  README.md                    # this file
+  pyproject.toml               # package metadata and dev tooling
+  src/gpusched/
+    core/resources.py          # GPU, Node, Pod, Job, Queue, Tenant, Cluster
+    scheduler/scheduler.py     # plugins, GPUScheduler, queue and preemption schedulers
+    scheduler/topology.py      # NVLink/NUMA/PCIe analysis and selection
+    allocator/allocator.py     # exclusive, MIG, time-share, MPS, hybrid
+    monitor/monitor.py         # metrics, health, alerts, export
+  tests/                       # unit and integration tests
+  docs/BLUEPRINT.md            # full architecture and design
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Support
-
-- **GitHub Issues**: Report bugs and request features
-- **Discussions**: Ask questions and share ideas
-- **Documentation**: Check our comprehensive docs
-- **Email**: gpu-scheduler@example.com
-
-## Roadmap
-
-- [ ] Distributed scheduling across multiple schedulers
-- [ ] Advanced preemption with checkpoint/restore
-- [ ] Cost-based optimization
-- [ ] ML-based workload prediction
-- [ ] Multi-cluster federation
-- [ ] Enhanced GPU virtualization support
-
-## Acknowledgments
-
-- Inspired by Kubernetes scheduler design
-- Built on NVIDIA GPU management technologies
-- Community contributions and feedback
-
----
-
-Built with ❤️ for efficient GPU resource management
+MIT — see ../LICENSE
