@@ -168,4 +168,4 @@ The `unittest`-based suite covers the graph IR, symbolic tensors, the tracer, ea
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

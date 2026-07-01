@@ -190,4 +190,4 @@ Core route groups (full detail in [`docs/API.md`](docs/API.md)):
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
+MIT — see [LICENSE](../LICENSE)

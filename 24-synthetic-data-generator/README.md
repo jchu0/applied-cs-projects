@@ -193,4 +193,4 @@ fully offline against `MockProvider`; no API keys or external services are requi
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

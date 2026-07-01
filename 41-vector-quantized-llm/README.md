@@ -185,4 +185,4 @@ No external services or hardware are required.
 
 ## License
 
-MIT — see ../LICENSE.
+MIT — see [LICENSE](../LICENSE)

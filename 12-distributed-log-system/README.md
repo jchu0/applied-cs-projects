@@ -150,4 +150,4 @@ The suite has 178 test functions across `log_tests.rs` (segments, index, retenti
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

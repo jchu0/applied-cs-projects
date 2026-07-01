@@ -195,4 +195,4 @@ passing suite (see What's Real vs Simulated).
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

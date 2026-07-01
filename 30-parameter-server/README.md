@@ -196,4 +196,4 @@ external services are required; transport tests bind to loopback only.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

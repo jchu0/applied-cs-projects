@@ -165,4 +165,4 @@ The suite covers models, broker semantics, worker execution and retries, the cir
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
+MIT — see [LICENSE](../LICENSE)

@@ -182,4 +182,4 @@ The `make test` target instead builds and tests the separate `services/` Go modu
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

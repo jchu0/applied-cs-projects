@@ -163,4 +163,4 @@ required; multi-node tests run over the in-process `MemoryNetwork`.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

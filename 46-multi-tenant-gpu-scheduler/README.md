@@ -163,4 +163,4 @@ The suite has 150 tests across resources, scheduler, topology, allocator, monito
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

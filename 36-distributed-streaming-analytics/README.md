@@ -174,4 +174,4 @@ No external services are required.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

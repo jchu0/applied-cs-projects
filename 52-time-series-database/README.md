@@ -162,4 +162,4 @@ Prometheus functions. No external services are needed; tests use `tempfile` scra
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

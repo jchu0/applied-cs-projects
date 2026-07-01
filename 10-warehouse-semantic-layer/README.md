@@ -150,4 +150,4 @@ The suite (~350 tests across 11 modules) covers models, adapters, the query engi
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
+MIT — see [LICENSE](../LICENSE)

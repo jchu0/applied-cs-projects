@@ -183,4 +183,4 @@ required. Criterion benchmarks for encode / loss / eval live under `benches/`.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

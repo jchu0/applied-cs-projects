@@ -157,4 +157,4 @@ download is exercised only when explicitly requested).
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

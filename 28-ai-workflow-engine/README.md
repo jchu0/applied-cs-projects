@@ -160,4 +160,4 @@ The suite has 215 tests across 14 files covering the compiler, DAG edge cases, s
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
+MIT — see [LICENSE](../LICENSE)

@@ -205,4 +205,4 @@ No fixed performance targets are committed; the benchmarks measure the current b
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

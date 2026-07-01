@@ -180,4 +180,4 @@ when torch is not installed; the NumPy paths run unconditionally.
 
 ## License
 
-MIT — see ../LICENSE.
+MIT — see [LICENSE](../LICENSE)

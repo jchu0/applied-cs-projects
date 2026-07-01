@@ -159,4 +159,4 @@ The suite spans `test_autograd.py` (reverse-mode correctness, Jacobian/Hessian, 
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

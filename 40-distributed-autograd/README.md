@@ -163,4 +163,4 @@ Because correctness here means "produces the value the real collective would," t
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

@@ -174,4 +174,4 @@ and the FastAPI endpoints. No external services are needed.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

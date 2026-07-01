@@ -181,4 +181,4 @@ need `pyspark` are automatically skipped when it is not installed (see `tests/co
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
+MIT — see [LICENSE](../LICENSE)

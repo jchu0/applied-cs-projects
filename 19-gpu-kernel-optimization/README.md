@@ -149,4 +149,4 @@ roofline, occupancy, and tiling analysis.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

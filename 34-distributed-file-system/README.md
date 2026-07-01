@@ -163,4 +163,4 @@ The NameNode, DataNode, and client take constructor keyword arguments rather tha
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
+MIT — see [LICENSE](../LICENSE)

@@ -171,4 +171,4 @@ their backends are skipped when the library is absent.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

@@ -153,4 +153,4 @@ The suite has 7 modules covering the producer, consumer, windowing, state, exact
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

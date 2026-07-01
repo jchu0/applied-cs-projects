@@ -165,6 +165,4 @@ access. No external services or GPU are required.
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
-</content>
-</invoke>
+MIT — see [LICENSE](../LICENSE)

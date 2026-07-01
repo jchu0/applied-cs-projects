@@ -173,6 +173,4 @@ against the in-process app.
 
 ## License
 
-MIT — see ../LICENSE
-</content>
-</invoke>
+MIT — see [LICENSE](../LICENSE)

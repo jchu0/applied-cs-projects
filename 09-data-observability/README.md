@@ -191,4 +191,4 @@ docs/BLUEPRINT.md   # Full architecture and design
 
 ## License
 
-MIT
+MIT — see [LICENSE](../LICENSE)

@@ -158,4 +158,4 @@ SIMD/NumPy parity. No external services are needed; tests run purely on syntheti
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

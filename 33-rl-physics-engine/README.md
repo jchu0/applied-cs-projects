@@ -168,4 +168,4 @@ properties), `test_dynamics.py` (forward dynamics and kinematics), and `test_int
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

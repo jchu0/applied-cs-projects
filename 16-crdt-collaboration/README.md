@@ -176,5 +176,4 @@ its own Jest suite under `client-sdk/tests/` (`npm test`).
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
-</content>
+MIT — see [LICENSE](../LICENSE)

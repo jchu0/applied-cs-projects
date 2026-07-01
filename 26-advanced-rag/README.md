@@ -191,4 +191,4 @@ are exercised with mock clients.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

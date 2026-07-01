@@ -169,4 +169,4 @@ required — everything runs on CPU against the simulated executor.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

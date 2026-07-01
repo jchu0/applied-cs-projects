@@ -162,4 +162,4 @@ services are needed.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

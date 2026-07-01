@@ -187,4 +187,4 @@ needed — the API tests run the deterministic path.
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
+MIT — see [LICENSE](../LICENSE)

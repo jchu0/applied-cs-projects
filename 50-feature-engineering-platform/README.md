@@ -166,4 +166,4 @@ dependencies.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

@@ -168,4 +168,4 @@ skipped with `-m "not gpu"`.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

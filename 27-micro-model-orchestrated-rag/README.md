@@ -182,4 +182,4 @@ logic run without it.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

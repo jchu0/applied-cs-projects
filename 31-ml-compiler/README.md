@@ -162,4 +162,4 @@ implement, and skip cleanly.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)

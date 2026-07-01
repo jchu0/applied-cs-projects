@@ -204,4 +204,4 @@ Run with `cargo test -- --nocapture` to see test output.
 
 ## License
 
-MIT — see ../LICENSE
+MIT — see [LICENSE](../LICENSE)
