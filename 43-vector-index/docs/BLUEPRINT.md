@@ -46,36 +46,36 @@ plainly in the README's "What's Real vs Simulated" section.
 
 ```mermaid
 flowchart TD
-    subgraph API (Public package vecindex)
+    subgraph API["API (public package vecindex)"]
         EXPORTS(Re-exported symbols)
     end
-    subgraph INDEXES (index/indexes.py)
+    subgraph INDEXES["INDEXES (index/indexes.py)"]
         ABC(Index ABC)
         FLAT(FlatIndex)
         IVF(IVFIndex)
         HNSW(HNSWIndex)
         IVFPQ(IVFPQIndex)
     end
-    subgraph CORE (core/vectors.py)
+    subgraph CORE["CORE (core/vectors.py)"]
         METRICS(compute_distance L2 IP cosine)
         TOPK(topk selection)
         KMEANS(kmeans clustering)
         STORE(VectorStore)
     end
-    subgraph QUANT (quantize/pq.py)
+    subgraph QUANT["QUANT (quantize/pq.py)"]
         PQ(ProductQuantizer)
         OPQ(OPQ rotation)
         SQ(ScalarQuantizer)
         BQ(BinaryQuantizer)
     end
-    subgraph SEARCHU (search/search.py)
+    subgraph SEARCHU["SEARCHU (search/search.py)"]
         BATCH(BatchSearcher)
         HYBRID(HybridSearcher)
         RERANK(RerankSearcher)
         FACTORY(IndexFactory and build_index)
         BENCH(benchmark_index)
     end
-    subgraph SIMD (simd/ops.py)
+    subgraph SIMD["SIMD (simd/ops.py)"]
         KERNELS(Numba kernels)
         FALLBACK(NumPy fallback)
     end

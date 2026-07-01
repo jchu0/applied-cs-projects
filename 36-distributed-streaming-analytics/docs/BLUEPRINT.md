@@ -66,7 +66,7 @@ The two subsystems are independent. The streaming side executes; the SQL side co
 
 ```mermaid
 flowchart TD
-    subgraph Streaming (executed)
+    subgraph StreamingSide["Streaming (executed)"]
         Env["StreamExecutionEnvironment"]
         Env -->|from_collection / from_elements / add_source| Source["async source (yields Event)"]
         Source -->|map / filter / flat_map / union| DataStream
@@ -76,7 +76,7 @@ flowchart TD
         DataStream -->|sink| Results
         KeyedStream -.->|snapshot / restore| StateBackends["State backends + CheckpointCoordinator"]
     end
-    subgraph SQL (planned, not executed)
+    subgraph SQLSide["SQL (planned, not executed)"]
         SQL["SQL text"] --> Lexer["SQLLexer"]
         Lexer --> Parser["SQLParser"]
         Parser --> Builder["LogicalPlanBuilder"]
