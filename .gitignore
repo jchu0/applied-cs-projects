@@ -20,3 +20,7 @@ PROGRESS.md
 PROJECTS_STATUS.md
 IMPLEMENTATION_PLAN.md
 audit/
+
+# Internal doc-authoring framework — referenced locally, not pushed
+DOC_STYLE_GUIDE.md
+templates/

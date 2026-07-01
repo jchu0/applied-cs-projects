@@ -16,7 +16,7 @@ The other sections of this repo teach concepts. This section *applies* them. Eve
 | **Tests** | ~9,500 |
 | **Average completion** | 92% (per 2026-05-12 audit) |
 
-See [`PROJECTS_STATUS.md`](PROJECTS_STATUS.md) for the master tracker, [`audit/AUDIT_REPORT.md`](audit/AUDIT_REPORT.md) for the latest blueprint-vs-implementation audit, and [`CONCEPT_TO_PROJECT_MAP.md`](CONCEPT_TO_PROJECT_MAP.md) for the bridge from tutorial concepts to the projects that demonstrate them.
+See [`audit/AUDIT_REPORT.md`](audit/AUDIT_REPORT.md) for the latest blueprint-vs-implementation audit.
 
 ---
 
@@ -73,11 +73,9 @@ The repo's top-level [`CLAUDE.md`](../CLAUDE.md) has the full command reference 
 
 ## How This Section Connects to the Tutorials
 
-When you finish a tutorial in §01–05 and want to see the idea in a complete system, follow the cross-links in [`CONCEPT_TO_PROJECT_MAP.md`](CONCEPT_TO_PROJECT_MAP.md). For example:
+When you finish a tutorial in §01–05 and want to see the idea in a complete system, these projects are where the concepts land. For example:
 
 - §04 *RAG fundamentals* → projects 25 (baseline RAG), 26 (advanced RAG), 27 (micro-model orchestrated RAG)
 - §01 *Rust async runtimes* → project 06 (async runtime from scratch)
 - §03 *Distributed training* → projects 04 (training orchestrator), 30 (parameter server), 40 (distributed autograd)
 - §02 *Streaming systems* → projects 08 (streaming platform), 36 (distributed streaming analytics), 51 (message queue)
-
-The reverse direction is also supported: each project's `BLUEPRINT.md` references the tutorials covering its constituent concepts (added incrementally as projects are touched).

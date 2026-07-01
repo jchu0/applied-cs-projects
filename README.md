@@ -10,9 +10,6 @@ Where a book chapter says **"Build it →"**, it points here.
 - Projects are grouped in tiers — foundation & backend (01–10), distributed
   systems (11–20), ML/AI core (21–37), advanced ML (38–49), data infrastructure
   (50–52).
-- [`CONCEPT_TO_PROJECT_MAP.md`](CONCEPT_TO_PROJECT_MAP.md) is the bidirectional
-  bridge between the book's chapters and these projects.
 
 Each project has its own `README` / `BLUEPRINT.md` and build instructions
-(`pip install -e .` / `cargo build` / `make`). Status per project lives in
-[`PROJECTS_STATUS.md`](PROJECTS_STATUS.md).
+(`pip install -e .` / `cargo build` / `make`).
