@@ -79,32 +79,28 @@ graph TB
 ## DDP Architecture
 
 ### Forward Pass
-```
-Worker 0                    Worker 1
-   |                           |
-   v                           v
-Model(input_0) ──┐      ┌── Model(input_1)
-                 │      │
-              Local Forward
-                 │      │
-                 v      v
-             Output_0  Output_1
+```mermaid
+flowchart TD
+    W0["Worker 0"] --> M0["Model(input_0)"]
+    W1["Worker 1"] --> M1["Model(input_1)"]
+    M0 --> LF["Local Forward"]
+    M1 --> LF
+    LF --> O0["Output_0"]
+    LF --> O1["Output_1"]
 ```
 
 ### Backward Pass with Gradient Synchronization
-```
-Worker 0                    Worker 1
-   |                           |
-Backward()                 Backward()
-   |                           |
-grad_0 ────────┐      ┌─────── grad_1
-               │      │
-            AllReduce()
-               │      │
-         averaged_grad
-               │      │
-               v      v
-         Update_0    Update_1
+```mermaid
+flowchart TD
+    W0["Worker 0"] --> B0["Backward()"]
+    W1["Worker 1"] --> B1["Backward()"]
+    B0 --> G0["grad_0"]
+    B1 --> G1["grad_1"]
+    G0 --> AR["AllReduce()"]
+    G1 --> AR
+    AR --> AG["averaged_grad"]
+    AG --> U0["Update_0"]
+    AG --> U1["Update_1"]
 ```
 
 ## FSDP Architecture
@@ -125,29 +121,34 @@ Each Worker:
 ```
 
 ### FSDP Communication Pattern
-```
-       All-Gather          Forward           Reduce-Scatter
-Worker 0: [P0] ──────> [P0,P1,P2,P3] ──────> [G0+G1+G2+G3]/4
-Worker 1: [P1] ──────> [P0,P1,P2,P3] ──────> [G0+G1+G2+G3]/4
-Worker 2: [P2] ──────> [P0,P1,P2,P3] ──────> [G0+G1+G2+G3]/4
-Worker 3: [P3] ──────> [P0,P1,P2,P3] ──────> [G0+G1+G2+G3]/4
+```mermaid
+flowchart LR
+    subgraph Worker0
+        A0["(P0)"] -->|All-Gather| B0["(P0,P1,P2,P3)"] -->|"Forward / Reduce-Scatter"| C0["(G0+G1+G2+G3)/4"]
+    end
+    subgraph Worker1
+        A1["(P1)"] -->|All-Gather| B1["(P0,P1,P2,P3)"] -->|"Forward / Reduce-Scatter"| C1["(G0+G1+G2+G3)/4"]
+    end
+    subgraph Worker2
+        A2["(P2)"] -->|All-Gather| B2["(P0,P1,P2,P3)"] -->|"Forward / Reduce-Scatter"| C2["(G0+G1+G2+G3)/4"]
+    end
+    subgraph Worker3
+        A3["(P3)"] -->|All-Gather| B3["(P0,P1,P2,P3)"] -->|"Forward / Reduce-Scatter"| C3["(G0+G1+G2+G3)/4"]
+    end
 ```
 
 ## RPC Autograd Architecture
 
 ### Remote Function Graph
-```
-Local Worker                Remote Worker
-     |                           |
- func.remote() ─────RPC────> Execute(func)
-     |                           |
- Build Graph                 Build Graph
-     |                           |
-   Node_L ←────────────────── Node_R
-     |                           |
- Backward() ───────RPC────> Backward()
-     |                           |
-  grad_local ←────────────── grad_remote
+```mermaid
+sequenceDiagram
+    participant Local as Local Worker
+    participant Remote as Remote Worker
+    Local->>Remote: func.remote() (RPC)
+    Note over Local,Remote: Both build graph
+    Remote-->>Local: Node_R -> Node_L
+    Local->>Remote: Backward() (RPC)
+    Remote-->>Local: grad_remote -> grad_local
 ```
 
 ### Distributed Computation Graph
@@ -196,12 +197,15 @@ All workers have: [ΣA, ΣB, ΣC, ΣD]
 ```
 
 #### Tree All-Reduce
-```
-Level 2:        W0 ←→ W4
-              /    \    \
-Level 1:   W0←→W1  W2←→W3  W4←→W5  W6←→W7
-          /  \  /  \  /  \  /  \  /  \
-Level 0: W0  W1  W2  W3  W4  W5  W6  W7
+```mermaid
+flowchart TD
+    W0["W0 (Level 2 root)"] --- W4
+    W0 --- W1
+    W0 --- W2
+    W2 --- W3
+    W4 --- W5
+    W4 --- W6
+    W6 --- W7
 ```
 
 ## Gradient Synchronization
@@ -436,10 +440,3 @@ class DistributedDebugger:
             time.sleep(10)
 ```
 
-## Future Directions
-
-1. **Zero Redundancy Optimizer (ZeRO)**: Further memory optimization
-2. **Tensor Parallelism**: Fine-grained model parallelism
-3. **Heterogeneous Training**: CPU-GPU-TPU mixed training
-4. **Federated Learning**: Privacy-preserving distributed training
-5. **Quantum-Classical Hybrid**: Integration with quantum computing

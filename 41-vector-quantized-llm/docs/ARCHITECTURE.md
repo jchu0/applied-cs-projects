@@ -6,38 +6,15 @@ The Vector Quantized LLM project provides a high-performance quantization framew
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         User API                             │
-├─────────────────────────────────────────────────────────────┤
-│                    Inference Engine                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │   Batched    │  │   KV Cache   │  │   Memory     │     │
-│  │  Inference   │  │  Management  │  │   Manager    │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-├─────────────────────────────────────────────────────────────┤
-│                  Quantization Layer                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │    INT8      │  │    INT4      │  │    GPTQ      │     │
-│  │  Quantizer   │  │  Quantizer   │  │  Quantizer   │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-│                    ┌──────────────┐                         │
-│                    │     AWQ      │                         │
-│                    │  Quantizer   │                         │
-│                    └──────────────┘                         │
-├─────────────────────────────────────────────────────────────┤
-│                  Calibration Layer                           │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │   Dataset    │  │   Hessian    │  │  Activation  │     │
-│  │   Loader     │  │  Calculator  │  │   Collector  │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-├─────────────────────────────────────────────────────────────┤
-│                     Core Types                               │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │  Quantized   │  │    Quant     │  │   Tensor     │     │
-│  │   Tensor     │  │    Config    │  │  Operations  │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    API["User API"]
+    Inference["Inference Engine<br/>Batched Inference · KV Cache Management · Memory Manager"]
+    Quant["Quantization Layer<br/>INT8 · INT4 · GPTQ · AWQ Quantizers"]
+    Calib["Calibration Layer<br/>Dataset Loader · Hessian Calculator · Activation Collector"]
+    Core["Core Types<br/>Quantized Tensor · Quant Config · Tensor Operations"]
+
+    API --> Inference --> Quant --> Calib --> Core
 ```
 
 ## Core Components
@@ -158,47 +135,30 @@ Packed:   [0x47, 0xD2] (2 bytes, 2 INT4s per byte)
 
 ### Quantization Flow
 
-```
-1. Original Model
-        ↓
-2. Calibration Data Collection
-        ↓
-3. Statistics Computation
-   - Min/max values
-   - Percentiles
-   - Hessian matrices (GPTQ)
-   - Activation scales (AWQ)
-        ↓
-4. Quantization Parameter Optimization
-   - Scale factors
-   - Zero points
-   - Bit allocation
-        ↓
-5. Weight Quantization
-   - Apply quantization
-   - Pack weights (INT4)
-   - Store metadata
-        ↓
-6. Quantized Model
+```mermaid
+flowchart TD
+    A["1. Original Model"]
+    B["2. Calibration Data Collection"]
+    C["3. Statistics Computation<br/>Min/max values · Percentiles · Hessian matrices (GPTQ) · Activation scales (AWQ)"]
+    D["4. Quantization Parameter Optimization<br/>Scale factors · Zero points · Bit allocation"]
+    E["5. Weight Quantization<br/>Apply quantization · Pack weights (INT4) · Store metadata"]
+    F["6. Quantized Model"]
+
+    A --> B --> C --> D --> E --> F
 ```
 
 ### Inference Flow
 
-```
-1. Input Tokens
-        ↓
-2. Embedding Lookup
-        ↓
-3. Quantized Layer Processing
-   - Dequantize activations (if needed)
-   - Quantized matrix multiplication
-   - Re-quantize outputs
-        ↓
-4. KV Cache Update
-        ↓
-5. Next Token Generation
-        ↓
-6. Output Tokens
+```mermaid
+flowchart TD
+    A["1. Input Tokens"]
+    B["2. Embedding Lookup"]
+    C["3. Quantized Layer Processing<br/>Dequantize activations (if needed) · Quantized matrix multiplication · Re-quantize outputs"]
+    D["4. KV Cache Update"]
+    E["5. Next Token Generation"]
+    F["6. Output Tokens"]
+
+    A --> B --> C --> D --> E --> F
 ```
 
 ## Memory Layout
@@ -352,11 +312,3 @@ with profiler.profile() as prof:
     output = engine.forward(input)
 prof.print_stats()
 ```
-
-## Future Enhancements
-
-1. **Mixed Precision Support**: Different precisions for different layers
-2. **Dynamic Quantization**: Runtime adaptation based on input
-3. **Sparse Quantization**: Combining sparsity with quantization
-4. **Hardware Acceleration**: Custom CUDA/Triton kernels
-5. **Distributed Inference**: Multi-GPU quantized inference

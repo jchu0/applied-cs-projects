@@ -1,428 +1,166 @@
-# HDFS-Like Distributed File System
+# HDFS-Lite Distributed File System
 
-A Python implementation of a distributed file system inspired by Hadoop Distributed File System (HDFS). This project provides scalable, fault-tolerant storage for large files across a cluster of commodity hardware.
+An HDFS-style distributed file system built from scratch in Python with `asyncio`. It follows the classic Hadoop architecture: a single **NameNode** that owns all filesystem metadata and the block-to-node map, plus a fleet of **DataNodes** that store blocks and serve bulk data transfer. Clients ask the NameNode where each block lives, then move bytes to and from DataNodes directly.
 
 ## Features
 
-- **Distributed Storage**: Store large files across multiple nodes
-- **Fault Tolerance**: Automatic replication with configurable replication factor
-- **Scalability**: Horizontal scaling by adding more DataNodes
-- **High Throughput**: Optimized for large sequential reads/writes
-- **HDFS-Compatible API**: Familiar interface for HDFS users
-- **Async I/O**: Built with Python's asyncio for high performance
-- **Automatic Recovery**: Self-healing from node failures
-- **Block Management**: Efficient block-based storage
-- **Metadata Management**: Centralized namespace management
+- **Centralized metadata** — the `NameNode` owns the namespace (`_files` / `_directories`), the forward and reverse block map, and the DataNode registry; clients never touch metadata directly (`namenode/namenode.py`).
+- **Block-based storage** — files split into 128 MiB blocks; each `DataNode` stores blocks as plain files under `<data_dir>/blocks/` named by block ID (`datanode/datanode.py`).
+- **Configurable replication** — per-file replication factor (default 3) with rack-aware, load-balanced replica placement (`_select_datanodes_for_block`).
+- **Heartbeats and block reports** — DataNodes heartbeat every 3 s and send periodic block reports; the NameNode piggybacks delete/replicate/re-register commands on heartbeat replies.
+- **Dead-node detection** — any node silent for more than 30 s is evicted, its blocks dropped from the location map, and re-replication scheduled.
+- **Safe mode** — on startup the NameNode refuses block allocation until at least 99.9% of known blocks have a reporting replica.
+- **Checkpoint persistence** — `save_checkpoint` / `load_checkpoint` serialize the full namespace and block map to a single JSON file.
+- **Async client API** — `HDFSClient` exposes file, directory, bulk-I/O, and streaming operations over a length-prefixed JSON wire protocol.
+- **Streaming I/O** — `HDFSOutputStream` and `HDFSInputStream` write and read block-at-a-time without buffering whole files; `stream_read` yields chunks.
+- **Checksums** — each DataNode computes and caches an MD5 per block and can verify or scan for corruption.
 
-## Architecture Overview
+## Architecture
 
+```mermaid
+flowchart TD
+    Client("HDFSClient (create / read / mkdir / listdir / delete / rename)")
+    NameNode("NameNode (namespace, block map, DataNode registry, placement)")
+    DN1("DataNode 1 (blocks plus checksums)")
+    DNN("DataNode N (blocks plus checksums)")
+    Snapshot[("checkpoint.json")]
+
+    Client -- metadata RPC --> NameNode
+    Client -- block transfer --> DN1
+    Client -- block transfer --> DNN
+    DN1 -- heartbeat and block report --> NameNode
+    DNN -- heartbeat and block report --> NameNode
+    NameNode -- save and load --> Snapshot
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Clients   │────▶│   NameNode  │────▶│  DataNodes  │
-│  (HDFS API) │     │  (Metadata) │     │   (Storage) │
-└─────────────┘     └─────────────┘     └─────────────┘
-```
 
-- **NameNode**: Manages filesystem metadata and coordinates operations
-- **DataNodes**: Store actual data blocks and serve read/write requests
-- **Client**: Provides user-facing API for file operations
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| NameNode | `namenode/namenode.py` | In-memory metadata service: namespace, block map, DN registry, placement, safe mode |
+| NameNodeServer | `namenode/namenode.py` | Async TCP front-end adapting `MessageType` requests to `NameNode` calls |
+| DataNode | `datanode/datanode.py` | File-backed block store: read/write/delete/verify, heartbeats, block reports |
+| DataNodeServer | `datanode/datanode.py` | Async TCP server for client block transfer plus background loops |
+| HDFSClient | `client/client.py` | User-facing async API plus `HDFSOutputStream` / `HDFSInputStream` |
+| Wire protocol | `common/protocol.py` | `Message` / `MessageType`, length-prefixed JSON framing, typed errors |
+| Core types | `common/types.py` | `Block`, `BlockLocation`, `FileInfo`, `DirectoryInfo`, `DataNodeInfo` |
 
 ## Quick Start
+
+### Prerequisites
+
+- Python 3.9+
+- No external services are required to run the test suite (clusters run in-process).
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-org/hdfs-python.git
-cd hdfs-python
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install the package
-pip install -e .
+pip install -e ".[dev]"
 ```
 
-### Single Node Setup
+### Running
 
-1. **Start the NameNode**:
-```bash
-# Initialize the filesystem
-python -m hdfs.namenode format
+There is no CLI; the NameNode and DataNode servers are started programmatically. A minimal single-node cluster:
 
-# Start NameNode
-python -m hdfs.namenode start
-```
-
-2. **Start a DataNode**:
-```bash
-python -m hdfs.datanode start \
-  --node-id datanode1 \
-  --data-dir /tmp/hdfs/datanode1
-```
-
-3. **Use the Client**:
 ```python
 import asyncio
-from hdfs.client import HDFSClient
+from hdfs import NameNode, NameNodeServer, DataNode, DataNodeServer
 
 async def main():
-    # Connect to HDFS
-    client = HDFSClient(namenode_host="localhost", namenode_port=9000)
+    nn = NameNodeServer(NameNode(), host="0.0.0.0", port=9000)
+    await nn.start()
 
-    # Write a file
-    await client.write("/hello.txt", b"Hello, HDFS!")
+    dn = DataNodeServer(DataNode(
+        node_id="datanode1",
+        data_dir="/tmp/hdfs/datanode1",
+        host="localhost", port=50010,
+        namenode_host="localhost", namenode_port=9000,
+    ))
+    await dn.start()
 
-    # Read the file
-    data = await client.read("/hello.txt")
-    print(data.decode())
-
-    # List directory
-    files = await client.listdir("/")
-    print(f"Files: {files}")
+    await asyncio.Event().wait()   # serve forever
 
 asyncio.run(main())
 ```
 
-### Multi-Node Cluster
+`docker-compose.yml` defines a NameNode plus three DataNode services for a multi-node layout.
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for detailed cluster setup instructions.
-
-## Examples
-
-### Basic File Operations
+## Usage
 
 ```python
 import asyncio
-from hdfs.client import HDFSClient
+from hdfs import HDFSClient
 
-async def file_operations():
-    client = HDFSClient()
+async def main():
+    client = HDFSClient(namenode_host="localhost", namenode_port=9000)
 
-    # Create and write file
-    await client.write("/data/report.csv", b"id,name,value\n1,Alice,100\n")
+    # Write and read a file (write() is an alias for create())
+    await client.write("/hello.txt", b"Hello, HDFS!")
+    data = await client.read("/hello.txt")
+    print(data.decode())                       # -> Hello, HDFS!
 
-    # Append to file
-    await client.append("/data/report.csv", b"2,Bob,200\n")
+    # Directories
+    await client.mkdir("/data", create_parents=True)
+    entries = await client.listdir("/data")
+    print(entries)
 
-    # Read file
-    content = await client.read("/data/report.csv")
-    print(content.decode())
+    # Metadata, rename, delete
+    info = await client.get_file_info("/hello.txt")
+    print(info["size"], info["replication"])
+    await client.rename("/hello.txt", "/data/hello.txt")
+    await client.delete("/data/hello.txt")
 
-    # Delete file
-    await client.delete("/data/report.csv")
-
-asyncio.run(file_operations())
+asyncio.run(main())
 ```
 
-### Working with Large Files
+Streaming a large file block-at-a-time:
 
 ```python
-async def large_file_handling():
-    client = HDFSClient()
+async with await client.open_for_write("/big.bin") as f:
+    await f.write(payload)
 
-    # Stream write large file
-    with open("large_local_file.bin", "rb") as f:
-        chunk_size = 64 * 1024 * 1024  # 64MB chunks
-        path = "/data/large_file.bin"
-
-        await client.create(path)
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            await client.append(path, chunk)
-
-    # Stream read large file
-    async for chunk in client.stream_read("/data/large_file.bin"):
-        process_chunk(chunk)  # Process incrementally
-
-asyncio.run(large_file_handling())
+async for chunk in client.stream_read("/big.bin", chunk_size=1 << 20):
+    process(chunk)
 ```
 
-### Directory Management
+## What's Real vs Simulated
 
-```python
-async def directory_operations():
-    client = HDFSClient()
-
-    # Create directory structure
-    await client.mkdir("/projects")
-    await client.mkdir("/projects/analytics")
-    await client.mkdir("/projects/ml")
-
-    # List directory contents
-    contents = await client.listdir("/projects")
-    for item in contents:
-        print(f"  {item}")
-
-    # Get file/directory info
-    info = await client.get_file_status("/projects/analytics")
-    print(f"Type: {'Directory' if info['is_directory'] else 'File'}")
-    print(f"Modified: {info['modification_time']}")
-
-asyncio.run(directory_operations())
-```
-
-### Error Handling
-
-```python
-from hdfs.common.protocol import FileNotFoundError, HDFSError
-
-async def robust_operations():
-    client = HDFSClient()
-
-    try:
-        # Try to read non-existent file
-        data = await client.read("/nonexistent.txt")
-    except FileNotFoundError as e:
-        print(f"File not found: {e}")
-    except HDFSError as e:
-        print(f"HDFS error: {e}")
-
-    # Retry logic for temporary failures
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            await client.write("/important.txt", b"Critical data")
-            break
-        except HDFSError:
-            if attempt == max_retries - 1:
-                raise
-            await asyncio.sleep(2 ** attempt)
-
-asyncio.run(robust_operations())
-```
+- **Real:** namespace operations, block allocation and placement, the rack-aware load-balanced selection algorithm, heartbeats, block reports, dead-node detection, safe mode, checkpoint save/load, the full client API, streaming I/O, and per-block MD5 checksums. All of this is exercised by the test suite, including 40 dedicated replication tests.
+- **Simulated / not wired:** the NameNode-issued `replicate` command is logged but does not copy bytes, so re-replication is *scheduled* but does not self-heal. Client writes fan out to each replica in a star, not the HDFS pipeline; `store_block_pipeline` only forwards to in-process objects. Block bodies travel as hex-encoded strings inside JSON (2x wire size). There is no edit log, no NameNode HA, and no auth/encryption. `ReplicationPolicy.ERASURE_CODING` is an enum value with no implementation, and `checkpoint_interval` is stored but never drives an automatic save. See [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the full list.
 
 ## Testing
 
-### Run Tests
-
 ```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=hdfs --cov-report=html
-
-# Run specific test module
-pytest tests/test_namenode.py
-
-# Run integration tests
-pytest tests/test_integration.py -v
+pytest                                    # full suite
+pytest --cov=hdfs --cov-report=term       # with coverage
+pytest tests/test_replication.py -v       # placement and recovery
 ```
 
-### Test Coverage
-
-Current test coverage: **85%+**
-
-- Unit tests for all major components
-- Integration tests for end-to-end scenarios
-- Stress tests for performance validation
-- Chaos tests for failure scenarios
-
-## Configuration
-
-### NameNode Configuration
-
-Create `config/namenode.yaml`:
-
-```yaml
-namenode:
-  host: 0.0.0.0
-  port: 9000
-  default_replication: 3
-  default_block_size: 134217728  # 128MB
-  heartbeat_interval: 3.0
-  checkpoint_interval: 3600.0
-```
-
-### DataNode Configuration
-
-Create `config/datanode.yaml`:
-
-```yaml
-datanode:
-  node_id: ${HOSTNAME}
-  namenode_host: localhost
-  namenode_port: 9000
-  data_dirs:
-    - /var/hdfs/data
-  heartbeat_interval: 3.0
-  block_report_interval: 3600.0
-```
-
-### Client Configuration
-
-```python
-client = HDFSClient(
-    namenode_host="localhost",
-    namenode_port=9000,
-    block_size=128 * 1024 * 1024,
-    replication=3,
-    retry_count=3,
-    connection_timeout=10.0
-)
-```
-
-## Performance
-
-### Benchmarks
-
-| Operation | Throughput | Latency (p99) |
-|-----------|------------|---------------|
-| Sequential Write | 800 MB/s | 10 ms |
-| Sequential Read | 1.2 GB/s | 8 ms |
-| Random Read | 300 MB/s | 15 ms |
-| Metadata Ops | 10K ops/s | 5 ms |
-
-*Tested on: 5-node cluster, 10Gbps network, SSD storage*
-
-### Optimization Tips
-
-1. **Block Size**: Use larger blocks (128-256MB) for large files
-2. **Replication**: Balance between reliability (3) and storage efficiency
-3. **Client Caching**: Enable metadata caching for read-heavy workloads
-4. **Parallel Operations**: Use async operations for concurrent access
-
-## Documentation
-
-- [Architecture Guide](docs/ARCHITECTURE.md) - System design and internals
-- [API Reference](docs/API.md) - Complete API documentation
-- [Deployment Guide](docs/DEPLOYMENT.md) - Production deployment instructions
-- [Contributing Guide](docs/CONTRIBUTING.md) - How to contribute
+Tests run entirely in-process (no live NameNode/DataNode processes needed). Coverage spans namespace ops, block read/write/verify, the client API and cache, end-to-end integration, and replica placement / failure recovery.
 
 ## Project Structure
 
 ```
-hdfs-python/
-├── src/
-│   └── hdfs/
-│       ├── common/         # Shared types and protocols
-│       ├── namenode/       # NameNode implementation
-│       ├── datanode/       # DataNode implementation
-│       └── client/         # Client API
-├── tests/                  # Test suites
-│   ├── fixtures.py        # Test helpers
-│   ├── test_namenode.py   # NameNode tests
-│   ├── test_datanode.py   # DataNode tests
-│   ├── test_client.py     # Client tests
-│   └── test_integration.py # Integration tests
-├── docs/                   # Documentation
-├── config/                 # Configuration files
-└── README.md              # This file
+34-distributed-file-system/
+  README.md                  # this file
+  pyproject.toml             # package metadata and tooling config
+  docker-compose.yml         # NameNode plus three DataNode services
+  src/hdfs/
+    common/                  # types.py (core types), protocol.py (wire protocol)
+    namenode/                # NameNode plus NameNodeServer
+    datanode/                # DataNode plus DataNodeServer
+    client/                  # HDFSClient plus streams
+  tests/                     # namenode, datanode, client, integration, replication
+  docs/
+    BLUEPRINT.md             # full architecture and design
+    ARCHITECTURE.md          # deeper architecture notes
+    API.md                   # full API reference
+    DEPLOYMENT.md            # cluster deployment runbook
+    CONTRIBUTING.md          # contribution guide
 ```
 
-## Requirements
+## Configuration
 
-- Python 3.8+
-- asyncio
-- aiofiles
-- pyyaml
-- pytest (for testing)
-
-## Roadmap
-
-### Current Features (v1.0)
-- ✅ Basic file operations (create, read, write, delete)
-- ✅ Directory operations
-- ✅ Block replication
-- ✅ DataNode heartbeats
-- ✅ Automatic failure detection
-- ✅ Client retry logic
-
-### Planned Features (v2.0)
-- [ ] NameNode High Availability
-- [ ] Erasure coding support
-- [ ] Kerberos authentication
-- [ ] Wire encryption (TLS)
-- [ ] HDFS Federation
-- [ ] WebHDFS REST API
-- [ ] Quotas and ACLs
-- [ ] Snapshots
-
-### Future Enhancements
-- [ ] S3-compatible API
-- [ ] Kubernetes operator
-- [ ] Prometheus metrics
-- [ ] Grafana dashboards
-- [ ] CLI improvements
-- [ ] GUI management console
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details on:
-
-- Code of Conduct
-- Development setup
-- Coding standards
-- Testing requirements
-- Pull request process
-
-## Troubleshooting
-
-### Common Issues
-
-**NameNode won't start:**
-```bash
-# Check if port is already in use
-netstat -tulpn | grep 9000
-
-# Check logs
-tail -f /var/log/hdfs/namenode.log
-```
-
-**DataNode can't connect:**
-```bash
-# Verify NameNode is running
-telnet localhost 9000
-
-# Check DataNode logs
-tail -f /var/log/hdfs/datanode.log
-```
-
-**Slow performance:**
-```bash
-# Check network latency
-ping -c 100 namenode_host
-
-# Check disk I/O
-iostat -x 1
-
-# Check system resources
-top -H
-```
-
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/your-org/hdfs-python/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-org/hdfs-python/discussions)
-- **Email**: hdfs-support@example.com
-- **Slack**: [Join our Slack](https://hdfs-slack.example.com)
+The NameNode, DataNode, and client take constructor keyword arguments rather than config files: replication factor, block size, heartbeat interval, capacity, cache TTL, and checksum verification. See [docs/API.md](docs/API.md) and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full set.
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Inspired by Apache Hadoop HDFS
-- Built with Python asyncio
-- Thanks to all contributors
-
-## Citation
-
-If you use this project in your research, please cite:
-
-```bibtex
-@software{hdfs-python,
-  title = {HDFS-Like Distributed File System},
-  author = {Your Organization},
-  year = {2024},
-  url = {https://github.com/your-org/hdfs-python}
-}
-```
-
----
-
-**Star this project if you find it useful!** ⭐
+MIT — see [../LICENSE](../LICENSE).

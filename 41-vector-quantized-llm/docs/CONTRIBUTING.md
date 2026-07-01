@@ -234,7 +234,6 @@ We follow PEP 8 with some modifications:
 from typing import Optional, List, Dict, Any
 import numpy as np
 
-
 class QuantizerExample:
     """Example quantizer implementation.
 
@@ -388,7 +387,6 @@ import pytest
 import numpy as np
 from vqllm.quantize import INT8Quantizer
 
-
 class TestINT8Quantizer:
     """Test INT8 quantization functionality."""
 
@@ -471,7 +469,6 @@ import pytest
 import time
 import numpy as np
 from vqllm.quantize import INT8Quantizer
-
 
 @pytest.mark.benchmark
 class TestPerformance:
@@ -744,19 +741,3 @@ git push origin v0.2.0
 ```bash
 twine upload dist/*
 ```
-
-## Questions and Support
-
-### Getting Help
-
-- **Discord**: Join our [Discord server](https://discord.gg/vqllm)
-- **GitHub Discussions**: Ask questions in [Discussions](https://github.com/org/vqllm/discussions)
-- **Stack Overflow**: Tag questions with `vqllm`
-
-### Contact
-
-- General questions: community@vqllm.ai
-- Security issues: security@vqllm.ai
-- Partnership: partnerships@vqllm.ai
-
-Thank you for contributing to Vector Quantized LLM! Your contributions help make LLM deployment more efficient and accessible to everyone.

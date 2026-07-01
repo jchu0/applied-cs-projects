@@ -8,15 +8,13 @@ This project implements a distributed file system inspired by the Hadoop Distrib
 
 ### High-Level Design
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Client    │────▶│   NameNode  │────▶│  DataNodes  │
-│  (HDFS API) │     │  (Metadata) │     │   (Storage) │
-└─────────────┘     └─────────────┘     └─────────────┘
-       │                    │                    │
-       │                    │                    │
-       └────────────────────┴────────────────────┘
-              TCP/IP Communication
+```mermaid
+flowchart LR
+    Client["Client<br/>(HDFS API)"] --> NameNode["NameNode<br/>(Metadata)"]
+    NameNode --> DataNodes["DataNodes<br/>(Storage)"]
+    Client -. "TCP/IP" .- NameNode
+    NameNode -. "TCP/IP" .- DataNodes
+    Client -. "TCP/IP" .- DataNodes
 ```
 
 ### Core Components
@@ -85,11 +83,19 @@ The client library provides the user-facing API:
 5. **DataNodes** replicate blocks in pipeline fashion
 6. **DataNodes** report block storage to **NameNode**
 
-```
-Client ──1──▶ NameNode
-       ◀──2── (block allocation)
-       ──3──▶ DataNode1 ──▶ DataNode2 ──▶ DataNode3
-       ◀──4── (acknowledgments)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant NameNode
+    participant DataNode1
+    participant DataNode2
+    participant DataNode3
+    Client->>NameNode: 1. request file creation
+    NameNode-->>Client: 2. block allocation
+    Client->>DataNode1: 3. write data
+    DataNode1->>DataNode2: pipeline replicate
+    DataNode2->>DataNode3: pipeline replicate
+    DataNode3-->>Client: 4. acknowledgments
 ```
 
 ### Read Operation
@@ -99,11 +105,15 @@ Client ──1──▶ NameNode
 3. **Client** reads blocks directly from **DataNodes**
 4. **Client** assembles blocks into complete file
 
-```
-Client ──1──▶ NameNode
-       ◀──2── (block locations)
-       ──3──▶ DataNode (parallel reads)
-       ◀──4── (block data)
+```mermaid
+sequenceDiagram
+    participant Client
+    participant NameNode
+    participant DataNode
+    Client->>NameNode: 1. request file info
+    NameNode-->>Client: 2. block locations
+    Client->>DataNode: 3. parallel reads
+    DataNode-->>Client: 4. block data
 ```
 
 ## Fault Tolerance
@@ -208,26 +218,12 @@ All communication uses a custom protocol with these message types:
 - **Memory Constraints**: NameNode memory limits total files/blocks
 - **Network Bandwidth**: Replication can consume significant bandwidth
 
-### Future Enhancements
-
-1. **NameNode Federation**: Multiple NameNodes for namespace partitioning
-2. **Erasure Coding**: Reduce storage overhead while maintaining reliability
-3. **Tiered Storage**: Support for SSD/HDD/Archive tiers
-4. **Small File Optimization**: Pack small files into containers
-
 ## Security Model
 
 ### Current Implementation
 
 - **Basic Authentication**: Node ID-based identification
 - **Network Isolation**: Assumes trusted network environment
-
-### Future Security Features
-
-1. **Kerberos Integration**: Strong authentication
-2. **Wire Encryption**: TLS for all communication
-3. **Access Control Lists**: File/directory permissions
-4. **Audit Logging**: Track all operations
 
 ## Configuration Parameters
 
@@ -288,28 +284,18 @@ cache_ttl = 60s                # Metadata cache timeout
 
 ### Recommended Setup
 
-```
-┌─────────────────────────────────────┐
-│          Load Balancer              │
-└─────────────────────────────────────┘
-                  │
-     ┌────────────┼────────────┐
-     │            │            │
-┌─────────┐ ┌─────────┐ ┌─────────┐
-│ Client1 │ │ Client2 │ │ Client3 │
-└─────────┘ └─────────┘ └─────────┘
-     │            │            │
-     └────────────┼────────────┘
-                  │
-          ┌───────────┐
-          │ NameNode  │
-          └───────────┘
-                  │
-     ┌────────────┼────────────┐
-     │            │            │
-┌──────────┐ ┌──────────┐ ┌──────────┐
-│DataNode1 │ │DataNode2 │ │DataNode3 │
-└──────────┘ └──────────┘ └──────────┘
+```mermaid
+flowchart TD
+    LB["Load Balancer"]
+    LB --> Client1
+    LB --> Client2
+    LB --> Client3
+    Client1 --> NameNode
+    Client2 --> NameNode
+    Client3 --> NameNode
+    NameNode --> DataNode1
+    NameNode --> DataNode2
+    NameNode --> DataNode3
 ```
 
 ### Hardware Requirements

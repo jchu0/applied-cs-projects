@@ -1,299 +1,170 @@
 # GPU Memory Manager
 
-A high-performance CUDA-style memory allocator for GPU memory management with advanced features including memory pooling, caching, stream-ordered allocation, and automatic defragmentation.
+A CUDA-style GPU memory management library built from scratch in pure Python. It implements
+caching, pooling, buddy, and slab allocators, an LRU/LFU memory cache with defragmentation,
+an allocation profiler, and multi-GPU distribution with topology-aware routing. Device memory
+is **simulated** with integer addresses, so the whole system runs and is fully tested on CPU
+without a GPU.
 
 ## Features
 
-- **Memory Pooling**: Reduce allocation overhead with pre-allocated memory pools
-- **Caching Allocator**: Cache freed blocks for fast reallocation
-- **Stream-Ordered Allocation**: Support for CUDA stream-specific memory management
-- **Best-Fit/First-Fit Strategies**: Multiple allocation strategies
-- **Automatic Defragmentation**: Coalesce free blocks to reduce fragmentation
-- **Memory Profiling**: Detailed statistics and profiling capabilities
-- **Multi-Device Support**: Manage memory across multiple GPUs
-- **Thread-Safe Operations**: Concurrent allocation and deallocation
+- **Four allocator strategies** — caching, pool, buddy, and slab allocators behind a common
+  `Allocator` interface (`gpumem.allocator.allocator`).
+- **CUDA-style caching allocator** — caches freed blocks for reuse, splits and coalesces
+  blocks, isolates allocations per stream, and flushes the cache on OOM (`CachingAllocator`).
+- **Memory pool with bucketing** — size-class free lists, block splitting, neighbor
+  coalescing, and trimming (`MemoryPool` / `MemoryBlock` in `gpumem.core.memory`).
+- **Buddy and slab allocators** — power-of-2 buddy allocation with XOR-buddy coalescing
+  (`BuddyAllocator`) and fixed-size object slabs (`SlabAllocator`).
+- **Memory caches** — `LRUCache` and `LFUCache` with TTL support, plus a shape/dtype-keyed
+  `TensorCache` (`gpumem.cache.cache`).
+- **Defragmentation** — compact, best-fit, and incremental strategies with a fragmentation
+  ratio metric (`Defragmenter` / `DefragmentStrategy`).
+- **Profiler** — allocation traces, size histograms, per-tag and per-device summaries, leak
+  detection, snapshots, and a JSON-exportable event timeline (`MemoryProfiler`).
+- **Multi-GPU distribution** — load-balanced allocation across simulated GPUs with P2P
+  transfer routing, distributed tensors, and ring all-reduce gradient sync
+  (`MultiGPUAllocator`, `DistributedTensorManager`, `GradientSynchronizer`).
 
-## Installation
+## Architecture
 
-```bash
-# Clone the repository
-git clone <repository-url>
-cd projects/38-gpu-memory-manager
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install CUDA dependencies (if using CUDA backend)
-pip install pycuda
-
-# Install in development mode
-pip install -e .
+```mermaid
+flowchart TD
+    User(User code: allocate / free / get_stats) --> Alloc(Allocator interface)
+    Alloc --> Caching(CachingAllocator)
+    Alloc --> Pool(PoolAllocator)
+    Alloc --> Buddy(BuddyAllocator)
+    Alloc --> Slab(SlabAllocator)
+    Caching --> MemPool(MemoryPool: size-class free lists)
+    MemPool --> Blocks(MemoryBlock split and coalesce)
+    Caching --> Cache(LRU / LFU / TensorCache)
+    Cache --> Defrag(Defragmenter)
+    Multi(MultiGPUAllocator) --> Caching
+    Multi --> P2P(P2PTransferManager: topology routing)
+    Profiler(MemoryProfiler) -.observes.-> Alloc
 ```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Core primitives | `gpumem.core.memory` | `MemoryBlock`, `MemoryPool`, `MemoryConfig`, `MemoryStats`, `DeviceType` |
+| Allocators | `gpumem.allocator.allocator` | `CachingAllocator`, `PoolAllocator`, `BuddyAllocator`, `SlabAllocator` |
+| Caching | `gpumem.cache.cache` | `LRUCache`, `LFUCache`, `TensorCache`, `Defragmenter` |
+| Profiling | `gpumem.profiler.profiler` | `MemoryProfiler`, `AllocationTrace`, `MemorySnapshot`, `MemoryTimeline` |
+| Multi-GPU | `gpumem.allocator.advanced` | `MultiGPUAllocator`, `DistributedTensorManager`, `GradientSynchronizer` |
 
 ## Quick Start
 
-### Basic Usage
+### Prerequisites
 
-```python
-from gpumem import PoolAllocator, MemoryConfig, DeviceType
+- Python 3.9+
+- `numpy` (the only runtime dependency). No GPU or CUDA toolkit is required — device memory
+  is simulated, so everything runs on CPU.
 
-# Configure memory manager
-config = MemoryConfig(
-    device_type=DeviceType.CUDA,
-    device_id=0,
-    max_memory=4 * 1024**3,  # 4GB limit
-    min_split_size=1024,      # 1KB minimum block
-)
+### Installation
 
-# Create allocator
-allocator = PoolAllocator(config)
-
-# Allocate memory
-ptr = allocator.allocate(1024 * 1024)  # Allocate 1MB
-print(f"Allocated memory at: {ptr}")
-
-# Use memory...
-
-# Deallocate
-allocator.deallocate(ptr)
-
-# Get statistics
-stats = allocator.get_stats()
-print(f"Total allocated: {stats['allocated']} bytes")
-print(f"Peak allocation: {stats['peak_allocated']} bytes")
+```bash
+pip install -e ".[dev]"
 ```
 
-### Caching Allocator
+### Running
 
-```python
-from gpumem import CachingAllocator, MemoryConfig
+This is a library, not a service. Import it and allocate:
 
-# Create caching allocator for fast reallocation
-allocator = CachingAllocator(MemoryConfig(
-    device_type=DeviceType.CUDA,
-    cache_size_limit=100 * 1024**2  # 100MB cache
-))
-
-# Repeated allocations of same size are fast
-for _ in range(1000):
-    ptr = allocator.allocate(4096)  # 4KB blocks
-    # Process data...
-    allocator.deallocate(ptr)  # Goes to cache
-
-stats = allocator.get_stats()
-print(f"Cache hits: {stats['cache_hits']}")
+```bash
+python -c "from gpumem import CachingAllocator; a = CachingAllocator(); print(a.allocate(1024))"
 ```
 
-### Stream-Ordered Allocation
+## Usage
+
+Allocators return a `MemoryBlock` (with a simulated `ptr` and `size`), not a raw pointer.
 
 ```python
-from gpumem import StreamOrderedAllocator
-import pycuda.driver as cuda
+from gpumem import CachingAllocator, MemoryConfig, DeviceType
 
-# Create stream-aware allocator
-allocator = StreamOrderedAllocator(MemoryConfig())
+config = MemoryConfig(device_type=DeviceType.CUDA, device_id=0, max_memory=4 * 1024**3)
+allocator = CachingAllocator(config)
 
-# Create CUDA streams
-stream1 = cuda.Stream()
-stream2 = cuda.Stream()
+block = allocator.allocate(1024 * 1024)        # 1MB; returns a MemoryBlock
+print(block.ptr, block.size)
 
-# Allocate on different streams
-ptr1 = allocator.allocate(1024, stream=stream1)
-ptr2 = allocator.allocate(2048, stream=stream2)
+allocator.free(block)                           # freed block is cached for reuse
 
-# Memory is isolated per stream
-allocator.deallocate(ptr1, stream=stream1)
-allocator.deallocate(ptr2, stream=stream2)
+stats = allocator.get_stats()                   # MemoryStats dataclass
+print(stats.num_allocs, stats.peak_allocated)
 ```
 
-## Examples
-
-### Example 1: Memory Pool Management
+Profiling an allocation workload:
 
 ```python
-from gpumem import MemoryPool, MemoryConfig
+from gpumem import CachingAllocator, MemoryProfiler
 
-# Create memory pool
-pool = MemoryPool(MemoryConfig(
-    max_memory=1024**3,  # 1GB
-    expandable_segments=True,
-    garbage_collection_threshold=0.8
-))
+allocator = CachingAllocator()
+profiler = MemoryProfiler()
+profiler.enable()
 
-# Allocate from pool
-blocks = []
-for size in [1024, 2048, 4096, 8192]:
-    block = pool.allocate(size)
-    blocks.append(block)
+block = allocator.allocate(10 * 1024 * 1024)
+block.tag = "activations"
+profiler.record_alloc(block)
+profiler.record_free(block)
 
-# Pool automatically expands if needed
-large_block = pool.allocate(100 * 1024**2)  # 100MB
-
-# Trigger garbage collection when threshold reached
-pool.garbage_collect()
-
-# Release unused memory back to system
-pool.release_memory()
+profiler.print_summary()                        # totals + size histogram
+profiler.take_snapshot(tag="after-step")
 ```
 
-### Example 2: Custom Allocation Strategy
+Multi-GPU allocation with load balancing:
 
 ```python
-from gpumem import BestFitAllocator, AllocationStrategy
+from gpumem import MultiGPUAllocator, LoadBalanceStrategy
 
-# Use best-fit strategy for minimal fragmentation
-allocator = BestFitAllocator(MemoryConfig())
-
-# Allocate various sizes
-sizes = [64, 128, 256, 512, 1024, 2048]
-ptrs = []
-
-for size in sizes:
-    ptr = allocator.allocate(size)
-    ptrs.append((ptr, size))
-
-# Free some blocks to create gaps
-for i in range(0, len(ptrs), 2):
-    allocator.deallocate(ptrs[i][0])
-
-# Best-fit finds optimal gap for new allocation
-new_ptr = allocator.allocate(200)  # Fits in 256-byte gap
-
-# Check fragmentation
-stats = allocator.get_stats()
-print(f"Fragmentation: {stats['fragmentation']:.2%}")
+mgpu = MultiGPUAllocator(num_gpus=4, strategy=LoadBalanceStrategy.LEAST_UTILIZED)
+block = mgpu.allocate(64 * 1024 * 1024)         # device chosen automatically
+moved = mgpu.transfer(block, target_device=1)   # P2P transfer (simulated)
+print(mgpu.get_statistics()["devices"])
 ```
 
-### Example 3: Memory Profiling
+## What's Real vs Simulated
 
-```python
-from gpumem import PoolAllocator, MemoryProfiler
-
-allocator = PoolAllocator(MemoryConfig())
-profiler = MemoryProfiler(allocator)
-
-# Enable profiling
-with profiler:
-    # Your GPU workload
-    ptr1 = allocator.allocate(10 * 1024**2)  # 10MB
-    ptr2 = allocator.allocate(20 * 1024**2)  # 20MB
-
-    allocator.deallocate(ptr1)
-
-    ptr3 = allocator.allocate(5 * 1024**2)   # 5MB
-
-# Get profiling results
-report = profiler.get_report()
-print(report.summary())
-print(f"Peak memory: {report.peak_memory_mb:.2f} MB")
-print(f"Total allocations: {report.num_allocations}")
-print(f"Average allocation size: {report.avg_allocation_size}")
-```
+- **Real:** All allocator logic, data structures, and algorithms execute for real on CPU —
+  size-class bucketing, block splitting and coalescing, buddy XOR coalescing, slab management,
+  LRU/LFU eviction with TTL, defragmentation, fragmentation-ratio computation, profiler
+  tracking and histograms, load-balancing device selection, and Dijkstra-based topology path
+  computation. The test suite exercises all of this without a GPU.
+- **Simulated / requires no GPU:** Device memory is modeled with monotonically increasing
+  integer addresses, not real `cudaMalloc`. There is no CUDA backend — P2P transfers, prefetch,
+  stream synchronization, and CPU offload update bookkeeping and sleep for an estimated
+  duration rather than moving bytes. Bandwidth and latency figures in the topology model are
+  representative constants, not measured.
 
 ## Testing
 
 ```bash
-# Run all tests
-python -m pytest tests/
-
-# Run specific test module
-python -m pytest tests/test_memory.py
-
-# Run with coverage
-python -m pytest --cov=gpumem tests/
-
-# Run performance benchmarks
-python -m pytest tests/benchmarks/ -v
+pytest tests/ -v
 ```
 
-## Performance
+The suite has 230 tests across allocators, core pool/block mechanics, caching and
+defragmentation, profiling, multi-GPU distribution, and thread-safety under concurrent
+access. No external services or GPU are required.
 
-Benchmark results (NVIDIA RTX 3090):
+## Project Structure
 
-| Operation | Size | Standard (μs) | Pooled (μs) | Speedup |
-|-----------|------|---------------|-------------|---------|
-| Allocate  | 1MB  | 125           | 3.2         | 39x     |
-| Allocate  | 10MB | 842           | 4.1         | 205x    |
-| Free      | 1MB  | 89            | 1.8         | 49x     |
-| Realloc   | 1MB  | 186           | 3.5         | 53x     |
-
-## Architecture
-
-Key components:
-
-- **Memory Pool**: Pre-allocated memory segments
-- **Allocator**: Allocation strategy implementation
-- **Block Manager**: Free/allocated block tracking
-- **Cache Layer**: Recently freed block cache
-- **Profiler**: Memory usage statistics
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
-
-## API Documentation
-
-Complete API reference in [docs/API.md](docs/API.md).
-
-## Contributing
-
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
-
-## Deployment
-
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for deployment instructions.
-
-## Advanced Features
-
-### Memory Defragmentation
-
-```python
-# Enable automatic defragmentation
-config = MemoryConfig(enable_defrag=True)
-allocator = PoolAllocator(config)
-
-# Manual defragmentation
-allocator.defragment()
 ```
-
-### Multi-GPU Support
-
-```python
-# Manage memory across multiple GPUs
-allocators = {}
-for device_id in range(4):  # 4 GPUs
-    config = MemoryConfig(
-        device_type=DeviceType.CUDA,
-        device_id=device_id
-    )
-    allocators[device_id] = PoolAllocator(config)
+39-gpu-memory-manager/
+  README.md                       # this file
+  pyproject.toml                  # package metadata and dev deps
+  src/gpumem/
+    core/memory.py                # MemoryBlock, MemoryPool, config, stats
+    allocator/allocator.py        # caching, pool, buddy, slab, unified allocators
+    allocator/advanced.py         # multi-GPU, P2P, prefetch, offload, distributed tensors
+    cache/cache.py                # LRU/LFU/tensor caches, defragmenter
+    profiler/profiler.py          # allocation tracing and reporting
+  tests/                          # pytest suite (230 tests)
+  docs/
+    BLUEPRINT.md                  # full architecture and design
+    ARCHITECTURE.md               # deeper architecture notes
 ```
-
-### Custom Memory Backend
-
-```python
-from gpumem import DeviceMemory, DeviceType
-
-class ROCmMemory(DeviceMemory):
-    def allocate(self, size):
-        # Custom ROCm allocation
-        pass
-
-    def deallocate(self, ptr):
-        # Custom ROCm deallocation
-        pass
-
-# Register custom backend
-DeviceMemory.register_backend(DeviceType.ROCM, ROCmMemory)
-```
-
-## Troubleshooting
-
-Common issues and solutions:
-
-1. **Out of Memory**: Increase `max_memory` or enable `expandable_segments`
-2. **High Fragmentation**: Use `BestFitAllocator` or enable defragmentation
-3. **Slow Allocation**: Enable caching with `CachingAllocator`
-4. **Memory Leaks**: Use profiler to track unreleased allocations
 
 ## License
 
-MIT License - See LICENSE file for details
+MIT — see [../LICENSE](../LICENSE).
+</content>
+</invoke>

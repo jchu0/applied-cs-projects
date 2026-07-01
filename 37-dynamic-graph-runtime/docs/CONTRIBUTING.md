@@ -319,13 +319,6 @@ def function_name(param1: Type1, param2: Type2) -> ReturnType:
 5. Create GitHub release
 6. Deploy to PyPI
 
-## Getting Help
-
-- Open an issue for bugs or features
-- Join our Discord/Slack channel
-- Check existing documentation
-- Ask questions in discussions
-
 ## Recognition
 
 Contributors will be recognized in:

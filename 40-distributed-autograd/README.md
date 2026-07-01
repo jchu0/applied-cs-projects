@@ -1,351 +1,166 @@
 # Distributed Autograd System
 
-A PyTorch-inspired distributed automatic differentiation system supporting data parallelism (DDP), model parallelism (FSDP), and RPC-based autograd for distributed deep learning training.
+A PyTorch-inspired distributed training framework built from scratch in pure Python and NumPy. It implements data-parallel training (DDP), fully-sharded data parallelism (FSDP), pipeline parallelism, RPC-based autograd, gradient bucketing with communication/computation overlap, gradient compression, and fault tolerance — all as an in-process simulation so the mechanics are inspectable without a GPU cluster.
 
 ## Features
 
-- **Distributed Data Parallel (DDP)**: Efficient gradient synchronization across workers
-- **Fully Sharded Data Parallel (FSDP)**: Memory-efficient model parallelism
-- **RPC Autograd**: Automatic differentiation across network boundaries
-- **Gradient Accumulation**: Support for large batch training
-- **Multiple Communication Backends**: NCCL, Gloo, MPI support
-- **Pipeline Parallelism**: Split models across devices
-- **Mixed Precision Training**: FP16/BF16 support
-- **Dynamic Process Groups**: Flexible communication topologies
+- **Distributed Data Parallel** — wraps a module, registers per-parameter gradient hooks, and reduces gradients in size-capped buckets (`DistributedDataParallel`, `Reducer` / `distributed/ddp.py`).
+- **Gradient bucketing** — groups parameters into reverse-order buckets so reduction can overlap with the backward pass; flatten/unflatten into a contiguous buffer (`GradientBucket`).
+- **Communication scheduler** — a thread pool that runs AllReduce off the critical path and records overlap, bandwidth, and per-bucket timing (`CommunicationScheduler`, `CommunicationStats`).
+- **Fully Sharded Data Parallel** — flattens and shards parameters across ranks, all-gathers for forward, reduce-scatters gradients, with CPU-offload and mixed-precision policies (`EnhancedFSDP`, `FSDPConfig`).
+- **Pipeline parallelism** — splits a model into stages and runs GPipe fill-drain or 1F1B interleaved micro-batch schedules (`PipelineParallel`, `PipelineSchedule`).
+- **RPC autograd** — tracks send/recv functions across simulated worker boundaries and runs a distributed backward pass (`RPCAutograd`, `DistAutogradContext`, `rpc_sync` / `rpc_async`).
+- **Gradient compression** — Top-K sparsification, int8 quantization, error feedback, and PowerSGD low-rank approximation (`TopKCompressor`, `QuantizedCompressor`, `PowerSGDCompressor`).
+- **Pluggable backends** — NCCL, Gloo, MPI, and Simulated backends behind a common interface plus a registry (`AbstractBackend`, `BackendRegistry`, `create_backend`).
+- **Fault tolerance** — heartbeat-based health monitoring, atomic checkpointing with rotation, recovery, and elastic membership changes (`HealthMonitor`, `Checkpointer`, `RecoveryManager`, `ElasticTrainer`).
+- **Adaptive communication** — picks Ring / Tree / recursive-halving based on a cost model over estimated bandwidth and latency (`AdaptiveCommunicator`).
+- **Device mesh** — an N-dimensional grid of device IDs with row-major flattening and submesh extraction for higher-dimensional parallelism layouts (`DeviceMesh`).
 
-## Installation
+## Architecture
 
-```bash
-# Clone the repository
-git clone <repository-url>
-cd projects/39-distributed-autograd
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install with MPI support (optional)
-pip install mpi4py
-
-# Install in development mode
-pip install -e .
+```mermaid
+flowchart TD
+    Model(User module and parameters) --> DDP(DistributedDataParallel)
+    DDP --> Hooks(Per-parameter grad hooks)
+    Hooks --> Reducer(Reducer with bucketing)
+    Reducer --> Sched(CommunicationScheduler thread pool)
+    Sched --> Backend(Backend - NCCL / Gloo / MPI / Simulated)
+    Model --> FSDP(EnhancedFSDP sharding)
+    Model --> Pipe(PipelineParallel stages)
+    Model --> RPC(RPCAutograd remote backward)
+    FSDP --> Backend
+    Pipe --> Backend
+    RPC --> Backend
 ```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Distributed context | `core/context.py` | Process groups, device mesh, distributed tensors, collective stubs |
+| Data parallel | `distributed/ddp.py` | DDP wrapper, reducer, bucketing, scheduler, backends, compression, fault tolerance |
+| Pipeline | `pipeline/pipeline.py` | Stage split and GPipe / 1F1B micro-batch schedules |
+| RPC autograd | `rpc/autograd.py` | Remote references, RPC calls, distributed backward |
 
 ## Quick Start
 
-### Basic DDP Training
+### Prerequisites
 
-```python
-from distautograd import DistributedContext, DistributedDataParallel
-from distautograd.core import WorkerInfo, Backend
+- Python 3.9+
+- NumPy (the only hard dependency); `pytest` for the test suite. No GPU or cluster needed.
 
-# Initialize distributed context
-worker = WorkerInfo(
-    rank=0,
-    world_size=4,
-    local_rank=0,
-    hostname="node1"
-)
-context = DistributedContext(worker_info=worker, backend=Backend.NCCL)
+### Installation
 
-# Wrap model with DDP
-model = YourModel()
-ddp_model = DistributedDataParallel(
-    model,
-    device_ids=[0],
-    broadcast_buffers=True
-)
-
-# Training loop
-for batch in dataloader:
-    # Forward pass
-    output = ddp_model(batch)
-    loss = criterion(output, target)
-
-    # Backward pass with gradient sync
-    loss.backward()
-
-    # Optimizer step
-    optimizer.step()
-    optimizer.zero_grad()
+```bash
+pip install -e ".[dev]"
 ```
 
-### FSDP for Large Models
+### Running
+
+This is a library, not a service. Import the package and drive it from Python (see Usage), or run the test suite to exercise every component.
+
+## Usage
+
+A minimal end-to-end DDP flow: wrap a module, run forward, populate gradients, and reduce them. Any object exposing `parameters()` and `__call__`/`forward` counts as a module, and any object with `.data`, `.grad`, and `register_hook` counts as a parameter — the framework is duck-typed rather than tied to a base class.
 
 ```python
-from distautograd.distributed import FullyShardedDataParallel
+import numpy as np
+from distautograd import DistributedDataParallel, GradReducer
+from distautograd.core import ProcessGroup
+from distautograd.core.context import Backend
 
-# Shard large model across GPUs
-fsdp_model = FullyShardedDataParallel(
-    model,
-    sharding_strategy="full_shard",
-    cpu_offload=True,  # Offload to CPU for memory savings
-    mixed_precision=True  # Use FP16
-)
+# A minimal module: anything with parameters() and __call__/forward.
+class Linear:
+    def __init__(self):
+        self._params = [_Param((64, 64)), _Param((64,))]
+    def parameters(self):
+        return iter(self._params)
+    def __call__(self, x):
+        return x
 
-# Training with automatic sharding
-for batch in dataloader:
-    output = fsdp_model(batch)
-    loss = criterion(output, target)
+class _Param:
+    def __init__(self, shape):
+        self.data = np.random.randn(*shape).astype(np.float32)
+        self.grad = None
+        self.requires_grad = True
+        self._hooks = []
+    def register_hook(self, hook):
+        self._hooks.append(hook)
 
-    # Gradients automatically gathered and sharded
-    loss.backward()
-    optimizer.step()
+group = ProcessGroup(ranks=[0, 1, 2, 3], backend=Backend.GLOO)
+model = DistributedDataParallel(Linear(), process_group=group, bucket_cap_mb=25.0)
+
+# Forward (prepares the reducer for the next backward).
+out = model(np.random.randn(32, 64).astype(np.float32))
+
+# Simulate a backward by populating gradients, then reduce them.
+for p in model.parameters():
+    p.grad = np.ones_like(p.data)
+
+reducer = GradReducer(model.parameters(), group)
+reducer.reduce_gradients()   # averages each bucket by world size (4)
 ```
 
-### RPC-Based Training
+Gradient compression is a standalone round-trip — compress a tensor to a compact payload plus metadata, then reconstruct it:
 
 ```python
-from distautograd.rpc import RPCAutograd, rpc_async
+from distautograd.distributed.ddp import TopKCompressor
 
-# Initialize RPC
-rpc.init_rpc(
-    name=f"worker_{rank}",
-    rank=rank,
-    world_size=world_size
-)
-
-# Define remote function
-@rpc_async
-def remote_forward(tensor, model_shard):
-    return model_shard(tensor)
-
-# Distributed forward pass
-autograd = RPCAutograd()
-ctx = autograd.create_context()
-
-# Send computation to remote worker
-future = remote_forward.remote(
-    "worker_1",
-    input_tensor,
-    remote_model
-)
-output = future.wait()
-
-# Automatic gradient computation across RPC
-gradients = autograd.backward(ctx, loss.grad)
+compressor = TopKCompressor(compression_ratio=0.01)   # keep the top 1% of elements
+payload, meta = compressor.compress(np.random.randn(1000).astype(np.float32))
+restored = compressor.decompress(payload, meta)        # scattered back into a zero tensor
 ```
 
-## Examples
-
-### Example 1: Multi-Node Training
+Pipeline schedules can be planned without running any modules — the planners emit the op order as data, which is handy for visualization or assertions:
 
 ```python
-import torch.distributed as dist
-from distautograd import DistributedContext, DistributedDataParallel
+from distautograd.pipeline.pipeline import GPipeSchedule
 
-def setup(rank, world_size):
-    # Initialize process group
-    dist.init_process_group(
-        backend="nccl",
-        init_method="tcp://master_ip:12345",
-        world_size=world_size,
-        rank=rank
-    )
-
-    # Create distributed context
-    context = DistributedContext.from_torch_distributed()
-
-    # Setup model and optimizer
-    model = create_model().cuda(rank)
-    model = DistributedDataParallel(model, device_ids=[rank])
-
-    optimizer = torch.optim.Adam(model.parameters())
-
-    # Training loop
-    train(model, optimizer, rank)
-
-def train(model, optimizer, rank):
-    dataloader = get_dataloader(rank)
-
-    for epoch in range(num_epochs):
-        for batch in dataloader:
-            output = model(batch)
-            loss = compute_loss(output)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        # Synchronize at epoch end
-        dist.barrier()
+schedule = GPipeSchedule(num_stages=4, num_microbatches=8)
+ops = schedule.get_schedule()   # list of (stage, microbatch, 'F'|'B') tuples
 ```
 
-### Example 2: Pipeline Parallelism
+## Configuration
 
-```python
-from distautograd.pipeline import PipelineParallel
+Behavior is set through constructor arguments and small config dataclasses rather than a config file:
 
-# Split model into stages
-model_stages = [
-    nn.Sequential(layer1, layer2),  # Stage 0
-    nn.Sequential(layer3, layer4),  # Stage 1
-    nn.Sequential(layer5, layer6),  # Stage 2
-    nn.Sequential(layer7, output),  # Stage 3
-]
+- `bucket_cap_mb` (default 25.0) — the size cap that determines how parameters pack into buckets; the same knob PyTorch DDP exposes.
+- `FSDPConfig(sharding_strategy=..., cpu_offload=..., mixed_precision=...)` — selects `FULL_SHARD` / `SHARD_GRAD_OP` / `NO_SHARD` / `HYBRID_SHARD` and the offload / precision policies.
+- `PipelineSchedule.GPIPE` vs `PipelineSchedule.INTERLEAVED` — fill-drain versus 1F1B micro-batch scheduling.
+- Compressor knobs — `TopKCompressor(compression_ratio=...)`, `QuantizedCompressor(bits=...)`, `PowerSGDCompressor(rank=..., num_iters=...)`.
 
-# Create pipeline
-pipeline = PipelineParallel(
-    stages=model_stages,
-    num_micro_batches=8,
-    schedule="1F1B"  # One forward, one backward
-)
+See [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the full design and the semantics of each option.
 
-# Run pipeline training
-for batch in dataloader:
-    loss = pipeline.forward_backward(batch, target)
+## What's Real vs Simulated
 
-    # Gradient sync happens automatically
-    optimizer.step()
-    optimizer.zero_grad()
-```
-
-### Example 3: Gradient Accumulation
-
-```python
-from distautograd import DistributedContext
-
-# Setup gradient accumulation
-context = DistributedContext.get_instance()
-context.enable_gradient_accumulation(steps=4)
-
-accumulation_steps = 4
-for i, batch in enumerate(dataloader):
-    # Forward and backward
-    output = model(batch)
-    loss = criterion(output, target) / accumulation_steps
-    loss.backward()
-
-    # Step accumulation counter
-    should_sync = context.step_gradient_accumulation()
-
-    if should_sync:
-        # Synchronize and update weights
-        optimizer.step()
-        optimizer.zero_grad()
-```
+- **Real:** Bucket construction and reverse ordering, flatten/unflatten, gradient averaging by world size, the thread-pool `CommunicationScheduler` with overlap/bandwidth stats, all gradient compressors (Top-K, quantization, error feedback, PowerSGD) including encode/decode round-trips, FSDP flatten/shard/all-gather/reduce-scatter math, pipeline schedule generation, atomic checkpoint write with rotation, heartbeat staleness detection, and the adaptive cost model. These run fully in-process and are covered by the tests.
+- **Simulated / requires credentials:** The collectives themselves. AllReduce/AllGather/Broadcast/ReduceScatter return the local tensor (or copies) rather than exchanging data over a network — there is a single process. The NCCL, Gloo, and MPI backends log their operations but do not call into the real libraries; `BackendRegistry` marks NCCL and MPI as unavailable. RPC executes the target function locally instead of over the wire.
 
 ## Testing
 
 ```bash
-# Run all tests
-python -m pytest tests/
-
-# Run distributed tests (requires multiple GPUs)
-python -m pytest tests/test_distributed.py -v
-
-# Run with specific number of processes
-mpirun -np 4 python -m pytest tests/test_mpi.py
-
-# Run integration tests
-python -m pytest tests/test_integration.py --dist
+pytest tests/ -v
 ```
 
-## Performance
+390 tests across eight files cover AllReduce strategies, gradient bucketing, the communication scheduler, communication primitives, DDP, FSDP, fault tolerance, and the enterprise features (backends, compression, adaptive communication, elastic training). The suite is pure CPU and needs no external services; the full run completes in well under a second.
 
-Benchmark results (8x A100 GPUs):
+Because correctness here means "produces the value the real collective would," the tests assert on the local arithmetic — for example, a bucket of all-fours gradients averaged over world size 4 yields all-ones, and reducing without a process group performs no averaging.
 
-| Configuration | Model | Batch Size | Throughput | Scaling |
-|--------------|-------|------------|------------|---------|
-| Single GPU   | GPT-2 | 32         | 100 img/s  | 1.0x    |
-| DDP 4 GPUs   | GPT-2 | 128        | 380 img/s  | 3.8x    |
-| DDP 8 GPUs   | GPT-2 | 256        | 720 img/s  | 7.2x    |
-| FSDP 8 GPUs  | GPT-3 | 512        | 650 img/s  | -       |
+## Project Structure
 
-## Architecture
-
-Key components:
-
-- **Distributed Context**: Global state management
-- **Process Groups**: Communication topology
-- **DDP Module**: Data parallel wrapper
-- **FSDP Module**: Fully sharded wrapper
-- **RPC Autograd**: Remote differentiation
-- **Pipeline Module**: Pipeline parallelism
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
-
-## API Documentation
-
-Complete API reference in [docs/API.md](docs/API.md).
-
-## Contributing
-
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
-
-## Deployment
-
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for deployment instructions.
-
-## Advanced Features
-
-### Custom Reduction Operations
-
-```python
-from distautograd import custom_reduce_op
-
-@custom_reduce_op
-def custom_average(tensors):
-    # Custom reduction logic
-    stacked = torch.stack(tensors)
-    return stacked.mean(dim=0)
-
-# Use in DDP
-ddp_model = DistributedDataParallel(
-    model,
-    reducer=custom_average
-)
 ```
-
-### Dynamic Process Groups
-
-```python
-# Create custom process groups
-data_parallel_group = ProcessGroup(
-    ranks=[0, 1, 2, 3],
-    backend=Backend.NCCL
-)
-
-model_parallel_group = ProcessGroup(
-    ranks=[0, 4],
-    backend=Backend.NCCL
-)
-
-context.add_process_group("dp", data_parallel_group)
-context.add_process_group("mp", model_parallel_group)
-
-# Use specific group for communication
-ddp_model = DistributedDataParallel(
-    model,
-    process_group="dp"
-)
+40-distributed-autograd/
+  README.md
+  pyproject.toml
+  src/distautograd/
+    core/context.py           # process groups, device mesh, tensors, collectives
+    distributed/ddp.py         # DDP, reducer, scheduler, FSDP, backends, compression, fault tolerance
+    pipeline/pipeline.py       # pipeline stages and schedules
+    rpc/autograd.py            # RPC and distributed autograd
+  tests/                       # 390 pytest tests across eight files
+  docs/
+    BLUEPRINT.md               # full design document
+    ARCHITECTURE.md            # architecture notes and diagrams
 ```
-
-### Gradient Compression
-
-```python
-from distautograd import GradientCompressor
-
-# Enable gradient compression
-compressor = GradientCompressor(
-    compression_ratio=0.1,  # Keep top 10% of gradients
-    method="topk"
-)
-
-ddp_model = DistributedDataParallel(
-    model,
-    gradient_compressor=compressor
-)
-```
-
-## Troubleshooting
-
-Common issues:
-
-1. **NCCL Timeout**: Increase timeout with `NCCL_TIMEOUT=3600`
-2. **OOM with FSDP**: Enable CPU offloading or reduce batch size
-3. **Uneven GPU Usage**: Check data distribution and load balancing
-4. **Slow Communication**: Ensure high-speed interconnect (NVLink/InfiniBand)
 
 ## License
 
-MIT License - See LICENSE file for details
+MIT — see ../LICENSE

@@ -313,10 +313,3 @@ def health_check():
     return metrics
 ```
 
-## Future Enhancements
-
-1. **Unified Memory Management**: Support for CPU-GPU unified memory
-2. **Multi-GPU Pools**: Coordinated allocation across multiple GPUs
-3. **Persistent Memory**: Support for persistent memory devices
-4. **Machine Learning Optimization**: ML-based allocation prediction
-5. **Hardware Offload**: Offload allocation logic to dedicated hardware

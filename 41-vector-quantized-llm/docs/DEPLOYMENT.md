@@ -272,19 +272,15 @@ print(f"Throughput: {results['throughput']:.2f} tokens/sec")
 
 ### Architecture
 
-```
-                     Load Balancer
-                          |
-            +-------------+-------------+
-            |             |             |
-        Server 1      Server 2      Server 3
-            |             |             |
-      Quantized      Quantized      Quantized
-        Model          Model          Model
-            |             |             |
-         Cache         Cache         Cache
-            |             |             |
-      Monitoring    Monitoring    Monitoring
+```mermaid
+flowchart TD
+    LB["Load Balancer"]
+    LB --> S1["Server 1"]
+    LB --> S2["Server 2"]
+    LB --> S3["Server 3"]
+    S1 --> M1["Quantized Model"] --> C1["Cache"] --> Mon1["Monitoring"]
+    S2 --> M2["Quantized Model"] --> C2["Cache"] --> Mon2["Monitoring"]
+    S3 --> M3["Quantized Model"] --> C3["Cache"] --> Mon3["Monitoring"]
 ```
 
 ### High Availability Setup
@@ -861,16 +857,7 @@ with timer("Total inference"):
         tokens = postprocess(logits)
 ```
 
-## Support
-
-### Resources
-
-- Documentation: https://docs.vqllm.ai
-- GitHub Issues: https://github.com/your-org/vqllm/issues
-- Discord Community: https://discord.gg/vqllm
-- Email Support: support@vqllm.ai
-
-### FAQ
+## FAQ
 
 **Q: Which quantization method should I use?**
 A: For most use cases, GPTQ with 4-bit quantization provides the best balance. Use INT8 for minimal quality loss, or AWQ for models with known activation patterns.

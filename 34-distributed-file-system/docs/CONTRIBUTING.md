@@ -573,13 +573,6 @@ We use Semantic Versioning (SemVer):
 - Slack: Real-time chat (invite link in README)
 - Mailing List: Major announcements
 
-### Getting Help
-
-- Check existing documentation
-- Search closed issues
-- Ask in GitHub Discussions
-- Join our Slack channel
-
 ## Recognition
 
 Contributors are recognized in:

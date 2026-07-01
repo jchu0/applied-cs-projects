@@ -1,219 +1,183 @@
 # GNN Runtime
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-
-A high-performance graph neural network runtime system optimized for GPU sparse operations, efficient graph partitioning, and scalable message passing. This project implements the core primitives needed for training and inference of GNNs on large-scale graphs with millions to billions of edges.
+A from-scratch graph neural network runtime built around sparse graph storage, message
+passing, neighbor sampling, and the GCN/GAT/GraphSAGE layers. The graph storage and the sparse
+kernels are pure NumPy; the trainable layers and fused kernels use PyTorch when it is installed,
+with NumPy fallbacks for the core message-passing and sparse operations so the runtime is usable
+without a deep-learning framework.
 
 ## Features
 
-- **Efficient Graph Storage**
-  - CSR/CSC sparse matrix formats
-  - Hybrid format for bidirectional operations
-  - Memory-mapped support for large graphs
-  - Node and edge feature storage
+- **Sparse graph storage** — CSR/CSC/COO/hybrid layouts with neighbor, degree, subgraph, and
+  self-loop operations, built from edge lists or adjacency matrices (`GraphStorage`,
+  `GraphFormat`).
+- **Graph partitioning** — balanced round-robin and degree-aware ("METIS-style") partitioning
+  with halo (ghost) node tracking and edge-cut metrics (`PartitionedGraph`).
+- **Message passing** — configurable message and aggregation functions over edges, with an
+  attention-weighted and multi-head variant; a NumPy-only path for framework-free use
+  (`MessagePassingEngine`, `MessagePassingNumpy`).
+- **Neighbor sampling** — multi-hop fanout sampling, personalized-PageRank sampling, layer-wise
+  and cluster sampling for mini-batch training (`NeighborSampler`, `PPRSampler`).
+- **Sparse kernels** — scatter-add/mean/max, CSR and COO SpMM, segment reductions, edge softmax,
+  and fused gather-scatter aggregation (`SparseOps`, `scatter_add`, `spmm`, `SparseOpsNumpy`).
+- **GNN layers** — `GCNLayer` (symmetric normalization), `GATLayer` (multi-head attention),
+  `GraphSAGELayer` (mean/max aggregators), and a stackable `GNNModel` with jumping-knowledge
+  options.
+- **Distributed training scaffolding** — single-process trainer with graph partitioning, a
+  halo-exchange interface, and a `VertexReorderOptimizer` (RCM, degree, partition reordering) for
+  cache locality (`DistributedGNNTrainer`, `HaloExchange`).
 
-- **Message Passing Engine**
-  - Configurable aggregation functions (sum, mean, max)
-  - GCN, GAT, and GraphSAGE layer implementations
-  - Edge feature support in message computation
-  - GPU-accelerated operations
+## Architecture
 
-- **Neighbor Sampling**
-  - Multi-hop uniform sampling
-  - PPR-based importance sampling
-  - Efficient mini-batch graph construction
-  - Parallel sampling implementation
+```mermaid
+flowchart TD
+    EL[Edge list / adjacency] --> GS[GraphStorage CSR / CSC]
+    GS --> PG[PartitionedGraph]
+    GS --> SM[Samplers #40;Neighbor / PPR / Layer / Cluster#41;]
+    SM --> SUB[SampledSubgraph]
+    GS --> MP[MessagePassingEngine / NumPy]
+    SUB --> MP
+    MP --> K[Sparse kernels: scatter / spmm / edge softmax]
+    K --> L[GCN / GAT / GraphSAGE layers]
+    L --> M[GNNModel]
+    PG --> DT[DistributedGNNTrainer]
+    M --> DT
+    DT --> HE[HaloExchange]
+```
 
-- **GPU Kernels**
-  - SpMM CUDA kernel (CSR format)
-  - Scatter-add and gather operations
-  - Memory-coalesced access patterns
-  - JIT-compiled kernels
-
-- **Multi-GPU Training**
-  - Graph partitioning (METIS-style)
-  - Distributed training with DDP
-  - Halo node synchronization
-  - Vertex reordering for cache efficiency
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Graph storage | `graph.py` | CSR/CSC/COO storage, partitioning, halo nodes |
+| Message passing | `message_passing.py` | message + aggregate functions, attention propagation |
+| Sampling | `sampling.py` | neighbor, PPR, layer, and cluster samplers |
+| Kernels | `kernels.py` | scatter, SpMM, segment reduce, edge softmax, fused ops |
+| Layers | `layers.py` | GCN, GAT, GraphSAGE, GNNModel |
+| Distributed | `distributed.py` | partitioned trainer, halo exchange, vertex reordering |
 
 ## Quick Start
+
+### Prerequisites
+
+- Python 3.9+
+- NumPy 1.21+ (the only required dependency). The graph storage, samplers, and NumPy kernel
+  fallbacks run without PyTorch.
+- PyTorch 2.0+ (optional, `pip install -e ".[torch]"`) is required for the trainable layers,
+  the `MessagePassingEngine`, and the distributed trainer.
 
 ### Installation
 
 ```bash
-cd projects/41-gnn-runtime
-pip install -e ".[full]"
+cd 42-gnn-runtime
+pip install -e ".[dev]"          # core + tests
+pip install -e ".[torch,dev]"    # add PyTorch for layers
 ```
 
-### Basic Usage
+### Running
+
+This is a library; exercise it from Python or run the tests:
+
+```bash
+pytest tests/ -v
+```
+
+## Usage
+
+Build a graph and query its structure (pure NumPy, no PyTorch needed):
 
 ```python
-from gnn_runtime import GraphStorage, GNNLayer, NeighborSampler
 import numpy as np
-import torch
+from gnn_runtime import GraphStorage
 
-# Create graph from edge list
-src = np.array([0, 1, 2, 1])
-dst = np.array([1, 2, 0, 3])
-graph = GraphStorage.from_edge_list(src, dst, num_nodes=4)
+src = np.array([0, 0, 1, 2, 3])
+dst = np.array([1, 2, 2, 3, 0])
+g = GraphStorage.from_edge_list(src, dst, num_nodes=4)
 
-# Add node features
-graph.node_features['x'] = np.random.randn(4, 128).astype(np.float32)
-graph.node_features['y'] = np.array([0, 1, 0, 1])
-
-# Build CSC for incoming edge queries
-graph.to_csc()
-
-# Create GNN layer
-model = GNNLayer(128, 64, message_type='gcn')
-
-# Create sampler for mini-batch training
-sampler = NeighborSampler(graph, fanouts=[10, 5], device='cuda')
-
-# Sample and forward pass
-seeds = torch.tensor([0, 1])
-subgraph = sampler.sample(seeds)
-features = torch.tensor(graph.node_features['x'][subgraph.node_ids.numpy()])
-output = model(features, subgraph.edge_index)
+print(g.get_neighbors(0, direction="out"))  # [1 2]
+print(g.degrees(direction="out"))           # degree per node
+sub = g.subgraph(np.array([0, 1, 2]))       # induced subgraph
 ```
 
-### Training Loop
+Run NumPy message passing over node features:
 
 ```python
-from gnn_runtime import GraphStorage, GNNLayer, NeighborSampler
-import torch
-import torch.nn.functional as F
+import numpy as np
+from gnn_runtime.message_passing import MessagePassingNumpy
 
-# Create model and optimizer
-model = GNNLayer(128, 64, message_type='gcn')
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+edge_index = np.array([[0, 0, 1, 2],
+                       [1, 2, 2, 3]])      # [2, E]
+features = np.eye(4, dtype=np.float32)
 
-# Create sampler
-sampler = NeighborSampler(graph, fanouts=[10, 5], device='cuda')
-
-# Training loop
-for epoch in range(100):
-    for batch_seeds in dataloader:
-        # Sample subgraph
-        subgraph = sampler.sample(batch_seeds)
-
-        # Get features
-        features = torch.tensor(
-            graph.node_features['x'][subgraph.node_ids.numpy()],
-            device='cuda'
-        )
-        labels = torch.tensor(
-            graph.node_features['y'][batch_seeds.numpy()],
-            device='cuda'
-        )
-
-        # Forward pass
-        optimizer.zero_grad()
-        out = model(features, subgraph.edge_index)
-        loss = F.cross_entropy(out[:len(batch_seeds)], labels)
-
-        # Backward pass
-        loss.backward()
-        optimizer.step()
-
-    print(f"Epoch {epoch}: Loss = {loss.item():.4f}")
+summed = MessagePassingNumpy.propagate_sum(edge_index, features)
+averaged = MessagePassingNumpy.propagate_mean(edge_index, features)
 ```
 
-### Distributed Training
+Partition a graph and inspect the cut:
 
 ```python
-from gnn_runtime import DistributedGNNTrainer
+from gnn_runtime import PartitionedGraph
 
-# Initialize distributed training
-trainer = DistributedGNNTrainer(
-    model=model,
-    graph=graph,
-    num_gpus=4,
-    partition_method='metis'
-)
-
-# Train
-for epoch in range(100):
-    loss = trainer.train_epoch(optimizer, loss_fn)
-    print(f"Epoch {epoch}: Loss = {loss:.4f}")
+pg = PartitionedGraph(g, num_partitions=2)
+pg.partition_balanced()
+print(pg.edge_cut_ratio(), pg.partition_sizes())
+halo = pg.get_halo_nodes(0)
 ```
 
-## Architecture
+Train a GCN (requires PyTorch):
 
-```
-+------------------------------------------------------------------+
-|                    GNN Runtime Architecture                       |
-+------------------------------------------------------------------+
-|                                                                    |
-|  +-------------------+     +-------------------+     +-----------+ |
-|  | Graph Storage     |     | Message Passing   |     | Neighbor  | |
-|  | Engine            |<--->| Engine            |<--->| Sampler   | |
-|  +-------------------+     +-------------------+     +-----------+ |
-|         |                          |                       |       |
-|         v                          v                       v       |
-|  +-------------------+     +-------------------+     +-----------+ |
-|  | Feature Store     |     | GPU Kernel Pool   |     | Partition | |
-|  | (Node/Edge)       |     | (SpMM, Scatter)   |     | Manager   | |
-|  +-------------------+     +-------------------+     +-----------+ |
-|                                    |                               |
-|                                    v                               |
-|  +----------------------------------------------------------+     |
-|  |                Multi-GPU Execution Engine                 |     |
-|  |  +--------+  +--------+  +--------+  +--------+           |     |
-|  |  | GPU 0  |  | GPU 1  |  | GPU 2  |  | GPU 3  |           |     |
-|  |  +--------+  +--------+  +--------+  +--------+           |     |
-|  +----------------------------------------------------------+     |
-+------------------------------------------------------------------+
+```python
+import torch
+from gnn_runtime import GNNModel
+
+edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 0]])
+x = torch.randn(4, 8)
+
+model = GNNModel(in_channels=8, hidden_channels=16, out_channels=3,
+                 num_layers=2, layer_type="gcn")
+logits = model(x, edge_index)   # [4, 3]
 ```
 
-## Performance Targets
+## What's Real vs Simulated
 
-| Metric | Target | Notes |
-|--------|--------|-------|
-| SpMM throughput | >100 GFLOPS | On V100 GPU |
-| Sampling rate | >1M nodes/sec | With fanout [10, 10] |
-| Training throughput | >100K nodes/sec | Full GCN pipeline |
-| Memory efficiency | <2x theoretical | Compared to dense |
-| Multi-GPU scaling | >80% efficiency | Up to 8 GPUs |
+- **Real:** `GraphStorage` (CSR/CSC/COO construction, neighbor/degree/subgraph/self-loop
+  operations), the partitioner (balanced and degree-aware) and halo-node tracking, the
+  NumPy message-passing and sparse-kernel paths, the PyTorch GCN/GAT/GraphSAGE layers and
+  `GNNModel`, and the samplers (multi-hop fanout, PPR power iteration, layer, cluster). All are
+  exercised by the test suite.
+- **Simulated / requires extras:** "Distributed" training runs in a single process —
+  `DistributedGNNTrainer` only calls `torch.distributed` init when `num_gpus > 1` and CUDA is
+  present, and `HaloExchange.exchange` returns features unchanged unless a process group is
+  initialized, so tests run the single-rank path. `partition_metis` is a simplified degree-aware
+  heuristic, not the real METIS library. There is no memory-mapped or out-of-core storage; graphs
+  live in memory. Datasets in tests are randomly generated, not standard benchmarks.
 
 ## Testing
 
 ```bash
-# Run all tests
 pytest tests/ -v
-
-# Run specific test file
-pytest tests/test_graph_storage.py -v
-
-# Run with coverage
-pytest tests/ --cov=gnn_runtime --cov-report=html
 ```
 
-## Documentation
+Tests cover graph storage and partitioning (`test_graph.py`), message passing including the
+NumPy fallback (`test_message_passing.py`), samplers (`test_sampling.py`), sparse kernels
+(`test_kernels.py`), the GNN layers and full models (`test_layers.py`), and the distributed
+scaffolding and vertex reordering (`test_distributed.py`). PyTorch-dependent tests are skipped
+when torch is not installed; the NumPy paths run unconditionally.
 
-- [Architecture Overview](docs/ARCHITECTURE.md) - System design and components
-- [API Reference](docs/API.md) - Complete API documentation
-- [Deployment Guide](docs/DEPLOYMENT.md) - Production deployment instructions
+## Project Structure
 
-## Dependencies
-
-- Python >= 3.9
-- PyTorch >= 2.0
-- CUDA >= 11.0
-- NumPy
-- SciPy (for sparse operations)
-- (Optional) METIS for graph partitioning
+```
+42-gnn-runtime/
+  README.md
+  src/gnn_runtime/
+    graph.py            # GraphStorage, PartitionedGraph
+    message_passing.py  # MessagePassingEngine, MessagePassingNumpy
+    sampling.py         # NeighborSampler, PPRSampler, Layer/Cluster samplers
+    kernels.py          # scatter, spmm, SparseOps, SparseOpsNumpy, FusedOps
+    layers.py           # GCN, GAT, GraphSAGE, GNNModel
+    distributed.py      # DistributedGNNTrainer, HaloExchange, VertexReorderOptimizer
+  tests/                # graph, message passing, sampling, kernels, layers, distributed
+  docs/BLUEPRINT.md     # full architecture and design
+```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## References
-
-- DGL: Deep Graph Library
-- PyTorch Geometric
-- GraphSAGE: Inductive Representation Learning on Large Graphs
-- GAT: Graph Attention Networks
-- Cluster-GCN: An Efficient Algorithm for Training Deep and Large Graph Convolutional Networks
+MIT — see ../LICENSE.

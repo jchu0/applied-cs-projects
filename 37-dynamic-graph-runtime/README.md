@@ -1,239 +1,171 @@
 # Dynamic Graph Execution Runtime
 
-A Python-native dynamic graph execution runtime inspired by PyTorch's TorchDynamo and TorchFX. This system captures Python code into optimizable intermediate representations, performs graph-level transformations, and lowers to efficient backends while maintaining Python semantics.
+A Python-native dynamic graph execution runtime, built from scratch, inspired by PyTorch's TorchDynamo and TorchFX. It captures straight-line Python tensor code by interpreting CPython bytecode, builds a computation graph, runs optimization passes over it, and lowers it to a NumPy or PyTorch backend behind a `torch.compile()`-style decorator with a guarded compilation cache.
 
 ## Features
 
-- **Dynamic Graph Capture**: Trace Python bytecode to build computation graphs
-- **Symbolic Tensor Execution**: Track tensor operations symbolically
-- **Graph Optimization**: Apply transformations like constant folding and operator fusion
-- **Multiple Backends**: Support for eager, CUDA, and custom backends
-- **JIT Compilation**: Compile hot paths for improved performance
-- **Guard System**: Recompile when assumptions change
-- **Python Semantics**: Preserve exact Python behavior
+- **Bytecode tracing** — walks a function's CPython bytecode with `dis` and symbolically executes the supported opcode families (loads, stores, stack manipulation, `BINARY_OP`, unary negation, returns) into a graph, recording a *graph break* on anything unsupported (`BytecodeTracer` / `tracer/bytecode_tracer.py`).
+- **Computation graph IR** — typed nodes and edges with rich `NodeMetadata`, a 30+-member `OpType` enum (arithmetic, NN ops, shape ops, reductions, boundary markers), Kahn topological sort with memoization, cycle detection, subgraph extraction, and dict (de)serialization (`Graph` / `Node` / `OpType` / `core/graph.py`).
+- **Symbolic tensors** — operator overloads (`+ - * / @`, negation, and reflected forms so `2 * x` works) that infer NumPy-style broadcast and matmul output shapes, promote dtypes via `np.promote_types`, and propagate `requires_grad` as a logical OR (`SymbolicTensor` / `core/tensor.py`).
+- **Optimization passes** — shape inference, constant folding, algebraic simplification (`x + 0 → x`, `x * 1 → x`, `x * 0 → 0`, `relu(relu(x)) → relu(x)`), dead-code elimination, common-subexpression elimination, operator fusion (`matmul + add → LINEAR`, `conv → bn → relu`), and layout optimization, all run to a fixed point (`GraphOptimizer` / `optimizer/passes.py`).
+- **Inference/training modes** — `optimize_for_inference` splices out `DROPOUT` nodes; `optimize_for_training` clamps to a conservative level ≤ 1, mirroring the `model.eval()`/`model.train()` split.
+- **Pluggable backends** — a class-level registry with a NumPy eager backend (always available, covering arithmetic, activations, shape ops, reductions, `LINEAR`, a naive `CONV2D`, and `BATCHNORM`) and an optional PyTorch CPU/CUDA backend registered only if `torch` imports (`Backend` / `BackendRegistry` / `EagerBackend` / `TorchBackend` / `codegen/backend.py`).
+- **Compilation cache with guards** — caches compiled functions keyed by the code object (`filename:firstlineno:name`), storing a list of shape/dtype-specialized entries per key, with hit-count-with-decay eviction and hit/miss statistics (`CompilationCache` / `ShapeGuard` / `DtypeGuard`).
+- **Guarded specialization** — a call with new shapes or dtypes misses its guards and re-traces, so the cache accumulates multiple specializations of the same function, exactly as a guarded JIT does.
+- **`torch.compile`-style API** — `DynamicCompiler` and a `compile` decorator with `optimization_level`, cache toggle, backend selection, and automatic fallback to eager Python on any tracing/compilation failure.
+- **Context management** — a thread-aware `GlobalContext` singleton plus `no_grad` / `enable_grad` context managers and a `CompilationContext.should_compile` policy (`core/context.py`).
+- **Introspection** — `trace()` returns the captured graph and `explain()` reports original vs. optimized node/edge counts and per-pass change counts.
 
-## Installation
+## Architecture
 
-```bash
-# Clone the repository
-git clone <repository-url>
-cd projects/37-dynamic-graph-runtime
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install in development mode
-pip install -e .
+```mermaid
+flowchart TD
+    Fn["Python function (decorated with compile)"] --> Tracer["BytecodeTracer (dis interpreter)"]
+    Tracer -->|graph break| Eager["Eager fallback (original function)"]
+    Tracer --> Graph["Graph IR (Node / Edge / OpType)"]
+    Graph --> Opt["GraphOptimizer (passes to convergence)"]
+    Opt --> Backend["Backend (EagerBackend NumPy / TorchBackend)"]
+    Backend --> Cache["CompilationCache (guards: shape / dtype)"]
+    Cache --> Result["Compiled function result"]
 ```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Graph IR | `core/graph.py` | `Node` / `Edge` / `OpType`, Kahn topological sort with memoization, cycle detection, `subgraph` / `clone`, `validate`, dict round-trip |
+| Symbolic tensor | `core/tensor.py` | Shape/dtype inference via operator overloads; broadcast and matmul rules; `TensorFactory` constructors |
+| Context | `core/context.py` | `CompilationContext.should_compile` policy, `ExecutionContext` graph stack, thread-aware `GlobalContext`, `no_grad` / `enable_grad` |
+| Tracer | `tracer/bytecode_tracer.py` | Bytecode interpretation over `dis.get_instructions`, value stack, INPUT binding, graph capture, `_GraphBreak` recording |
+| Frame guard | `tracer/frame_guard.py` | Tracing-time `GuardCondition` scaffolding and `GuardFailure` reporting |
+| Optimizer | `optimizer/graph_optimizer.py`, `optimizer/passes.py` | Fixed-point pass pipeline, per-pass telemetry, inference/training entry points |
+| Backends | `codegen/backend.py` | `EagerBackend` (NumPy) and optional `TorchBackend`; `BackendRegistry` with default fallback |
+| Compiler | `codegen/compiler.py` | `DynamicCompiler` decorator, `CompilationCache`, shape/dtype `Guard`s, `compile` / `trace` / `explain` |
 
 ## Quick Start
 
-### Basic Usage
+### Prerequisites
+
+- Python 3.9+
+- NumPy. PyTorch is optional and only needed for the Torch/CUDA backend; the tests run without it.
+
+### Installation
+
+There is no packaging file; the package lives under `src/`. Add it to the path:
+
+```bash
+cd 37-dynamic-graph-runtime
+export PYTHONPATH="$PWD/src:$PYTHONPATH"
+```
+
+### Running
+
+The runtime is a library used from Python:
+
+```python
+import dynamicgraph
+print(dynamicgraph.__version__)
+```
+
+## Usage
+
+Compile a function with the decorator (defaults to the NumPy `eager_numpy` backend):
+
+```python
+import numpy as np
+from dynamicgraph import compile
+
+@compile(optimization_level=2)
+def f(x, y):
+    return x * y + x
+
+x = np.ones((4, 4), dtype=np.float32)
+y = np.full((4, 4), 2.0, dtype=np.float32)
+print(f(x, y))   # traced, optimized, executed; falls back to eager on a graph break
+```
+
+Trace and inspect a graph without executing it:
+
+```python
+from dynamicgraph import trace, explain
+
+g = trace(f, x, y)
+print(g)                  # Graph(name=f, nodes=..., edges=...)
+print(explain(f, x, y))   # node counts and per-pass change summary
+```
+
+Build a graph by hand and run optimization passes:
+
+```python
+from dynamicgraph import Graph, Node, OpType, GraphOptimizer
+
+g = Graph(name="manual")
+inp = g.add_node(Node(op_type=OpType.INPUT, name="x"))
+relu = g.add_node(Node(op_type=OpType.RELU, name="act"))
+out = g.add_node(Node(op_type=OpType.OUTPUT, name="y"))
+g.add_edge(inp, relu)
+g.add_edge(relu, out)
+
+assert g.validate() == []          # validate() returns a list of issues (empty == valid)
+optimized, stats = GraphOptimizer(optimization_level=2).optimize(g)
+```
+
+Observe guarded specialization and cache statistics. Each new shape re-traces and adds a
+separate cache entry keyed under the same code object:
 
 ```python
 from dynamicgraph import DynamicCompiler
-
-# Create compiler
-compiler = DynamicCompiler(backend="cuda", optimization_level=2)
-
-# Compile a function
-@compiler.compile
-def matrix_operations(x, y, z):
-    temp = x @ y  # Matrix multiplication
-    result = temp + z
-    return result * 2
-
-# Use compiled function
 import numpy as np
-x = np.random.randn(100, 200).astype(np.float32)
-y = np.random.randn(200, 150).astype(np.float32)
-z = np.random.randn(100, 150).astype(np.float32)
 
-result = matrix_operations(x, y, z)
-```
-
-### Graph Construction
-
-```python
-from dynamicgraph import Graph, Node, OpType
-
-# Build graph manually
-graph = Graph(name="my_computation")
-
-# Add operations
-input_node = Node(op_type=OpType.INPUT, name="x")
-relu_node = Node(op_type=OpType.RELU, name="activation")
-output_node = Node(op_type=OpType.OUTPUT, name="output")
-
-# Connect nodes
-x_id = graph.add_node(input_node)
-relu_id = graph.add_node(relu_node)
-out_id = graph.add_node(output_node)
-
-graph.add_edge(x_id, relu_id)
-graph.add_edge(relu_id, out_id)
-
-# Validate and optimize
-if not graph.validate():
-    print("Graph is valid!")
-```
-
-### Bytecode Tracing
-
-```python
-from dynamicgraph import BytecodeTracer
-
-def neural_network_layer(x, weight, bias):
-    # Linear transformation
-    output = x @ weight + bias
-    # Activation
-    return np.maximum(0, output)  # ReLU
-
-# Trace the function
-tracer = BytecodeTracer()
-graph = tracer.trace_function(
-    neural_network_layer,
-    np.ones((32, 128)),
-    np.ones((128, 64)),
-    np.ones(64)
-)
-
-print(f"Captured graph with {len(graph.nodes)} operations")
-```
-
-## Examples
-
-### Example 1: Optimizing Matrix Operations
-
-```python
-from dynamicgraph import DynamicCompiler, GraphOptimizer
-
-def complex_computation(a, b, c, d):
-    # Multiple matrix operations
-    x = a @ b
-    y = c @ d
-    z = x + y
-    return z @ z.T
-
-# Compile with optimizations
 compiler = DynamicCompiler(optimization_level=2)
-optimized_fn = compiler.compile(complex_computation)
 
-# Profile performance
-import time
+@compiler
+def g(a, b):
+    return a @ b + a
 
-# Original version
-start = time.time()
-result1 = complex_computation(a, b, c, d)
-original_time = time.time() - start
+g(np.ones((4, 4), dtype=np.float32), np.ones((4, 4), dtype=np.float32))   # miss: trace + compile
+g(np.ones((4, 4), dtype=np.float32), np.ones((4, 4), dtype=np.float32))   # hit: guards pass
+g(np.ones((8, 8), dtype=np.float32), np.ones((8, 8), dtype=np.float32))   # miss: shape guards fail
 
-# Optimized version
-start = time.time()
-result2 = optimized_fn(a, b, c, d)
-optimized_time = time.time() - start
-
-print(f"Speedup: {original_time / optimized_time:.2f}x")
+print(compiler.get_stats())   # hits, misses, hit rate, compile time
 ```
 
-### Example 2: Custom Backend Integration
+Optimize a hand-built graph for inference, which additionally splices out `DROPOUT` nodes:
 
 ```python
-from dynamicgraph import Backend, BackendRegistry
+from dynamicgraph import GraphOptimizer, Graph, Node, OpType
 
-class MyCustomBackend(Backend):
-    def compile(self, graph):
-        # Custom compilation logic
-        compiled_ops = []
-        for node_id in graph.topological_sort():
-            node = graph.nodes[node_id]
-            compiled_ops.append(self.compile_op(node))
-        return compiled_ops
-
-    def execute(self, compiled, inputs):
-        # Custom execution logic
-        for op in compiled:
-            op.execute(inputs)
-        return inputs['output']
-
-# Register and use
-BackendRegistry.register("mybackend", MyCustomBackend)
-compiler = DynamicCompiler(backend="mybackend")
+optimizer = GraphOptimizer(optimization_level=2)
+optimized, stats = optimizer.optimize_for_inference(some_graph)
+# optimized has no DROPOUT nodes; stats.pass_results reports per-pass changes
 ```
+
+## What's Real vs Simulated
+
+- **Real:** the graph IR, topological sort and validation, symbolic-tensor shape/dtype inference, every optimization pass, the NumPy eager backend, the compilation cache with shape/dtype guards, and the `compile` / `trace` / `explain` API. The bytecode tracer genuinely interprets CPython bytecode (including the 3.11+ `BINARY_OP` and 3.13/3.14 `LOAD_FAST_BORROW` forms) and records real graph breaks.
+- **Simulated / requires credentials:** the tracer covers only straight-line tensor math — any call, branch, loop, or jump triggers a graph break and an eager fallback (no partial-subgraph stitching). The PyTorch/CUDA backend (`TorchBackend`) is registered only if `torch` is importable; without it the runtime is NumPy-only. There is no GPU code generation, and `ExecutionContext.compute_gradients` is a placeholder — no autodiff is implemented.
 
 ## Testing
 
 ```bash
-# Run all tests
-python -m pytest tests/
-
-# Run specific test file
-python -m pytest tests/test_graph.py
-
-# Run with coverage
-python -m pytest --cov=dynamicgraph tests/
-
-# Run integration tests
-python -m pytest tests/test_integration.py -v
+cd 37-dynamic-graph-runtime
+PYTHONPATH="$PWD/src" python -m pytest tests/ -v
 ```
 
-## Architecture
+The `unittest`-based suite covers the graph IR, symbolic tensors, the tracer, each optimizer pass, the backends, and end-to-end integration. No external services are required; the PyTorch paths only run when `torch` happens to be importable.
 
-The system consists of several key components:
+## Project Structure
 
-- **Core**: Graph data structures, tensor abstractions, execution context
-- **Tracer**: Bytecode interpretation and symbolic execution
-- **IR**: Intermediate representation and transformations
-- **Optimizer**: Graph optimization passes
-- **Codegen**: Backend code generation and compilation
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture documentation.
-
-## API Documentation
-
-Comprehensive API documentation is available in [docs/API.md](docs/API.md).
-
-## Performance
-
-Benchmark results on common operations:
-
-| Operation | Input Size | Eager (ms) | Compiled (ms) | Speedup |
-|-----------|------------|------------|---------------|---------|
-| MatMul    | 1000x1000  | 45.2       | 12.3          | 3.7x    |
-| Conv2D    | 224x224    | 23.1       | 8.9           | 2.6x    |
-| ReLU      | 10000      | 0.8        | 0.2           | 4.0x    |
-| Softmax   | 1000x1000  | 15.6       | 5.1           | 3.1x    |
-
-## Contributing
-
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for contribution guidelines.
-
-## Deployment
-
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for deployment instructions.
-
-## Limitations
-
-- Python 3.7+ required
-- Limited support for dynamic control flow
-- Some Python operations cause graph breaks
-- Backend support varies by operation type
-
-## Future Work
-
-- MLIR backend integration
-- Advanced loop optimizations
-- Distributed graph execution
-- Auto-tuning support
-- WebAssembly target
+```
+37-dynamic-graph-runtime/
+  README.md                       # This file
+  src/dynamicgraph/
+    core/        # graph.py, tensor.py, context.py
+    tracer/      # bytecode_tracer.py, frame_guard.py
+    optimizer/   # graph_optimizer.py, passes.py
+    codegen/     # backend.py, compiler.py
+  tests/                          # unittest suite per component
+  docs/BLUEPRINT.md               # Full architecture and design
+```
 
 ## License
 
-MIT License - See LICENSE file for details
-
-## Acknowledgments
-
-Inspired by:
-- PyTorch TorchDynamo
-- TorchFX
-- JAX JIT compilation
-- TensorFlow XLA
+MIT — see ../LICENSE

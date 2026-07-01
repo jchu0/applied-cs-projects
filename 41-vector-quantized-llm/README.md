@@ -1,347 +1,188 @@
 # Vector Quantized LLM
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](tests/)
-[![Coverage](https://img.shields.io/badge/coverage-85%25-yellowgreen.svg)](htmlcov/index.html)
-
-A high-performance quantization framework for Large Language Models (LLMs) supporting INT8, INT4, GPTQ, and AWQ quantization methods. Achieve up to 8x model compression with minimal accuracy loss.
+A from-scratch, NumPy-only quantization library for large language models. It implements
+weight quantization (INT8, INT4, FP8 E4M3/E5M2), the GPTQ and AWQ/SmoothQuant algorithms,
+post-training calibration, a GGUF reader/writer, and a small autoregressive inference engine
+with a KV cache — all without PyTorch or external quantization kernels.
 
 ## Features
 
-- **Multiple Quantization Methods**
-  - INT8/INT4 uniform quantization
-  - GPTQ (Gradient-based Post-Training Quantization)
-  - AWQ (Activation-aware Weight Quantization)
-  - SmoothQuant (W8A8 with scale migration)
-  - Mixed precision support
+- **INT8 / INT4 weight quantization** — per-tensor, per-channel, and per-group scaling, with
+  symmetric and asymmetric modes (`INT8Quantizer`, `INT4Quantizer`, `quantize_int8`,
+  `quantize_int4` in `core/types.py`).
+- **INT4 bit packing** — two 4-bit values packed per byte, with signed/unsigned unpacking
+  (`pack_int4` / `unpack_int4`).
+- **FP8 quantization** — full E4M3 and E5M2 encode/decode implemented by hand at the bit level
+  (`FP8Quantizer`, `float_to_fp8_e4m3`, `fp8_e5m2_to_float`, `FP8QuantizedTensor`).
+- **GPTQ** — Hessian-damped, activation-ordered, column-by-column quantization with error
+  feedback (`GPTQQuantizer`).
+- **AWQ** — activation-aware scale search that protects salient weight channels
+  (`AWQQuantizer`).
+- **SmoothQuant** — migrates quantization difficulty between activations and weights via a
+  per-channel smoothing factor (`SmoothQuantQuantizer`).
+- **Calibration** — MinMax, percentile, and MSE grid-search calibrators plus a Hessian
+  collector for GPTQ and an activation collector for AWQ (`calibration/calibrate.py`).
+- **Inference engine** — a quantized transformer with INT-quantized linear layers, a
+  pre-allocated KV cache, and temperature / top-k / top-p sampling (`inference/engine.py`).
+- **GGUF I/O** — a from-scratch reader and writer for the llama.cpp GGUF v3 container, with
+  metadata key/value parsing and tensor type tables (`formats/gguf.py`).
 
-- **Optimized Inference**
-  - KV cache for O(1) per-token attention
-  - Configurable sampling strategies (greedy, nucleus)
-  - Memory-efficient attention
-  - Pre-allocated memory for batch inference
+## Architecture
 
-- **Calibration Methods**
-  - MinMax calibration for basic range finding
-  - Percentile calibration for outlier handling
-  - MSE calibration for optimal scale search
-  - Entropy calibration (KL-divergence based)
+```mermaid
+flowchart TD
+    W[FP32 weights] --> CAL[Calibrators]
+    CAL --> Q[Quantizers]
+    Q -->|INT8 / INT4 / FP8| QT[QuantizedTensor / FP8QuantizedTensor]
+    QT --> QL[QuantizedLinear]
+    QL --> M[LegacyQuantizedModel]
+    M --> ENG[QuantizedEngine]
+    ENG --> KV[(KV cache)]
+    ENG --> S[Sampler]
+    QT <--> GGUF[(GGUF reader / writer)]
+```
 
-- **Production Ready**
-  - Easy deployment via Docker
-  - Prometheus metrics integration
-  - Health checks and monitoring
-  - Multi-GPU support
-
-## Performance
-
-| Model Size | Method | Compression | Speedup | Accuracy Loss |
-|------------|--------|-------------|---------|---------------|
-| 7B | INT8 | 4x | 2.5x | <1% |
-| 7B | INT4 | 8x | 4x | <2% |
-| 7B | GPTQ-4bit | 7x | 3.5x | <1.5% |
-| 7B | AWQ-4bit | 7x | 3.8x | <1.2% |
-| 13B | INT8 | 4x | 2.3x | <1% |
-| 13B | GPTQ-4bit | 7x | 3.2x | <1.5% |
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Core types | `core/types.py` | `QuantConfig`, `QuantizedTensor`, `FP8QuantizedTensor`, `QuantizedLinear`, pack/unpack and FP8 kernels |
+| Quantizers | `quantize/quantizers.py` | INT8/INT4/FP8 quantizers plus GPTQ, AWQ, SmoothQuant |
+| Calibration | `calibration/calibrate.py` | MinMax/percentile/MSE calibrators, Hessian and activation collectors |
+| Inference | `inference/engine.py` | `QuantizedEngine`, `KVCache`, batching, sampling, benchmarking |
+| GGUF format | `formats/gguf.py` | `GGUFReader`, `GGUFWriter`, `GGUFMetadata`, type tables |
 
 ## Quick Start
+
+### Prerequisites
+
+- Python 3.9+
+- NumPy 1.24+ (the only runtime dependency). No GPU or external services are needed.
 
 ### Installation
 
 ```bash
-# From PyPI (when available)
-pip install vector-quantized-llm
-
-# From source
-git clone https://github.com/your-org/vector-quantized-llm.git
-cd vector-quantized-llm
-pip install -e .
+cd 41-vector-quantized-llm
+pip install -e ".[dev]"
 ```
 
-### Basic Usage
+### Running
 
-```python
-from vqllm import quantize_model, InferenceEngine
-
-# Quantize a model
-quantized_model = quantize_model(
-    model_path="path/to/model",
-    quant_config={
-        "quant_type": "gptq",
-        "bits": 4
-    }
-)
-
-# Save quantized model
-quantized_model.save("quantized_model.npz")
-
-# Load and run inference
-engine = InferenceEngine.from_quantized("quantized_model.npz")
-output = engine.generate("Hello, world!", max_tokens=100)
-print(output)
-```
-
-### CLI Usage
+This is a library; exercise it from Python or run the test suite:
 
 ```bash
-# Quantize a model
-vqllm quantize \
-    --model-path ./models/llama-7b \
-    --output-path ./models/llama-7b-quantized \
-    --quant-type gptq \
-    --bits 4
-
-# Start inference server
-vqllm serve \
-    --model-path ./models/llama-7b-quantized \
-    --port 8000 \
-    --batch-size 8
-
-# Test the server
-curl -X POST http://localhost:8000/generate \
-    -H "Content-Type: application/json" \
-    -d '{"prompt": "The meaning of life is", "max_tokens": 50}'
+pytest tests/ -v
 ```
 
-## Documentation
+## Usage
 
-- [Architecture Overview](docs/ARCHITECTURE.md) - System design and components
-- [API Reference](docs/API.md) - Complete API documentation
-- [Deployment Guide](docs/DEPLOYMENT.md) - Production deployment instructions
-- [Contributing Guide](docs/CONTRIBUTING.md) - How to contribute
+Quantize a weight matrix to INT4 with per-group scales and measure the compression ratio:
+
+```python
+import numpy as np
+from vqllm import INT4Quantizer, QuantConfig, ScaleType
+
+weight = np.random.randn(256, 512).astype(np.float32)
+
+config = QuantConfig(bits=4, scale_type=ScaleType.PER_GROUP, group_size=128, symmetric=True)
+quantizer = INT4Quantizer(config)
+qtensor = quantizer.quantize_weight(weight, name="mlp.down_proj")
+
+recovered = qtensor.dequantize()
+print("compression:", weight.nbytes / qtensor.nbytes)
+print("max abs error:", np.abs(weight - recovered.reshape(weight.shape)).max())
+```
+
+GPTQ quantization with a Hessian and FP8 encoding:
+
+```python
+import numpy as np
+from vqllm import GPTQQuantizer, FP8Quantizer, QuantConfig, ScaleType
+
+w = np.random.randn(128, 256).astype(np.float32)
+
+# GPTQ: Hessian-aware INT4
+gptq = GPTQQuantizer(QuantConfig(bits=4, scale_type=ScaleType.PER_GROUP, group_size=128))
+hessian = np.eye(256, dtype=np.float32)
+q = gptq.quantize_weight(w, name="attn.q_proj", hessian=hessian)
+
+# FP8 E4M3
+fp8 = FP8Quantizer(format="e4m3")
+qf = fp8.quantize_weight(w)
+print("fp8 bytes:", qf.nbytes, "format:", qf.format)
+```
+
+Run autoregressive generation through the quantized engine:
+
+```python
+import numpy as np
+from vqllm import QuantConfig
+from vqllm.inference.engine import LegacyQuantizedModel, QuantizedEngine, GenerationConfig
+
+model = LegacyQuantizedModel(QuantConfig(bits=8), num_layers=2, hidden_size=128, num_heads=4)
+engine = QuantizedEngine(model, max_batch_size=1)
+
+prompt = np.array([[1, 5, 9, 12]])
+out = engine.generate(prompt, GenerationConfig(max_length=16, do_sample=False))
+print(out.shape)
+```
+
+Round-trip tensors through GGUF:
+
+```python
+import numpy as np
+from vqllm import GGUFWriter, GGUFReader, GGUFMetadata
+
+writer = GGUFWriter("model.gguf", GGUFMetadata(name="demo", block_count=2))
+writer.add_tensor("blk.0.weight", np.random.randn(64, 64).astype(np.float16))
+writer.write()
+
+with GGUFReader("model.gguf") as reader:
+    print(reader.list_tensors())
+    w = reader.get_tensor("blk.0.weight")
+```
+
+## What's Real vs Simulated
+
+- **Real:** All quantization math is fully implemented in NumPy — INT8/INT4 scaling and
+  packing, FP8 E4M3/E5M2 bit encode/decode, the GPTQ column-update loop with error feedback,
+  AWQ scale search, and SmoothQuant smoothing. The MinMax/percentile/MSE calibrators, the KV
+  cache, the sampler, and the GGUF v3 reader/writer all run end to end and are covered by
+  tests.
+- **Simulated / illustrative:** The inference model (`LegacyQuantizedModel`) uses
+  randomly-initialized weights and a character-level tokenizer in the calibration helpers —
+  there are no pretrained weights, so generated tokens are not meaningful text. `QuantizedLinear`
+  dequantizes weights before a plain NumPy matmul rather than using a fused low-bit kernel.
+  There is no GPU, distributed, or CUDA path; everything is single-process CPU NumPy.
 
 ## Testing
 
 ```bash
-# Run unit tests
-pytest tests/unit/
-
-# Run integration tests
-pytest tests/integration/
-
-# Run all tests with coverage
-pytest --cov=vqllm --cov-report=html
-
-# Run performance benchmarks
-pytest tests/performance/ --benchmark-only
+pytest tests/ -v
 ```
 
-### Test Coverage
+The suite (`tests/`) covers the quantizers (`test_quantizers.py`), GGUF round-trips
+(`test_gguf.py`), calibration (`test_calibration.py`), the inference engine and KV cache
+(`test_inference.py`), and an end-to-end quantize-then-generate flow (`test_integration.py`).
+No external services or hardware are required.
 
-Current test coverage: **85%**
-
-| Module | Coverage |
-|--------|----------|
-| vqllm/quantize | 88% |
-| vqllm/calibration | 82% |
-| vqllm/inference | 85% |
-| vqllm/core | 90% |
-
-## Examples
-
-### INT8 Quantization
-
-```python
-from vqllm.quantize import INT8Quantizer
-from vqllm.core.types import QuantConfig
-
-config = QuantConfig(quant_type="int8", scale_type="per_channel")
-quantizer = INT8Quantizer(config)
-
-# Quantize weights
-quantized_weights = quantizer.quantize_weight(weights)
-print(f"Compression ratio: {weights.nbytes / quantized_weights.nbytes:.2f}x")
-```
-
-### GPTQ Quantization
-
-```python
-from vqllm.quantize import GPTQQuantizer
-from vqllm.calibration import HessianCalibrator
-
-# Collect calibration data
-calibrator = HessianCalibrator()
-hessians = calibrator.collect_hessians(model, calibration_data)
-
-# Quantize with GPTQ
-quantizer = GPTQQuantizer(config)
-quantized_model = quantizer.quantize_model(model, hessians)
-```
-
-### Batch Inference
-
-```python
-from vqllm.inference import BatchedInference
-
-engine = BatchedInference(
-    model_path="quantized_model.npz",
-    max_batch_size=16,
-    continuous_batching=True
-)
-
-# Add requests
-for i, prompt in enumerate(prompts):
-    engine.add_request(f"req_{i}", prompt)
-
-# Process batch
-results = engine.process_batch()
-```
-
-## Docker Deployment
-
-```bash
-# Build Docker image
-docker build -t vqllm:latest .
-
-# Run container
-docker run -d \
-    --name vqllm-server \
-    -p 8000:8000 \
-    -v $(pwd)/models:/models \
-    --gpus all \
-    vqllm:latest
-
-# Check health
-curl http://localhost:8000/health
-```
-
-## Benchmarks
-
-### Latency Comparison
+## Project Structure
 
 ```
-Model: LLaMA-7B, Batch Size: 1, Sequence Length: 128
-
-Method          | Mean Latency | P95 Latency | P99 Latency
-----------------|-------------|------------|-------------
-FP16 (baseline) | 45ms        | 52ms       | 58ms
-INT8            | 18ms        | 22ms       | 25ms
-INT4            | 11ms        | 14ms       | 16ms
-GPTQ-4bit       | 13ms        | 16ms       | 18ms
-AWQ-4bit        | 12ms        | 15ms       | 17ms
-```
-
-### Throughput Comparison
-
-```
-Model: LLaMA-7B, Max Sequence Length: 2048
-
-Method          | Tokens/sec | Memory Usage | GPU Util
-----------------|------------|--------------|----------
-FP16 (baseline) | 850        | 14GB         | 95%
-INT8            | 2100       | 3.5GB        | 92%
-INT4            | 3400       | 1.8GB        | 88%
-GPTQ-4bit       | 3000       | 2.0GB        | 90%
-AWQ-4bit        | 3200       | 2.0GB        | 91%
-```
-
-## Advanced Configuration
-
-### Custom Quantization Config
-
-```python
-from vqllm.core.types import QuantConfig, ScaleType
-
-config = QuantConfig(
-    quant_type="gptq",
-    bits=4,
-    group_size=128,
-    block_size=128,
-    scale_type=ScaleType.PER_GROUP,
-    dampening=0.01,
-    symmetric=False,
-    zero_point=True,
-    calibration_samples=256
-)
-```
-
-### Memory Optimization
-
-```python
-from vqllm.utils import optimize_memory
-
-# Enable memory optimization
-optimize_memory(
-    enable_gradient_checkpointing=True,
-    enable_cpu_offload=True,
-    memory_efficient_attention=True
-)
-```
-
-### Multi-GPU Inference
-
-```python
-from vqllm.distributed import DistributedEngine
-
-engine = DistributedEngine(
-    model_path="quantized_model.npz",
-    tensor_parallel_size=4,
-    pipeline_parallel_size=2
-)
-```
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details.
-
-### Development Setup
-
-```bash
-# Clone repository
-git clone https://github.com/your-org/vector-quantized-llm.git
-cd vector-quantized-llm
-
-# Install development dependencies
-pip install -e ".[dev]"
-
-# Run pre-commit hooks
-pre-commit install
-
-# Run tests
-pytest tests/
-```
-
-## Citation
-
-If you use this project in your research, please cite:
-
-```bibtex
-@software{vector_quantized_llm,
-  title = {Vector Quantized LLM: High-Performance Quantization for Large Language Models},
-  author = {Your Organization},
-  year = {2024},
-  url = {https://github.com/your-org/vector-quantized-llm}
-}
+41-vector-quantized-llm/
+  README.md
+  src/vqllm/
+    core/types.py            # QuantConfig, QuantizedTensor, FP8, pack/unpack
+    quantize/quantizers.py   # INT8/INT4/FP8, GPTQ, AWQ, SmoothQuant
+    calibration/calibrate.py # MinMax/percentile/MSE, Hessian, activation
+    inference/engine.py       # QuantizedEngine, KVCache, sampling
+    formats/gguf.py          # GGUF reader/writer
+  tests/                     # quantizer, GGUF, calibration, inference, integration
+  docs/
+    BLUEPRINT.md             # full architecture and design
+    ARCHITECTURE.md          # deeper architecture notes
+    API.md                   # API reference
+    DEPLOYMENT.md            # deployment notes
 ```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-This project builds upon several excellent works:
-- GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers
-- AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration
-- The open-source community for continuous support and contributions
-
-## Contact
-
-- Issues: [GitHub Issues](https://github.com/your-org/vector-quantized-llm/issues)
-- Discussions: [GitHub Discussions](https://github.com/your-org/vector-quantized-llm/discussions)
-- Email: support@vqllm.ai
-- Discord: [Join our community](https://discord.gg/vqllm)
-
-## Roadmap
-
-- [x] INT8/INT4 quantization
-- [x] GPTQ implementation
-- [x] AWQ implementation
-- [x] SmoothQuant implementation
-- [x] KV cache optimization
-- [x] Multiple calibration methods
-- [ ] Speculative decoding
-- [ ] Custom CUDA kernels
-- [ ] ONNX export
-- [ ] WebAssembly runtime
+MIT — see ../LICENSE.
