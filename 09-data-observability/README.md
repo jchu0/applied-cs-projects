@@ -39,8 +39,8 @@ flowchart TD
     WH[(Data Warehouses)] --> Collectors[Metadata Collectors]
     Collectors --> Store[Metadata & Metric History]
 
-    Store --> Detect[Anomaly Detection]
-    subgraph Detect[Anomaly Detection]
+    Store --> Detection
+    subgraph Detection["Anomaly Detection"]
         Stat[Statistical Detector]
         ML[Isolation Forest Detector]
         Stat --> Ensemble[Ensemble Detector]
@@ -58,7 +58,7 @@ flowchart TD
     Ensemble --> Triage[LLM Triage Runbooks]
 
     API[FastAPI Gateway] --> Store
-    API --> Detect
+    API --> Detection
     API --> Lineage
     API --> Health
     API --> PII
