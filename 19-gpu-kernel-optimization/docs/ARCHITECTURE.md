@@ -8,36 +8,38 @@ The GPU GEMM Optimization project implements highly optimized General Matrix Mul
 
 ### 1. Core Components
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                         Application Layer                      │
-├──────────────────────────────────────────────────────────────┤
-│                          Autotuner                            │
-│                    ┌──────────────────┐                       │
-│                    │  Search Strategy  │                       │
-│                    │  - Grid Search    │                       │
-│                    │  - Random Search  │                       │
-│                    │  - Bayesian Opt   │                       │
-│                    │  - Genetic Algo   │                       │
-│                    └──────────────────┘                       │
-├──────────────────────────────────────────────────────────────┤
-│                        GEMM Kernel Layer                       │
-│        ┌──────────┐  ┌──────────┐  ┌──────────┐             │
-│        │  Tiling  │  │  Prefetch │  │  Vector  │             │
-│        │  Engine  │  │  Control  │  │   Units  │             │
-│        └──────────┘  └──────────┘  └──────────┘             │
-├──────────────────────────────────────────────────────────────┤
-│                       Matrix Operations                        │
-│        ┌──────────┐  ┌──────────┐  ┌──────────┐             │
-│        │  Storage │  │ Transpose │  │   Math   │             │
-│        │  Layout  │  │   Engine  │  │   Ops    │             │
-│        └──────────┘  └──────────┘  └──────────┘             │
-├──────────────────────────────────────────────────────────────┤
-│                    Performance Metrics                         │
-│        ┌──────────┐  ┌──────────┐  ┌──────────┐             │
-│        │ Collector │  │ Analyzer  │  │ Reporter │             │
-│        └──────────┘  └──────────┘  └──────────┘             │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    App["Application Layer"]
+    App --> Autotuner
+
+    subgraph Autotuner["Autotuner"]
+        Search["Search Strategy: Grid Search, Random Search, Bayesian Opt, Genetic Algo"]
+    end
+
+    Autotuner --> Kernel
+
+    subgraph Kernel["GEMM Kernel Layer"]
+        Tiling["Tiling Engine"]
+        Prefetch["Prefetch Control"]
+        Vector["Vector Units"]
+    end
+
+    Kernel --> MatrixOps
+
+    subgraph MatrixOps["Matrix Operations"]
+        Storage["Storage Layout"]
+        Transpose["Transpose Engine"]
+        Math["Math Ops"]
+    end
+
+    MatrixOps --> Metrics
+
+    subgraph Metrics["Performance Metrics"]
+        Collector["Collector"]
+        Analyzer["Analyzer"]
+        Reporter["Reporter"]
+    end
 ```
 
 ### 2. Module Architecture
@@ -78,61 +80,36 @@ The GPU GEMM Optimization project implements highly optimized General Matrix Mul
 
 ### 1. Standard GEMM Operation
 
-```
-Input Matrices (A, B)
-        ↓
-Matrix Validation
-        ↓
-Configuration Selection
-        ↓
-┌─────────────────┐
-│   Tiling Loop   │
-│  ┌───────────┐  │
-│  │ L1 Cache  │  │ ←── Prefetch
-│  │   Tiles   │  │
-│  └───────────┘  │
-│        ↓        │
-│  ┌───────────┐  │
-│  │  Register │  │
-│  │   Block   │  │
-│  └───────────┘  │
-│        ↓        │
-│  ┌───────────┐  │
-│  │    FMA    │  │
-│  │Operations │  │
-│  └───────────┘  │
-└─────────────────┘
-        ↓
-Output Matrix (C)
+```mermaid
+flowchart TD
+    Input["Input Matrices (A, B)"] --> Validation["Matrix Validation"]
+    Validation --> Config["Configuration Selection"]
+    Config --> TilingLoop
+
+    subgraph TilingLoop["Tiling Loop"]
+        L1["L1 Cache Tiles"]
+        Reg["Register Block"]
+        FMA["FMA Operations"]
+        Prefetch["Prefetch"]
+        Prefetch --> L1
+        L1 --> Reg
+        Reg --> FMA
+    end
+
+    TilingLoop --> Output["Output Matrix (C)"]
 ```
 
 ### 2. Autotuning Workflow
 
-```
-Problem Size (M, N, K)
-        ↓
-┌────────────────────┐
-│ Search Space Init  │
-└────────────────────┘
-        ↓
-┌────────────────────┐
-│ Generate Configs   │ ←─┐
-└────────────────────┘   │
-        ↓                │
-┌────────────────────┐   │
-│ Parallel Evaluation│   │
-└────────────────────┘   │
-        ↓                │
-┌────────────────────┐   │
-│ Performance Metrics│   │
-└────────────────────┘   │
-        ↓                │
-┌────────────────────┐   │
-│ Search Strategy    │───┘
-│ (Update/Converge)  │
-└────────────────────┘
-        ↓
-   Best Configuration
+```mermaid
+flowchart TD
+    Problem["Problem Size (M, N, K)"] --> Init["Search Space Init"]
+    Init --> Generate["Generate Configs"]
+    Generate --> Eval["Parallel Evaluation"]
+    Eval --> Metrics["Performance Metrics"]
+    Metrics --> Strategy["Search Strategy (Update/Converge)"]
+    Strategy --> Generate
+    Strategy --> Best["Best Configuration"]
 ```
 
 ## Optimization Techniques
@@ -276,23 +253,6 @@ pub struct GemmConfig {
 - Benchmark suite for various sizes
 - Regression testing for optimizations
 - Scalability analysis
-
-## Future Enhancements
-
-### 1. GPU Backend
-- CUDA kernel generation
-- OpenCL support
-- ROCm integration
-
-### 2. Advanced Optimizations
-- Tensor core utilization
-- Mixed precision support
-- Sparse matrix support
-
-### 3. Extended Functionality
-- Batched GEMM operations
-- Strided access patterns
-- Complex number support
 
 ## Dependencies
 

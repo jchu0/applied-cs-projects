@@ -8,34 +8,23 @@ The Service Mesh is a dedicated infrastructure layer for handling service-to-ser
 
 ### High-Level Components
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Control Plane                            │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │ Certificate │  │   Service    │  │    Policy    │      │
-│  │  Authority  │  │   Registry   │  │   Manager    │      │
-│  └─────────────┘  └──────────────┘  └──────────────┘      │
-└─────────────────────────┬───────────────────────────────────┘
-                          │
-┌─────────────────────────┼───────────────────────────────────┐
-│                    Data Plane                                │
-│                         │                                    │
-│  ┌──────────────────────┼──────────────────────────┐       │
-│  │     Service Pod      │                          │       │
-│  │  ┌─────────────┐  ┌──┴───────────┐             │       │
-│  │  │   Service   │◄─┤    Sidecar   │◄────────┐   │       │
-│  │  │  Container  │  │     Proxy    │         │   │       │
-│  │  └─────────────┘  └──────────────┘         │   │       │
-│  └──────────────────────────────────────────┐  │   │       │
-│                                             │  │   │       │
-│  ┌──────────────────────────────────────┐   │  │   │       │
-│  │     Service Pod                      │   │  │   │       │
-│  │  ┌─────────────┐  ┌──────────────┐  │   │  │   │       │
-│  │  │   Service   │◄─┤    Sidecar   ├──┼───┘  │   │       │
-│  │  │  Container  │  │     Proxy    │  │      │   │       │
-│  │  └─────────────┘  └──────────────┘  │      │   │       │
-│  └──────────────────────────────────────┘      │   │       │
-└─────────────────────────────────────────────────┴───┘       │
+```mermaid
+flowchart TD
+    subgraph ControlPlane[Control Plane]
+        CA[Certificate Authority]
+        Registry[Service Registry]
+        Policy[Policy Manager]
+    end
+    subgraph DataPlane[Data Plane]
+        subgraph Pod1[Service Pod]
+            Svc1[Service Container] <--> Side1[Sidecar Proxy]
+        end
+        subgraph Pod2[Service Pod]
+            Svc2[Service Container] <--> Side2[Sidecar Proxy]
+        end
+        Side1 <--> Side2
+    end
+    ControlPlane --> DataPlane
 ```
 
 ## Core Components
@@ -199,16 +188,18 @@ Collected metrics include:
 
 ### mTLS Implementation
 
-```
-┌──────────────┐                      ┌──────────────┐
-│   Client     │                      │   Server     │
-│   Sidecar    │                      │   Sidecar    │
-├──────────────┤                      ├──────────────┤
-│ Client Cert  │◄─────Validate────────┤ Server Cert  │
-│ Private Key  │                      │ Private Key  │
-├──────────────┤                      ├──────────────┤
-│   CA Cert    │──────────────────────│   CA Cert    │
-└──────────────┘                      └──────────────┘
+```mermaid
+flowchart LR
+    subgraph ClientSidecar[Client Sidecar]
+        CC[Client Cert + Private Key]
+        CCA[CA Cert]
+    end
+    subgraph ServerSidecar[Server Sidecar]
+        SC[Server Cert + Private Key]
+        SCA[CA Cert]
+    end
+    SC -->|Validate| CC
+    CCA <--> SCA
 ```
 
 ### Authorization Flow
@@ -251,16 +242,18 @@ Collected metrics include:
 
 ### Multi-Cluster Support
 
-```
-┌─────────────┐     ┌─────────────┐
-│  Cluster A  │     │  Cluster B  │
-│             │     │             │
-│   ┌─────┐   │     │   ┌─────┐   │
-│   │ CA  │◄──┼─────┼───┤ CA  │   │
-│   └─────┘   │     │   └─────┘   │
-│             │     │             │
-│  Services   │◄────┤  Services   │
-└─────────────┘     └─────────────┘
+```mermaid
+flowchart LR
+    subgraph ClusterA[Cluster A]
+        CAa[CA]
+        SvcA[Services]
+    end
+    subgraph ClusterB[Cluster B]
+        CAb[CA]
+        SvcB[Services]
+    end
+    CAb --> CAa
+    SvcB --> SvcA
 ```
 
 - Shared root CA across clusters
@@ -271,22 +264,12 @@ Collected metrics include:
 
 ### Circuit Breaker States
 
-```
-        ┌─────────┐
-        │ Closed  │──────── Failure threshold
-        └────┬────┘         exceeded
-             │              │
-             │              ▼
-     Success │         ┌─────────┐
-      after  │         │  Open   │
-      probe  │         └────┬────┘
-             │              │
-             │              │ Timeout
-             ▼              ▼
-        ┌─────────┐    ┌─────────┐
-        │ Closed  │◄───│  Half   │
-        └─────────┘    │  Open   │
-                       └─────────┘
+```mermaid
+stateDiagram-v2
+    Closed --> Open : failure threshold exceeded
+    Open --> HalfOpen : timeout
+    HalfOpen --> Closed : success after probe
+    HalfOpen --> Open : probe fails
 ```
 
 ### Retry Strategy
@@ -311,22 +294,6 @@ Collected metrics include:
 2. **Certificate Debugging**: Validate certificate chains
 3. **Policy Testing**: Dry-run policy changes
 4. **Traffic Capture**: Encrypted traffic inspection
-
-## Future Enhancements
-
-### Planned Features
-
-1. **WebAssembly Filters**: Custom request processing
-2. **Canary Deployments**: Gradual rollout support
-3. **Chaos Engineering**: Fault injection
-4. **Multi-Protocol Support**: gRPC, WebSocket, TCP
-
-### Extension Points
-
-- Plugin system for custom policies
-- External authorization services
-- Custom load balancing algorithms
-- Pluggable certificate providers
 
 ## Performance Benchmarks
 

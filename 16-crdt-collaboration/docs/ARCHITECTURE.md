@@ -6,30 +6,33 @@ The CRDT Collaboration System is a real-time collaborative editing framework bui
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Client Applications                   │
-├─────────────────────────────────────────────────────────┤
-│                   WebSocket Protocol                      │
-├─────────────────────────────────────────────────────────┤
-│                 Collaboration Server                      │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐  │
-│  │ Session  │  │ Document │  │   Presence Manager    │  │
-│  │ Manager  │  │  Store   │  │                      │  │
-│  └──────────┘  └──────────┘  └──────────────────────┘  │
-├─────────────────────────────────────────────────────────┤
-│                     CRDT Layer                           │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
-│  │   LWW    │  │ G/PN     │  │  OR-Set  │  │  RGA    │ │
-│  │ Register │  │ Counter  │  │          │  │  List   │ │
-│  └──────────┘  └──────────┘  └──────────┘  └─────────┘ │
-├─────────────────────────────────────────────────────────┤
-│                   Storage Layer                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐  │
-│  │ Document │  │Operation │  │    Snapshot Store     │  │
-│  │   Store  │  │   Log    │  │                      │  │
-│  └──────────┘  └──────────┘  └──────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Clients["Client Applications"]
+    WS["WebSocket Protocol"]
+    Clients --> WS
+
+    subgraph Server["Collaboration Server"]
+        SM["Session Manager"]
+        DS["Document Store"]
+        PM["Presence Manager"]
+    end
+    WS --> Server
+
+    subgraph CRDT["CRDT Layer"]
+        LWW["LWW Register"]
+        Counter["G/PN Counter"]
+        ORSet["OR-Set"]
+        RGA["RGA List"]
+    end
+    Server --> CRDT
+
+    subgraph Storage["Storage Layer"]
+        DocStore["Document Store"]
+        OpLog["Operation Log"]
+        Snapshot["Snapshot Store"]
+    end
+    CRDT --> Storage
 ```
 
 ## Core Components
@@ -116,36 +119,44 @@ Persistence and recovery system:
 
 ### 1. Edit Operation Flow
 
-```
-User Input → Local Document → CRDT Operation → Operation Log
-                    ↓
-            WebSocket Server → Broadcast to Session
-                    ↓
-            Remote Clients → Apply Operation → Update View
+```mermaid
+flowchart TD
+    UI["User Input"] --> LD["Local Document"]
+    LD --> CO["CRDT Operation"]
+    CO --> OL["Operation Log"]
+    CO --> WS["WebSocket Server"]
+    WS --> BC["Broadcast to Session"]
+    BC --> RC["Remote Clients"]
+    RC --> AO["Apply Operation"]
+    AO --> UV["Update View"]
 ```
 
 ### 2. Join Session Flow
 
-```
-Client Connect → WebSocket Handshake → Join Message
-                         ↓
-              Server Session Registry → Add to Session
-                         ↓
-              Sync Current State → Send to Client
-                         ↓
-              Client Apply State → Ready for Collaboration
+```mermaid
+flowchart TD
+    CC["Client Connect"] --> HS["WebSocket Handshake"]
+    HS --> JM["Join Message"]
+    JM --> SR["Server Session Registry"]
+    SR --> AS["Add to Session"]
+    AS --> SC["Sync Current State"]
+    SC --> ST["Send to Client"]
+    ST --> CA["Client Apply State"]
+    CA --> RC["Ready for Collaboration"]
 ```
 
 ### 3. Conflict Resolution Flow
 
-```
-Concurrent Op A ←→ Concurrent Op B
-         ↓               ↓
-    Local Apply     Remote Apply
-         ↓               ↓
-    CRDT Merge  ←→  CRDT Merge
-         ↓               ↓
-    Converged State (Identical)
+```mermaid
+flowchart TD
+    OpA["Concurrent Op A"] <--> OpB["Concurrent Op B"]
+    OpA --> LA["Local Apply"]
+    OpB --> RA["Remote Apply"]
+    LA --> MA["CRDT Merge"]
+    RA --> MB["CRDT Merge"]
+    MA <--> MB
+    MA --> CS["Converged State (Identical)"]
+    MB --> CS
 ```
 
 ## Key Design Decisions
@@ -246,19 +257,3 @@ Benefits:
 - Storage health monitoring
 - Network connectivity checks
 
-## Future Enhancements
-
-### Planned Features
-
-1. **Rich Text Support**: Formatting, styles, and embedded media
-2. **Offline Mode**: Full offline editing with sync on reconnect
-3. **Branching/Merging**: Git-like branching for documents
-4. **Time Travel**: View and restore any point in history
-5. **Plugins**: Extensible architecture for custom operations
-
-### Research Areas
-
-1. **Byzantine Fault Tolerance**: Handle malicious actors
-2. **Compression**: Advanced compression for operations
-3. **Machine Learning**: Intelligent conflict resolution
-4. **P2P Mode**: Direct peer-to-peer collaboration

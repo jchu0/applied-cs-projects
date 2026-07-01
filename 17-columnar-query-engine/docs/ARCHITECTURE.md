@@ -6,32 +6,30 @@ A high-performance columnar query engine inspired by DuckDB, built in Rust using
 
 ## Architecture Components
 
-```
-┌──────────────────────────────────────────────────┐
-│                SQL Interface                      │
-├──────────────────────────────────────────────────┤
-│               Query Parser & Planner               │
-├──────────────────────────────────────────────────┤
-│              Logical Plan Optimizer                │
-├──────────────────────────────────────────────────┤
-│             Physical Plan Generator                │
-├──────────────────────────────────────────────────┤
-│                Query Executor                      │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
-│  │   Scan   │  │  Filter  │  │  Aggregation │   │
-│  │ Operator │  │ Operator │  │   Operator   │   │
-│  └──────────┘  └──────────┘  └──────────────┘   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
-│  │   Join   │  │   Sort   │  │   Projection │   │
-│  │ Operator │  │ Operator │  │   Operator   │   │
-│  └──────────┘  └──────────┘  └──────────────┘   │
-├──────────────────────────────────────────────────┤
-│             Columnar Storage Layer                │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
-│  │  Arrow   │  │ Parquet  │  │   Memory     │   │
-│  │  Arrays  │  │   Files  │  │   Manager    │   │
-│  └──────────┘  └──────────┘  └──────────────┘   │
-└──────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    SQL["SQL Interface"]
+    Parser["Query Parser & Planner"]
+    Optimizer["Logical Plan Optimizer"]
+    Physical["Physical Plan Generator"]
+    SQL --> Parser --> Optimizer --> Physical --> Executor
+
+    subgraph Executor["Query Executor"]
+        Scan["Scan Operator"]
+        Filter["Filter Operator"]
+        Agg["Aggregation Operator"]
+        Join["Join Operator"]
+        Sort["Sort Operator"]
+        Proj["Projection Operator"]
+    end
+
+    Executor --> Storage
+
+    subgraph Storage["Columnar Storage Layer"]
+        Arrow["Arrow Arrays"]
+        Parquet["Parquet Files"]
+        Memory["Memory Manager"]
+    end
 ```
 
 ## Core Components
@@ -138,24 +136,3 @@ Only read columns that are actually needed
 - NUMA-aware memory allocation
 - Adaptive query execution
 
-## Future Enhancements
-
-1. **Advanced Optimizations**
-   - Adaptive query execution
-   - Runtime statistics collection
-   - Query result caching
-
-2. **Extended SQL Support**
-   - Window functions
-   - Common Table Expressions (CTEs)
-   - Recursive queries
-
-3. **Storage Improvements**
-   - Columnar indexes
-   - Zone maps for data skipping
-   - Delta lake support
-
-4. **Integration**
-   - JDBC/ODBC drivers
-   - Spark connector
-   - Python bindings

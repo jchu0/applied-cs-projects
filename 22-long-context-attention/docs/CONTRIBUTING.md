@@ -488,13 +488,6 @@ How were these changes tested?
 - **Discord**: Real-time chat (link in README)
 - **Email**: maintainers@example.com
 
-### Getting Help
-
-- Check documentation first
-- Search existing issues
-- Ask in GitHub Discussions
-- Join Discord for real-time help
-
 ### Recognition
 
 Contributors are recognized in:

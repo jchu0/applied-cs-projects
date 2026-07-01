@@ -584,11 +584,6 @@ All contributors will be recognized in:
 - **Issues**: Search existing issues
 - **Discussions**: Use GitHub Discussions
 
-### Contact
-- Open an issue for bugs
-- Start a discussion for questions
-- Email maintainers for sensitive matters
-
 ## License
 
 By contributing, you agree that your contributions will be licensed under the same MIT License that covers the project.

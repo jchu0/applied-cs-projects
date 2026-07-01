@@ -690,27 +690,11 @@ cargo publish
 ./scripts/build-release.sh
 ```
 
-## Getting Help
-
-### Resources
-
-- [Documentation](https://docs.service-mesh.io)
-- [API Reference](https://api.service-mesh.io)
-- [Discord Community](https://discord.gg/service-mesh)
-- [Stack Overflow](https://stackoverflow.com/questions/tagged/service-mesh)
-
-### Communication Channels
-
-- **GitHub Issues**: Bug reports and feature requests
-- **Discord**: Real-time discussion and help
-- **Mailing List**: Announcements and discussions
-- **Twitter**: Updates and announcements
-
 ## Recognition
 
 ### Contributors
 
-We maintain a list of all contributors in [CONTRIBUTORS.md](../CONTRIBUTORS.md). All contributors are added automatically via GitHub.
+Contributors are recognized automatically via GitHub's contributor graph.
 
 ### Code Ownership
 

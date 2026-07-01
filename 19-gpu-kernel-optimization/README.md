@@ -1,374 +1,152 @@
-# GPU GEMM Optimization
+# GPU GEMM Optimization (cuBLAS-lite)
 
-[![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](./tests)
-[![Coverage](https://img.shields.io/badge/coverage-60%25+-blue)](./tests)
-
-High-performance General Matrix Multiplication (GEMM) kernels with automatic performance tuning, implemented in Rust. This project demonstrates GPU kernel optimization patterns through CPU simulation, providing a foundation for GPU-accelerated linear algebra.
+A from-scratch Rust library that teaches GPU kernel-optimization concepts for General Matrix Multiplication (GEMM). The kernels run on the CPU but mirror the GPU optimization progression — naive, shared-memory tiling, register tiling, double buffering, vectorized loads, and simulated Tensor Cores — alongside autotuning, roofline analysis, occupancy modeling, and bank-conflict detection.
 
 ## Features
 
-- **🚀 High-Performance GEMM Kernels**: Optimized matrix multiplication with tiling, vectorization, and prefetching
-- **🎯 Automatic Performance Tuning**: Smart autotuner with multiple search strategies (Grid, Random, Bayesian, Genetic)
-- **📊 Comprehensive Metrics**: Detailed performance analysis including throughput, latency, and efficiency metrics
-- **🔧 Flexible Configuration**: Customizable tile sizes, memory layouts, and optimization parameters
-- **🧪 Extensive Testing**: 60%+ test coverage with unit, integration, and performance tests
-- **📚 Full Documentation**: Complete API docs, architecture guide, and deployment instructions
+- **Progressive GEMM kernels** — naive, shared-memory tiling, register tiling, parallel tiling, and double buffering (`naive_gemm`, `tiled_gemm`, `register_tiled_gemm`, `parallel_tiled_gemm`, `double_buffered_gemm` in `gemm.rs`).
+- **BLAS-style and fused variants** — `scaled_gemm` (alpha/beta), `gemm_activation`, `gemm_bias_activation`, and `gemm_fused` with a 7-way `Activation` enum (ReLU, GELU, SiLU, …).
+- **Batched GEMM** — `batched_gemm`, `batched_scaled_gemm`, and `strided_batched_gemm` parallelized with Rayon (`gemm.rs`).
+- **Tensor Core simulation** — `wmma_gemm` and `wmma_mma_sync` over `WmmaFragment` with 16x16x16 and other `WmmaConfig` fragment shapes.
+- **Autotuner** — grid, random, simulated-annealing, and genetic search over the `GemmConfig` space, plus `TuningCache` and `HeuristicSelector` (`autotuner.rs`).
+- **Roofline analysis** — `RooflineModel` computes arithmetic intensity, ridge point, and `ComputeBound` / `MemoryBound` / `Balanced` classification (`gemm.rs`).
+- **Occupancy and bank-conflict modeling** — `OccupancyCalculator` (Ampere/Volta/Turing presets) and `BankConflictAnalysis` with padding suggestions (`memory.rs`).
+- **Vectorized memory ops** — `Float4` / `Float8` SIMD-style loads simulating `LDG.128`, plus `CoalescingAnalysis` (`vectorize.rs`).
+- **Benchmarking and metrics** — `Benchmark` runner with warmup/median timing and `GemmMetrics` (GFLOPS, bandwidth, efficiency) in `metrics.rs`.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Caller(Caller / tests / benches) --> Matrix(Matrix - row-major f32)
+    Caller --> Kernels(GEMM kernels - gemm.rs)
+    Kernels --> WMMA(WMMA fragments - Tensor Core sim)
+    Kernels --> Roofline(RooflineModel)
+    Tuner(Autotuner - autotuner.rs) --> Kernels
+    Tuner --> Bench(Benchmark + GemmMetrics - metrics.rs)
+    Bench --> Kernels
+    Vectorize(Float4 / Float8 / Coalescing - vectorize.rs) --> Kernels
+    Memory(Occupancy + BankConflict - memory.rs) --> Tuner
+```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Matrix | `matrix.rs` | Row-major `f32` storage, constructors, transpose, layout conversion, packing |
+| GEMM kernels | `gemm.rs` | Naive through double-buffered kernels, fused/batched/WMMA variants, roofline |
+| Autotuner | `autotuner.rs` | Search strategies over `GemmConfig`, tuning cache, heuristic selection |
+| Metrics | `metrics.rs` | `Benchmark` runner, `GemmMetrics`, `PerformanceModel`, kernel comparison |
+| Vectorize | `vectorize.rs` | `Float4`/`Float8` vector ops, vectorized GEMM, coalescing analysis |
+| Memory | `memory.rs` | Bank-conflict analysis, shared-memory padding, occupancy modeling |
 
 ## Quick Start
+
+### Prerequisites
+
+- Rust 1.70 or later (edition 2021)
+- No GPU, services, or credentials are required — everything runs on the CPU.
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/gpu-gemm-optimization.git
-cd gpu-gemm-optimization
-
-# Build the project
+cd 19-gpu-kernel-optimization
 cargo build --release
-
-# Run tests
-cargo test
-
-# Run benchmarks
-cargo bench
 ```
 
-### Basic Usage
+### Running
+
+This is a library crate; exercise it through the test suite or benchmarks:
+
+```bash
+cargo test          # run the suite
+cargo bench         # Criterion benchmarks (naive vs tiled, 128x128)
+```
+
+## Usage
+
+Basic GEMM and a tiled variant, verified against the naive baseline:
 
 ```rust
-use gpu_gemm_optimization::{
-    matrix::Matrix,
-    gemm::{GemmKernel, GemmParams, GemmConfig},
-    matrix::TransposeMode,
-};
+use gpu_gemm_optimization::{Matrix, naive_gemm, tiled_gemm, GemmConfig, register_tiled_gemm};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create random matrices
-    let a = Matrix::random(512, 512);
-    let b = Matrix::random(512, 512);
-    let mut c = Matrix::zeros(512, 512);
+fn main() -> gpu_gemm_optimization::Result<()> {
+    let a = Matrix::random(256, 256);
+    let b = Matrix::random(256, 256);
 
-    // Configure GEMM operation
-    let params = GemmParams {
-        m: 512,
-        n: 512,
-        k: 512,
-        alpha: 1.0,
-        beta: 0.0,
-        trans_a: TransposeMode::NoTranspose,
-        trans_b: TransposeMode::NoTranspose,
-    };
+    // Baseline kernel: one "thread" per output element.
+    let mut c = Matrix::zeros(256, 256);
+    naive_gemm(&a, &b, &mut c)?;
 
-    // Execute GEMM with default configuration
-    let kernel = GemmKernel::new(GemmConfig::default());
-    kernel.execute(&a, &b, &mut c, &params)?;
+    // Shared-memory tiled kernel with a 32-wide tile.
+    let mut c_tiled = Matrix::zeros(256, 256);
+    tiled_gemm(&a, &b, &mut c_tiled, 32)?;
+    assert!(c_tiled.approx_eq(&c, 1e-3));
 
-    println!("GEMM completed! Result norm: {}", c.frobenius_norm());
+    // Register-tiled kernel driven by a block/thread config.
+    let mut c_reg = Matrix::zeros(256, 256);
+    register_tiled_gemm(&a, &b, &mut c_reg, &GemmConfig::default())?;
+    println!("result norm = {}", c_reg.frobenius_norm());
     Ok(())
 }
 ```
 
-### Autotuning Example
+Autotuning a kernel over a parameter space:
 
 ```rust
-use gpu_gemm_optimization::{
-    autotuner::{Autotuner, AutotuneConfig, SearchSpace, OptimizationObjective, SearchStrategy},
-    gemm::MemoryLayout,
-};
+use gpu_gemm_optimization::Matrix;
+use gpu_gemm_optimization::autotuner::{Autotuner, AutotuneConfig, ParameterSpace, SearchStrategy};
+use gpu_gemm_optimization::gemm::register_tiled_gemm;
 
-// Define search space for optimization
-let search_space = SearchSpace {
-    tile_m_options: vec![32, 64, 128, 256],
-    tile_n_options: vec![32, 64, 128, 256],
-    tile_k_options: vec![8, 16, 32],
-    prefetch_options: vec![1, 2, 4, 8],
-    vector_width_options: vec![4, 8, 16],
-    memory_layouts: vec![MemoryLayout::RowMajor, MemoryLayout::ColumnMajor],
-};
+let tuner = Autotuner::new(
+    AutotuneConfig { strategy: SearchStrategy::GridSearch, ..Default::default() },
+    ParameterSpace::small(),
+);
 
-// Configure autotuner
-let config = AutotuneConfig {
-    search_space,
-    max_iterations: 100,
-    convergence_threshold: 0.01,
-    timeout_seconds: 300,
-    parallel_evaluations: 4,
-    optimization_objective: OptimizationObjective::Throughput,
-    search_strategy: SearchStrategy::BayesianOptimization,
-};
-
-// Find optimal configuration
-let mut tuner = Autotuner::new(config)?;
-let best_config = tuner.tune(&a, &b, &c)?;
-println!("Optimal tile size: {}x{}x{}",
-         best_config.tile_config.tile_m,
-         best_config.tile_config.tile_n,
-         best_config.tile_config.tile_k);
+let a = Matrix::random(128, 128);
+let b = Matrix::random(128, 128);
+let result = tuner.tune(&a, &b, |a, b, c, cfg| register_tiled_gemm(a, b, c, cfg)).unwrap();
+println!("{}", result.format()); // best block/thread config + GFLOPS
 ```
 
-## Architecture
+## What's Real vs Simulated
 
-The project consists of four main modules:
-
-### 1. Matrix Module (`matrix.rs`)
-- Core matrix data structures and operations
-- Efficient memory layout management
-- Submatrix extraction and validation
-- Mathematical operations (transpose, add, multiply)
-
-### 2. GEMM Module (`gemm.rs`)
-- High-performance kernel implementations
-- Multiple optimization strategies:
-  - **Cache tiling**: Optimize for L1/L2 cache locality
-  - **Vectorization**: SIMD operations for parallel computation
-  - **Prefetching**: Reduce memory latency
-  - **Memory layouts**: Row-major, column-major, packed formats
-
-### 3. Autotuner Module (`autotuner.rs`)
-- Automatic performance tuning system
-- Multiple search strategies:
-  - **Grid Search**: Exhaustive parameter exploration
-  - **Random Search**: Stochastic sampling
-  - **Bayesian Optimization**: Gaussian process-based optimization
-  - **Genetic Algorithm**: Evolutionary optimization
-- Performance modeling and prediction
-
-### 4. Metrics Module (`metrics.rs`)
-- Comprehensive performance measurement
-- Statistical analysis and aggregation
-- Bottleneck identification
-- Benchmarking framework
-
-## Performance
-
-### Optimization Techniques
-
-1. **Cache Optimization**
-   - Multi-level tiling for cache hierarchy
-   - Optimal tile sizes for L1/L2 caches
-   - Minimized cache misses
-
-2. **Vectorization**
-   - SIMD instruction utilization
-   - Aligned memory access
-   - Fused multiply-add operations
-
-3. **Memory Access Patterns**
-   - Optimized data layouts
-   - Prefetching strategies
-   - NUMA-aware allocation
-
-4. **Parallelization**
-   - Thread-level parallelism with Rayon
-   - Work distribution strategies
-   - Lock-free algorithms
-
-### Benchmark Results
-
-Performance on various matrix sizes (single-threaded, Intel Core i7):
-
-| Matrix Size | GFLOPS | Efficiency | Cache Hit Rate |
-|------------|--------|------------|----------------|
-| 256×256    | 45.2   | 71%        | 98%            |
-| 512×512    | 42.8   | 67%        | 95%            |
-| 1024×1024  | 38.5   | 60%        | 92%            |
-| 2048×2048  | 32.1   | 50%        | 87%            |
+- **Real:** All GEMM kernels, fused/batched/WMMA variants, the autotuner (grid/random/annealing/genetic) with caching, the roofline model, `Benchmark`/`GemmMetrics` timing, vectorized `Float4`/`Float8` ops, coalescing analysis, bank-conflict analysis, shared-memory padding, and occupancy calculation are fully implemented in Rust and exercised by the tests.
+- **Simulated:** There is no GPU execution. "Shared memory," "registers," "warps," and "Tensor Cores" are CPU stand-ins (local arrays, `WmmaFragment`s, Rayon parallelism). Occupancy and bank-conflict math use NVIDIA architecture constants (32 banks, Ampere/Volta/Turing limits) but model — rather than measure — hardware. GFLOPS/efficiency are computed against a configurable software `peak_gflops`, not a real device peak.
 
 ## Testing
 
-The project includes comprehensive test suites:
-
-### Running Tests
-
 ```bash
-# Run all tests
 cargo test
-
-# Run specific test module
-cargo test test_matrix
-
-# Run with verbose output
-cargo test -- --nocapture
-
-# Run benchmarks
-cargo bench
-
-# Generate coverage report (requires cargo-tarpaulin)
-cargo tarpaulin --out Html
 ```
 
-### Test Coverage
+Five integration/unit suites (`integration_test.rs`, `test_gemm.rs`, `test_matrix.rs`, `test_autotuner.rs`, `test_metrics.rs`) plus in-module `#[cfg(test)]` tests cover kernel correctness (every kernel is checked against the naive reference), identity/zero/numerical-stability edge cases, all four search strategies, roofline/occupancy math, and bank-conflict/coalescing analysis. No external services are needed.
 
-- **Unit Tests**: Core functionality testing (~65% coverage)
-- **Integration Tests**: End-to-end workflow validation
-- **Performance Tests**: Regression testing for optimizations
-- **Property Tests**: Randomized testing for edge cases
+## Performance
 
-## Documentation
-
-Comprehensive documentation is available:
-
-- **[Architecture Guide](docs/ARCHITECTURE.md)**: System design and data flow
-- **[API Documentation](docs/API.md)**: Complete API reference with examples
-- **[Deployment Guide](docs/DEPLOYMENT.md)**: Installation and configuration
-- **[Contributing Guide](docs/CONTRIBUTING.md)**: How to contribute
-
-Generate API documentation:
-```bash
-cargo doc --no-deps --open
-```
+Throughput is reported as GFLOPS derived from `2*M*N*K` over measured median time, with
+efficiency relative to a configurable software `peak_gflops` rather than a real device
+peak. `RooflineModel` classifies a workload as `MemoryBound`, `ComputeBound`, or
+`Balanced` from its arithmetic intensity and emits matching recommendations. The
+repository ships no fixed benchmark table — run `cargo bench` to measure naive vs tiled
+GEMM on your own machine. See [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the full
+roofline, occupancy, and tiling analysis.
 
 ## Project Structure
 
 ```
-gpu-kernel-optimization/
-├── src/
-│   ├── lib.rs           # Public API
-│   ├── matrix.rs        # Matrix operations
-│   ├── gemm.rs          # GEMM kernels
-│   ├── autotuner.rs     # Performance tuning
-│   └── metrics.rs       # Performance metrics
-├── tests/
-│   ├── test_matrix.rs      # Matrix tests
-│   ├── test_gemm.rs        # GEMM tests
-│   ├── test_autotuner.rs   # Autotuner tests
-│   ├── test_metrics.rs     # Metrics tests
-│   └── integration_test.rs # Integration tests
-├── docs/
-│   ├── ARCHITECTURE.md  # System architecture
-│   ├── API.md          # API documentation
-│   ├── DEPLOYMENT.md   # Deployment guide
-│   └── CONTRIBUTING.md # Contributing guidelines
-├── benches/
-│   └── gemm_benchmarks.rs # Performance benchmarks
-├── Cargo.toml          # Project configuration
-└── README.md          # This file
-```
-
-## Requirements
-
-- **Rust**: 1.70.0 or later
-- **CPU**: x86_64 or ARM64 with SIMD support
-- **RAM**: 8GB minimum, 16GB recommended
-- **OS**: Linux, macOS, or Windows
-
-## Roadmap
-
-### Near-term
-- [ ] Mixed precision support (FP16, BF16)
-- [ ] Sparse matrix optimizations
-- [ ] Batched GEMM operations
-- [ ] Intel MKL and OpenBLAS backends
-
-### Long-term
-- [ ] CUDA kernel generation
-- [ ] OpenCL support
-- [ ] ROCm/HIP support
-- [ ] Tensor Core utilization
-- [ ] Distributed GEMM
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details on:
-
-- Code style and standards
-- Testing requirements
-- Pull request process
-- Issue reporting
-
-### Development Setup
-
-```bash
-# Install development dependencies
-rustup component add rustfmt clippy
-
-# Run formatter
-cargo fmt
-
-# Run linter
-cargo clippy -- -D warnings
-
-# Run pre-commit checks
-./scripts/pre-commit.sh
-```
-
-## Performance Tips
-
-### For Best Performance
-
-1. **Enable optimizations**: Build with `--release` flag
-2. **Set thread count**: `export RAYON_NUM_THREADS=<num_cores>`
-3. **Use huge pages**: Reduce TLB misses
-4. **CPU affinity**: Pin threads to cores
-5. **Disable frequency scaling**: Set CPU governor to performance
-
-### Configuration Tuning
-
-```toml
-# gemm_config.toml
-[performance]
-tile_m = 128
-tile_n = 128
-tile_k = 32
-prefetch_distance = 4
-vector_width = 16
-use_fma = true
-memory_layout = "Packed"
-
-[system]
-thread_pool_size = 8
-memory_limit_gb = 16
-```
-
-## Benchmarking
-
-Run comprehensive benchmarks:
-
-```bash
-# Quick benchmark
-cargo bench
-
-# Detailed benchmark with save
-cargo bench -- --save-baseline master
-
-# Compare with baseline
-cargo bench -- --baseline master
-
-# Profile-guided optimization
-CARGO_PROFILE_BENCH_LTO=true cargo bench
+19-gpu-kernel-optimization/
+  src/
+    lib.rs         # public API and re-exports
+    matrix.rs      # Matrix type, layout conversion, packing
+    gemm.rs        # kernels, fused/batched/WMMA, roofline
+    autotuner.rs   # search strategies, tuning cache
+    metrics.rs     # Benchmark, GemmMetrics, PerformanceModel
+    vectorize.rs   # Float4/Float8, coalescing analysis
+    memory.rs      # bank conflicts, occupancy
+  tests/           # integration + per-module test suites
+  benches/         # Criterion benchmarks
+  docs/BLUEPRINT.md   # full architecture and design
 ```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Inspired by BLIS, OpenBLAS, and Intel MKL
-- Based on research in cache-oblivious algorithms
-- Optimization techniques from "Anatomy of High-Performance Matrix Multiplication"
-
-## Citations
-
-If you use this project in your research, please cite:
-
-```bibtex
-@software{gpu_gemm_optimization,
-  title = {GPU GEMM Optimization: High-Performance Matrix Kernels in Rust},
-  author = {Your Name},
-  year = {2024},
-  url = {https://github.com/yourusername/gpu-gemm-optimization}
-}
-```
-
-## Contact
-
-- **Issues**: [GitHub Issues](https://github.com/yourusername/gpu-gemm-optimization/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/gpu-gemm-optimization/discussions)
-- **Email**: your.email@example.com
-
----
-
-**Note**: This project demonstrates GPU optimization patterns through CPU simulation. For production GPU workloads, consider using established libraries like cuBLAS, rocBLAS, or MKL.
+MIT — see ../LICENSE

@@ -451,12 +451,6 @@ All PRs are reviewed for:
 
 ## Community
 
-### Getting Help
-
-- GitHub Discussions for questions
-- Discord server for real-time chat
-- Stack Overflow tag: `crdt-collaboration`
-
 ### Becoming a Maintainer
 
 Active contributors may be invited to become maintainers. Criteria:
