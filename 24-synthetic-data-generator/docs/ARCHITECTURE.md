@@ -6,26 +6,25 @@ The Synthetic Data Generator is a comprehensive Python framework for generating 
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Application Layer                         │
-│                  (APIs, CLI, Web Interface)                  │
-├─────────────────────────────────────────────────────────────┤
-│                    Core Generation Engine                    │
-│  ┌──────────┬──────────┬──────────┬──────────┬──────────┐ │
-│  │Generator │ Domain   │ Quality  │Curriculum│  Dataset  │ │
-│  │  Core    │ Registry │ Checker  │ Manager  │  Builder  │ │
-│  └──────────┴──────────┴──────────┴──────────┴──────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│                     LLM Provider Layer                       │
-│         (OpenAI, Anthropic, Cohere, Local Models)           │
-├─────────────────────────────────────────────────────────────┤
-│                    Infrastructure Layer                      │
-│  ┌──────────┬──────────┬──────────┬──────────┬──────────┐ │
-│  │  Cache   │ Storage  │ Queue    │Monitoring│  Export   │ │
-│  │  System  │ Backend  │ Manager  │  System  │  Formats  │ │
-│  └──────────┴──────────┴──────────┴──────────┴──────────┘ │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    App[Application Layer: APIs, CLI, Web Interface]
+    subgraph Core[Core Generation Engine]
+        GenCore[Generator Core]
+        DomainReg[Domain Registry]
+        QualityChk[Quality Checker]
+        CurrMgr[Curriculum Manager]
+        DatasetBld[Dataset Builder]
+    end
+    Provider[LLM Provider Layer: OpenAI, Anthropic, Cohere, Local Models]
+    subgraph Infra[Infrastructure Layer]
+        Cache[Cache System]
+        Storage[Storage Backend]
+        Queue[Queue Manager]
+        Monitoring[Monitoring System]
+        Export[Export Formats]
+    end
+    App --> Core --> Provider --> Infra
 ```
 
 ## Core Components
@@ -87,8 +86,9 @@ class Domain:
 - Complexity assessment
 
 **Quality Pipeline**:
-```
-Generation → Validation → Scoring → Filtering → Post-processing
+```mermaid
+flowchart LR
+    Generation --> Validation --> Scoring --> Filtering --> Post[Post-processing]
 ```
 
 ### 4. Curriculum Manager (`curriculum.py`)
@@ -118,28 +118,33 @@ Generation → Validation → Scoring → Filtering → Post-processing
 ### Generation Pipeline
 
 1. **Request Processing**
-   ```
-   User Request → Configuration → Domain Selection → Template Loading
+   ```mermaid
+   flowchart LR
+       A[User Request] --> B[Configuration] --> C[Domain Selection] --> D[Template Loading]
    ```
 
 2. **Generation Phase**
-   ```
-   Prompt Construction → LLM Call → Response Parsing → Validation
+   ```mermaid
+   flowchart LR
+       A[Prompt Construction] --> B[LLM Call] --> C[Response Parsing] --> D[Validation]
    ```
 
 3. **Quality Assurance**
-   ```
-   Quality Scoring → Threshold Check → Filtering → Enhancement
+   ```mermaid
+   flowchart LR
+       A[Quality Scoring] --> B[Threshold Check] --> C[Filtering] --> D[Enhancement]
    ```
 
 4. **Dataset Construction**
-   ```
-   Sample Collection → Deduplication → Metadata Addition → Formatting
+   ```mermaid
+   flowchart LR
+       A[Sample Collection] --> B[Deduplication] --> C[Metadata Addition] --> D[Formatting]
    ```
 
 5. **Export & Storage**
-   ```
-   Format Selection → Serialization → Compression → Storage/Export
+   ```mermaid
+   flowchart LR
+       A[Format Selection] --> B[Serialization] --> C[Compression] --> D[Storage/Export]
    ```
 
 ## Provider Integration
@@ -416,14 +421,7 @@ async def generate_batch(prompts: List[str]):
 
 ### Format Conversion Pipeline
 
+```mermaid
+flowchart LR
+    Dataset --> Serializer --> Formatter --> Compressor --> Writer
 ```
-Dataset → Serializer → Formatter → Compressor → Writer
-```
-
-## Future Enhancements
-
-1. **Active Learning**: Incorporate human feedback
-2. **Multi-modal Support**: Images, audio, video
-3. **Federated Generation**: Privacy-preserving generation
-4. **AutoML Integration**: Automatic quality tuning
-5. **Real-time Streaming**: WebSocket-based streaming

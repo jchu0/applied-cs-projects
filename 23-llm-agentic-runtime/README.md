@@ -1,328 +1,190 @@
-# LLM Agentic Runtime 🤖
+# LLM Agentic Runtime
 
-[![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Build Status](https://img.shields.io/github/workflow/status/yourorg/llm-agentic-runtime/CI)](https://github.com/yourorg/llm-agentic-runtime/actions)
+A from-scratch Rust runtime for LLM-driven autonomous agents. It runs a ReAct-style
+reason/act loop over a pluggable LLM client, dispatches tool calls through a trait-based
+registry, persists step history in a tiered memory, and exposes the whole thing over an
+Axum HTTP API. The reasoning loop is model-agnostic: attach a real Anthropic client, a
+deterministic mock, or run with no client at all.
 
-A powerful Rust-based runtime for building and orchestrating autonomous AI agents using the ReAct pattern and other advanced reasoning strategies.
+## Features
 
-## ✨ Features
+- **ReAct reasoning loop** — the `AgentRuntime` iterates think → act → observe, parsing
+  each model turn into a `(thought, action, action_input)` triple and stopping on a
+  `finish` action, a timeout, or a max-step cap (`agent.rs`).
+- **Pluggable LLM client** — the `LlmClient` trait abstracts the model. `AnthropicClient`
+  is a real raw-HTTP wrapper over the Anthropic Messages API; `MockLlmClient` replays
+  scripted responses for offline tests (`llm.rs`).
+- **Deterministic fallback** — with no `LlmClient` attached the runtime uses a built-in
+  heuristic so demos and tests run without a network call or API key (`AgentRuntime::think_simulated`).
+- **Trait-based tools** — implement `Tool` and register it in `ToolRegistry`. Ships with
+  `CalculatorTool` (recursive expression evaluator) and a `SearchTool` stub (`tools.rs`).
+- **Tiered memory** — `AgentMemory` keeps a bounded short-term `VecDeque`, overflows into
+  scored long-term entries, and supports keyword recall plus run summaries (`memory.rs`).
+- **Planners** — `SimplePlanner`, `RulePlanner`, and `HybridPlanner` produce a `Plan` of
+  dependency-linked `PlanStep`s; `PlanOptimizer` finds parallelizable levels (`planner.rs`).
+- **DAG executor** — `ExecutionGraph` builds a node graph from a plan, runs ready nodes in
+  batches, resolves `$node` input references, and topologically orders execution (`executor.rs`).
+- **Guardrails** — `Guardrails` enforces blocked regex patterns, tool allow/deny lists, and
+  length limits; `CommonGuardrails`, `SqlGuard`, and `ContentModeration` add presets (`guardrails.rs`).
+- **Tracing** — `AgentTracer` records traces, writes them as JSON, computes statistics, and
+  exports successful runs as chat-formatted training data (`tracing.rs`).
+- **HTTP API** — Axum server with run/poll/cancel endpoints, an in-memory task registry, and
+  background execution (`api.rs`, `main.rs`).
 
-- **🧠 Multiple Planning Strategies**: ReAct, Chain-of-Thought, Tree-of-Thought
-- **⚡ Flexible Execution**: Sequential, parallel, and adaptive execution modes
-- **💾 Advanced Memory Systems**: Short-term, long-term, episodic, and semantic memory
-- **🛠️ Tool Integration**: Dynamic tool registration and execution
-- **🛡️ Built-in Guardrails**: Content filtering, PII detection, and safety checks
-- **📊 Comprehensive Tracing**: Distributed tracing and observability
-- **🔄 Multi-Agent Orchestration**: Coordinate multiple specialized agents
-- **🚀 Production Ready**: Error recovery, rate limiting, and monitoring
+## Architecture
 
-## 🚀 Quick Start
+```mermaid
+flowchart TD
+    Client(HTTP client) --> API(Axum API in api.rs)
+    API --> Runtime(AgentRuntime reason-act loop)
+    Runtime --> LLM(LlmClient trait)
+    LLM --> Anthropic(AnthropicClient real)
+    LLM --> Mock(MockLlmClient and heuristic fallback)
+    Runtime --> Tools(ToolRegistry)
+    Tools --> Calc(CalculatorTool)
+    Tools --> Search(SearchTool stub)
+    Runtime --> Memory(AgentMemory short and long term)
+    Planner(Planner trait) --> Graph(ExecutionGraph DAG)
+    Graph --> Tools
+    Runtime --> Trace(AgentTracer)
+    Runtime --> Guard(Guardrails)
+```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Agent runtime | `agent` | ReAct loop, state machine, ReAct prompt build and parse |
+| LLM client | `llm` | `LlmClient` trait, real `AnthropicClient`, `MockLlmClient` |
+| Tools | `tools` | `Tool` trait, `ToolRegistry`, calculator and search tools |
+| Memory | `memory` | Short/long-term store, importance scoring, recall, summary |
+| Planner | `planner` | `Plan`/`PlanStep` types and simple/rule/hybrid planners |
+| Executor | `executor` | DAG build from plan, batched parallel run, topo sort |
+| Guardrails | `guardrails` | Pattern/tool/length validation, SQL and content checks |
+| Tracing | `tracing` | Trace capture, JSON persistence, stats, training export |
+| HTTP API | `api` | Run/poll/cancel endpoints over a background task registry |
+
+## Quick Start
+
+### Prerequisites
+
+- Rust 1.75+ (2021 edition) and Cargo.
+- No external services are required to build, test, or run the deterministic path.
+- An `ANTHROPIC_API_KEY` is required only to drive the agent with a real model.
 
 ### Installation
 
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-llm-agentic-runtime = "0.1.0"
-tokio = { version = "1", features = ["full"] }
+```bash
+cd 23-llm-agentic-runtime
+cargo build
 ```
 
-### Basic Usage
+### Running
+
+```bash
+# Deterministic heuristic path (no key needed):
+cargo run
+
+# Drive the loop with a real model:
+ANTHROPIC_API_KEY=sk-... BIND_ADDR=127.0.0.1:8080 cargo run
+```
+
+The server listens on `BIND_ADDR` (default `0.0.0.0:8080`) and exposes `GET /health`,
+`GET /tools`, `POST /agent/run`, `GET /agent/{task_id}`, and `POST /agent/{task_id}/cancel`.
+
+```bash
+curl -s localhost:8080/agent/run \
+  -H 'content-type: application/json' \
+  -d '{"task":"summarize the plan","max_steps":10}'
+# {"task_id":"...","status":"running"}
+```
+
+## Usage
+
+Run the agent loop in-process with a scripted mock client (no key, no network):
 
 ```rust
-use llm_agentic_runtime::{Agent, AgentConfig, AgentCapability};
+use llm_agentic_runtime::{
+    AgentContext, AgentMemory, AgentRuntime, AgentRuntimeConfig, MockLlmClient,
+    SearchTool, SimplePlanner, ToolRegistry,
+};
 
 #[tokio::main]
 async fn main() {
-    // Configure agent
-    let config = AgentConfig {
-        name: "Assistant".to_string(),
-        model: "gpt-4".to_string(),
-        capabilities: vec![
-            AgentCapability::Planning,
-            AgentCapability::Reasoning,
-            AgentCapability::ToolUse,
-        ],
-        ..Default::default()
-    };
+    let mut tools = ToolRegistry::new();
+    tools.register(Box::new(SearchTool::new("search")));
 
-    // Create agent
-    let mut agent = Agent::new(config);
+    // The model searches first, then finishes.
+    let scripted = vec![
+        r#"{"thought":"search it","action":"search","action_input":{"query":"France"}}"#.to_string(),
+        r#"{"thought":"answer","action":"finish","action_input":{"answer":"Paris"}}"#.to_string(),
+    ];
 
-    // Execute task
-    let result = agent.execute_task("Plan a trip to Tokyo").await;
+    let mut runtime = AgentRuntime::new(
+        tools,
+        Box::new(SimplePlanner::new()),
+        AgentMemory::new(10),
+        AgentRuntimeConfig::default(),
+    )
+    .with_llm(Box::new(MockLlmClient::new(scripted)));
 
-    match result {
-        Ok(response) => println!("Agent: {}", response),
-        Err(e) => eprintln!("Error: {}", e),
-    }
+    let result = runtime
+        .run(AgentContext::new("capital of France").with_max_steps(5))
+        .await;
+
+    assert!(result.success);
+    println!("answer = {:?}", result.answer); // Some("Paris")
 }
 ```
 
-### ReAct Pattern Example
+Swap `MockLlmClient` for `AnthropicClient::from_env()` to use a real model, or omit
+`.with_llm(...)` entirely to run the deterministic heuristic.
 
-```rust
-use llm_agentic_runtime::{Agent, AgentConfig, PlanningStrategy};
+## What's Real vs Simulated
 
-let config = AgentConfig {
-    planning_strategy: PlanningStrategy::ReAct,
-    ..Default::default()
-};
+- **Real:** the ReAct loop, state machine, ReAct prompt/JSON parsing, timeout and
+  max-step handling; the `LlmClient` trait and the `AnthropicClient` HTTP wrapper; the
+  `MockLlmClient`; the `CalculatorTool` expression evaluator; `ToolRegistry`; tiered
+  `AgentMemory`; planners and `PlanOptimizer`; the `ExecutionGraph` DAG (build, batched
+  run, dependency resolution, topo sort); `Guardrails` and the SQL/content presets; the
+  `AgentTracer` (JSON persistence, stats, training export); and the Axum API
+  (run/poll/cancel over an in-memory registry). All are exercised by unit tests.
+- **Simulated / requires credentials:** `AnthropicClient` needs a live `ANTHROPIC_API_KEY`
+  and network — without it the runtime falls back to the deterministic heuristic.
+  `SearchTool` is a stub that returns an explicit "no backend configured" placeholder
+  rather than real results. Unknown actions in the loop and executor are echoed rather
+  than executed. Memory `embedding` fields are placeholders; long-term recall is keyword
+  matching, not vector similarity. The task registry is in-memory and non-persistent.
 
-let mut agent = Agent::new(config);
-
-// Register tools
-agent.register_tool("search", |query: &str| {
-    format!("Search results for: {}", query)
-});
-
-agent.register_tool("calculate", |expr: &str| {
-    format!("Result: {}", expr)
-});
-
-// Execute multi-step task
-let task = "Find the population of Tokyo and calculate 10% of it";
-let result = agent.execute_task(task).await.unwrap();
-
-// Agent will:
-// 1. Think: Need to search for Tokyo's population
-// 2. Act: Use search tool
-// 3. Observe: Process search results
-// 4. Think: Need to calculate 10%
-// 5. Act: Use calculator tool
-// 6. Observe: Get final result
-```
-
-## 🏗️ Architecture
-
-```
-Agent Runtime
-├── Core Components
-│   ├── Agent Engine
-│   ├── Planning Module
-│   ├── Execution Engine
-│   └── Memory System
-├── Supporting Systems
-│   ├── Tool Registry
-│   ├── Guardrails
-│   ├── Tracing
-│   └── State Management
-└── Extensions
-    ├── Multi-Agent Orchestration
-    ├── Custom Strategies
-    └── Plugin System
-```
-
-## 📦 Components
-
-### Agent
-
-The core component that orchestrates all operations:
-
-```rust
-let mut agent = Agent::builder()
-    .name("ResearchAgent")
-    .model("gpt-4")
-    .temperature(0.7)
-    .add_capability(AgentCapability::Research)
-    .add_capability(AgentCapability::Analysis)
-    .build();
-```
-
-### Planning Strategies
-
-Multiple strategies for task decomposition:
-
-```rust
-// ReAct Pattern
-let react_agent = Agent::with_strategy(PlanningStrategy::ReAct);
-
-// Chain of Thought
-let cot_agent = Agent::with_strategy(PlanningStrategy::ChainOfThought);
-
-// Tree of Thought (exploration)
-let tot_agent = Agent::with_strategy(PlanningStrategy::TreeOfThought);
-```
-
-### Memory Management
-
-Comprehensive memory system:
-
-```rust
-// Configure memory
-let memory = MemoryStore::new(MemoryType::Hybrid);
-
-agent.set_memory(memory);
-agent.store_memory("key_fact", "Important information");
-
-let recalled = agent.recall("key_fact");
-```
-
-### Tool Integration
-
-Easy tool registration and usage:
-
-```rust
-// Sync tool
-agent.register_tool("uppercase", |text: &str| {
-    text.to_uppercase()
-});
-
-// Async tool
-agent.register_async_tool("fetch", |url: &str| async {
-    // Async operation
-    fetch_data(url).await
-});
-```
-
-### Guardrails
-
-Built-in safety mechanisms:
-
-```rust
-let guardrails = Guardrail::builder()
-    .enable_content_filter()
-    .enable_pii_detection()
-    .max_output_length(1000)
-    .block_patterns(vec!["password", "secret"])
-    .build();
-
-agent.set_guardrails(guardrails);
-```
-
-## 🎯 Use Cases
-
-- **Customer Support**: Autonomous support agents
-- **Research Assistants**: Information gathering and analysis
-- **Task Automation**: Complex workflow automation
-- **Code Generation**: Intelligent code assistants
-- **Data Analysis**: Automated data processing and insights
-
-## 📊 Performance
-
-| Metric | Value |
-|--------|-------|
-| Average Response Time | < 500ms |
-| Concurrent Agents | 1000+ |
-| Memory per Agent | ~10MB |
-| Tool Execution Overhead | < 10ms |
-
-## 🧪 Testing
+## Testing
 
 ```bash
-# Run all tests
 cargo test
-
-# Run specific test suite
-cargo test test_agent
-
-# Run with coverage
-cargo tarpaulin --out Html
-
-# Run benchmarks
-cargo bench
 ```
 
-## 🔧 Configuration
+Tests live in `#[cfg(test)]` modules in each source file. They cover the agent loop
+(deterministic and mock-LLM paths, timeout, ReAct parsing), tools, memory tiering and
+recall, planners and parallelism, the execution graph, guardrails, the tracer, and the
+HTTP API (health, tools listing, run-then-poll, 404). No external services or API key are
+needed — the API tests run the deterministic path.
 
-### Environment Variables
+## Project Structure
 
-```bash
-# LLM Configuration
-export LLM_API_KEY="your-api-key"
-export LLM_MODEL="gpt-4"
-export LLM_TEMPERATURE=0.7
-
-# Runtime Configuration
-export AGENT_MAX_RETRIES=3
-export AGENT_TIMEOUT_MS=30000
-export AGENT_MEMORY_SIZE_MB=100
-
-# Monitoring
-export ENABLE_TRACING=true
-export TRACE_ENDPOINT="http://localhost:4317"
+```
+23-llm-agentic-runtime/
+  src/
+    lib.rs         # Crate root, Error enum, shared constants
+    agent.rs       # AgentRuntime ReAct loop and state machine
+    llm.rs         # LlmClient trait, AnthropicClient, MockLlmClient
+    tools.rs       # Tool trait, ToolRegistry, calculator and search tools
+    memory.rs      # AgentMemory tiered store, WorkingMemory
+    planner.rs     # Plan/PlanStep, planners, PlanOptimizer
+    executor.rs    # ExecutionGraph DAG executor
+    guardrails.rs  # Guardrails and content/SQL safety checks
+    tracing.rs     # AgentTracer, training-data export
+    api.rs         # Axum HTTP API
+    main.rs        # Binary entry point (HTTP server)
+  docs/BLUEPRINT.md   # Full architecture and design
 ```
 
-### Configuration File
+## License
 
-```toml
-[agent]
-name = "ProductionAgent"
-model = "gpt-4"
-max_concurrent_tasks = 10
-
-[memory]
-type = "persistent"
-path = "/var/lib/agent/memory"
-max_size_mb = 500
-
-[guardrails]
-enable_all = true
-custom_filters = ["medical_advice", "financial_advice"]
-
-[tracing]
-enabled = true
-sample_rate = 0.1
-```
-
-## 🚀 Deployment
-
-### Docker
-
-```dockerfile
-FROM rust:latest
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-CMD ["./target/release/llm-agentic-runtime"]
-```
-
-### Kubernetes
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: agentic-runtime
-spec:
-  replicas: 3
-  template:
-    spec:
-      containers:
-      - name: agent
-        image: llm-agentic-runtime:latest
-        env:
-        - name: LLM_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: llm-secret
-              key: api-key
-```
-
-## 📚 Documentation
-
-- [Architecture Overview](docs/ARCHITECTURE.md)
-- [API Reference](docs/API.md)
-- [Deployment Guide](docs/DEPLOYMENT.md)
-- [Contributing Guide](docs/CONTRIBUTING.md)
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details.
-
-## 📄 License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- ReAct paper authors (Yao et al.)
-- Tree of Thoughts authors (Yao et al.)
-- Rust async community
-- OpenAI and Anthropic for LLM APIs
-
----
-
-Built with ❤️ by the AI Engineering Community
+MIT — see [../LICENSE](../LICENSE).

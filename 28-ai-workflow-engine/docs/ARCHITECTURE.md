@@ -23,22 +23,27 @@ The AI Workflow Engine is a flexible, scalable system for defining, executing, a
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Workflow Engine                       │
-├─────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │   Parser     │  │  Validator   │  │  Optimizer   │     │
-│  └──────────────┘  └──────────────┘  └──────────────┘     │
-├─────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-│  │  Scheduler   │  │   Executor   │  │    Retry     │     │
-│  └──────────────┘  └──────────────┘  │   Manager    │     │
-├─────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐  ┌──────────────┐  └──────────────┘     │
-│  │Node Registry │  │Version Mgmt  │  ┌──────────────┐     │
-│  └──────────────┘  └──────────────┘  │  Monitoring  │     │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Engine[Workflow Engine]
+        subgraph Compile[Compilation]
+            Parser
+            Validator
+            Optimizer
+        end
+        subgraph Execute[Execution]
+            Scheduler
+            Executor
+            RetryManager[Retry Manager]
+        end
+        subgraph Support[Supporting Services]
+            NodeRegistry[Node Registry]
+            VersionMgmt[Version Mgmt]
+            Monitoring
+        end
+    end
+
+    Compile --> Execute --> Support
 ```
 
 ## Core Components
@@ -183,34 +188,29 @@ class FlowVersionManager:
 ### Execution Flow
 
 1. **Input Phase**
-   ```
-   User Definition (YAML/JSON/DSL)
-           ↓
-   Parser → Internal Representation
-           ↓
-   Validator → Validated Flow
-           ↓
-   Optimizer → Optimized Flow
+
+   ```mermaid
+   flowchart TD
+       UserDef[User Definition YAML/JSON/DSL] --> Parser[Parser → Internal Representation]
+       Parser --> Validator[Validator → Validated Flow]
+       Validator --> Optimizer[Optimizer → Optimized Flow]
    ```
 
 2. **Execution Phase**
-   ```
-   Scheduler → DAG Analysis
-           ↓
-   Node Scheduling → Parallel/Sequential
-           ↓
-   Node Execution → Results
-           ↓
-   Data Passing → Next Nodes
+
+   ```mermaid
+   flowchart TD
+       Scheduler[Scheduler → DAG Analysis] --> NodeScheduling[Node Scheduling → Parallel/Sequential]
+       NodeScheduling --> NodeExecution[Node Execution → Results]
+       NodeExecution --> DataPassing[Data Passing → Next Nodes]
    ```
 
 3. **Output Phase**
-   ```
-   Results Aggregation
-           ↓
-   Output Validation
-           ↓
-   Final Results → User
+
+   ```mermaid
+   flowchart TD
+       Aggregation[Results Aggregation] --> OutputValidation[Output Validation]
+       OutputValidation --> FinalResults[Final Results → User]
    ```
 
 ### Data Passing Between Nodes
@@ -390,23 +390,3 @@ class PauseCommand:
    - Track execution metrics
    - Identify bottleneck nodes
    - Monitor resource utilization
-
-## Future Enhancements
-
-1. **Planned Features**
-   - Distributed execution across multiple machines
-   - Real-time workflow modification
-   - Advanced scheduling algorithms
-   - Machine learning-based optimization
-
-2. **Integration Points**
-   - Kubernetes operator for cloud deployment
-   - Apache Airflow compatibility layer
-   - MLflow integration for experiment tracking
-   - Prometheus metrics export
-
-3. **Performance Improvements**
-   - Compiled workflow execution
-   - GPU acceleration for compatible nodes
-   - Intelligent caching strategies
-   - Predictive resource allocation

@@ -1,260 +1,199 @@
 # RAG Baseline
 
-![Python](https://img.shields.io/badge/python-3.9%2B-blue)
-![License](https://img.shields.io/badge/license-Apache%202.0-green)
-![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
-![Coverage](https://img.shields.io/badge/coverage-65%25-yellow)
-
-A production-ready implementation of Retrieval-Augmented Generation (RAG) for building intelligent question-answering systems. This project provides a robust, scalable, and extensible RAG pipeline with enterprise features.
+A Retrieval-Augmented Generation system built from scratch in Python: document
+ingestion, chunking, embedding-based retrieval, BM25/hybrid search, reranking, and
+LLM generation, exposed both as a library (`ragbaseline`) and a FastAPI service. The
+full pipeline runs locally with mock embeddings and a mock LLM, so no API keys are
+required to exercise it end to end.
 
 ## Features
 
-### Core Capabilities
-- 🔍 **Advanced Retrieval**: Multiple retrieval strategies including vector, hybrid, and MMR
-- 🧠 **Flexible Embeddings**: Support for OpenAI, Cohere, HuggingFace, and local models
-- 📚 **Smart Chunking**: Multiple chunking strategies for optimal document processing
-- 💾 **Vector Store Integration**: Chroma, Qdrant, Pinecone, and in-memory stores
-- 🤖 **Multi-LLM Support**: OpenAI, Anthropic, and local LLM providers
-- ⚡ **Streaming Responses**: Real-time streaming for better user experience
-- 🔄 **Caching System**: Intelligent caching for improved performance
+- **Pluggable document parsers** — PDF, HTML, Markdown, and plain text via a common
+  `DocumentParser` interface and `DocumentIngestion` dispatcher (`parsers.py`).
+- **Multiple chunking strategies** — `FixedSizeChunker`, `SentenceChunker`,
+  `RecursiveChunker`, `SemanticChunker`, and `HierarchicalChunker` (`chunking.py`).
+- **Swappable embeddings** — `MockEmbedding` (deterministic, hash-seeded),
+  `SentenceTransformerEmbedding`, `OpenAIEmbedding`, and `HuggingFaceEmbedding`, behind
+  a `get_embedding_model` factory (`embeddings.py`).
+- **Vector stores** — NumPy-based `SimpleVectorStore` plus `ChromaVectorStore`,
+  `QdrantVectorStore`, and `PineconeVectorStore` (`vectorstore.py`).
+- **Lexical and hybrid retrieval** — a from-scratch `BM25` scorer and a
+  `HybridRetriever` that fuses vector and keyword results with Reciprocal Rank Fusion
+  (`retrieval.py`).
+- **Advanced retrievers** — `VectorRetriever`, `FusionRetriever`, and `MMRRetriever`
+  for diversity-aware retrieval (`retrieval.py`).
+- **Reranking** — `CrossEncoderReranker` and `CohereReranker` behind a `get_reranker`
+  factory (`retrieval.py`).
+- **Metadata filtering** — operator syntax (`$in`, `$gte`, `$lt`, `$contains`, …) and a
+  `MetadataFilter` string parser shared across stores and BM25.
+- **LLM generation** — `OpenAIProvider`, `AnthropicProvider`, and `MockLLMProvider`
+  with sync and streaming generation behind `get_llm_provider` (`pipeline.py`).
+- **Multi-tenancy and analytics** — `TenantManager`, `RetrievalLogger`, and
+  `UsageTracker` for per-tenant isolation, JSONL query logs, and usage metrics
+  (`enterprise.py`).
+- **FastAPI service** — query, streaming query, search, ingest, tenant, analytics, and
+  usage endpoints (`api.py`).
 
-### Enterprise Features
-- 🏢 **Multi-tenancy**: Isolated environments for different users/organizations
-- 📊 **Analytics & Monitoring**: Built-in metrics and observability
-- 🔒 **Security**: API key authentication, rate limiting, and data encryption
-- 🎯 **A/B Testing**: Experiment with different configurations
-- 📈 **Scalability**: Horizontal and vertical scaling support
-- 🔧 **Configuration Management**: Flexible configuration system
+## Architecture
+
+```mermaid
+flowchart TD
+    Files(Source files: PDF / HTML / MD / TXT) --> Ingest(DocumentIngestion)
+    Ingest --> Chunk(Chunking strategy)
+    Chunk --> Embed(Embedding model)
+    Embed --> Store[(Vector store)]
+    Query(User query) --> Index(RAGIndex.search)
+    Index --> Embed
+    Index --> Store
+    Store --> Retrieve(SearchResults)
+    Retrieve --> Rerank(Optional reranker)
+    Rerank --> Pipe(RAGPipeline)
+    Pipe --> LLM(LLM provider)
+    LLM --> Answer(RAGResponse)
+    API(FastAPI app) --> Pipe
+```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| Parsers | `parsers.py` | Turn files into `Document` objects by format |
+| Chunking | `chunking.py` | Split documents into `Chunk` objects |
+| Embeddings | `embeddings.py` | Encode text into vectors |
+| Vector store | `vectorstore.py` | Store vectors and run similarity search |
+| Index | `index.py` | Combine chunker + embeddings + store (`RAGIndex`) |
+| Retrieval | `retrieval.py` | BM25, hybrid, fusion, MMR, reranking, filters |
+| Pipeline | `pipeline.py` | Retrieve, build context, generate (`RAGPipeline`) |
+| Enterprise | `enterprise.py` | Tenants, retrieval logging, usage tracking |
+| API | `api.py` | FastAPI REST + SSE streaming endpoints |
+| Schemas | `schemas.py` | `Document`, `Chunk`, `SearchResult`, `RAGResponse` |
 
 ## Quick Start
+
+### Prerequisites
+
+- Python 3.10+
+- No external services or API keys are required to run the tests or the default
+  in-memory pipeline. Optional integrations (OpenAI, Anthropic, Chroma, Cohere,
+  sentence-transformers, FastAPI) are installed via extras. See
+  [docs/SETUP.md](docs/SETUP.md) for detailed environment setup.
 
 ### Installation
 
 ```bash
-# Using pip
-pip install ragbaseline
-
-# Using poetry
-poetry add ragbaseline
-
-# From source
-git clone https://github.com/your-org/rag-baseline.git
-cd rag-baseline
+# Core install (NumPy only)
 pip install -e .
+
+# With test dependencies
+pip install -e ".[dev]"
+
+# Everything (parsers, embeddings, providers, API)
+pip install -e ".[full]"
 ```
 
-### Basic Usage
+### Running
+
+```bash
+# Start the FastAPI service (defaults to the mock LLM provider, no keys needed)
+uvicorn ragbaseline.api:app --reload
+# or
+python -m ragbaseline.api
+```
+
+## Usage
+
+The example below uses the fully local stack (`MockEmbedding`, `SimpleVectorStore`,
+`MockLLMProvider`) and runs without any credentials.
 
 ```python
-from ragbaseline import RAGPipeline, OpenAIProvider, ChromaVectorStore
+import asyncio
 
-# Initialize components
-llm = OpenAIProvider(api_key="your-openai-key")
-vectorstore = ChromaVectorStore(collection_name="documents")
+from ragbaseline import (
+    Document, RAGConfig, RAGIndex, RAGPipeline,
+    MockEmbedding, SimpleVectorStore, MockLLMProvider, FixedSizeChunker,
+)
 
-# Create pipeline
+# Build an index from a chunker + embedding model + vector store
+index = RAGIndex(
+    embedding_model=MockEmbedding(dimension=128),
+    vector_store=SimpleVectorStore(),
+    chunker=FixedSizeChunker(chunk_size=200, chunk_overlap=20),
+)
+
+index.index_document(Document(
+    id="geo",
+    content="France is a country in Europe. Its capital is Paris.",
+    metadata={"filename": "geo.txt"},
+))
+
+# Generate an answer over retrieved context
 pipeline = RAGPipeline(
-    llm_provider=llm,
-    vectorstore=vectorstore
+    index=index,
+    llm_provider=MockLLMProvider(responses=["The capital of France is Paris."]),
+    config=RAGConfig(top_k=3),
 )
 
-# Index documents
-await pipeline.index_document(
-    content="Artificial Intelligence is transforming industries...",
-    metadata={"source": "ai_article.pdf"}
-)
-
-# Query
-response = await pipeline.query(
-    "What industries is AI transforming?",
-    k=5
-)
-
-print(response.answer)
-# Output: AI is transforming various industries including healthcare, finance...
-
-# Access sources
-for source in response.sources:
-    print(f"- {source.content[:100]}... (score: {source.score})")
+response = asyncio.run(pipeline.query("What is the capital of France?"))
+print(response.answer)                       # -> The capital of France is Paris.
+for src in response.sources:
+    print(src.id, round(src.score, 3))
 ```
 
-### Streaming Example
+Swap `MockEmbedding`/`MockLLMProvider` for `OpenAIEmbedding`/`OpenAIProvider` (or the
+Anthropic / sentence-transformers equivalents) to run against real models.
 
-```python
-# Streaming responses
-async for chunk in pipeline.stream_query("Explain machine learning"):
-    print(chunk, end="", flush=True)
-```
+## What's Real vs Simulated
 
-## Architecture
-
-```
-┌────────────┐     ┌──────────┐     ┌────────────┐
-│   Query    │────▶│ Retrieval │────▶│ Generation │
-└────────────┘     └──────────┘     └────────────┘
-                         │                  │
-                         ▼                  ▼
-                  ┌────────────┐     ┌────────────┐
-                  │Vector Store│     │    LLM     │
-                  └────────────┘     └────────────┘
-```
-
-## Documentation
-
-- 📚 [Full Documentation](docs/)
-- 🏗️ [Architecture Guide](docs/ARCHITECTURE.md)
-- 🔌 [API Reference](docs/API.md)
-- 🚀 [Deployment Guide](docs/DEPLOYMENT.md)
-- 🤝 [Contributing Guidelines](docs/CONTRIBUTING.md)
+- **Real (no credentials, exercised by the test suite):** document parsing (plain text
+  always; PDF/HTML/Markdown when their optional deps are installed), all chunking
+  strategies, `MockEmbedding` (deterministic hash-seeded vectors), `SimpleVectorStore`
+  cosine search with metadata filtering, `RAGIndex`, `RAGPipeline` (sync + streaming),
+  the from-scratch `BM25` scorer, `HybridRetriever` RRF fusion, fusion/MMR retrievers,
+  `MultiIndexManager`, `MetadataFilter`, and the enterprise logging/usage trackers. The
+  FastAPI app defaults to the mock LLM provider, so it runs without keys.
+- **Simulated / requires credentials or optional deps:** `OpenAIEmbedding` /
+  `OpenAIProvider` (OpenAI key), `AnthropicProvider` (Anthropic key), `CohereReranker`
+  (Cohere key), `ChromaVectorStore` / `QdrantVectorStore` / `PineconeVectorStore` (their
+  client libraries / services), `SentenceTransformerEmbedding`, `HuggingFaceEmbedding`,
+  and `CrossEncoderReranker` (model downloads). `LocalLLMProvider` returns a fixed
+  placeholder string rather than calling a real local model.
 
 ## Testing
 
 ```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=ragbaseline --cov-report=html
-
-# Run specific test categories
-pytest tests/unit/
-pytest tests/integration/
-pytest tests/e2e/
-
-# Run tests in parallel
-pytest -n auto
+pytest tests/ -v
 ```
 
-## Configuration
+The suite covers schemas, parsing, every chunking strategy, embedding determinism,
+vector-store add/search/delete/filter, `RAGIndex`, the index- and retriever-based
+pipelines, BM25 and hybrid retrieval, streaming, multi-index isolation, and edge cases
+(empty/whitespace/very long documents, concurrent queries). It runs entirely on the
+mock/local components — no external services required.
 
-Create a `.env` file or set environment variables:
+## Project Structure
 
-```bash
-# LLM Configuration
-OPENAI_API_KEY=your-key
-LLM_MODEL=gpt-3.5-turbo
-LLM_TEMPERATURE=0.7
-
-# Vector Store
-VECTOR_STORE_TYPE=chroma
-CHROMA_HOST=localhost
-CHROMA_PORT=8000
-
-# Retrieval Settings
-RETRIEVAL_K=5
-CHUNK_SIZE=512
-CHUNK_OVERLAP=50
-
-# API Settings
-API_PORT=8000
-RATE_LIMIT=100
 ```
-
-## Docker Deployment
-
-```bash
-# Build image
-docker build -t rag-baseline:latest .
-
-# Run with docker-compose
-docker-compose up -d
-
-# Check logs
-docker-compose logs -f rag-api
+25-rag-baseline/
+  README.md                 # This file
+  pyproject.toml            # Package metadata, extras, pytest config
+  Dockerfile                # Container build for the API
+  docker-compose.yml        # Local API stack
+  src/ragbaseline/
+    schemas.py              # Document, Chunk, SearchResult, RAGResponse, RAGConfig
+    parsers.py              # PDF / HTML / Markdown / text parsers + ingestion
+    chunking.py             # Fixed, sentence, recursive, semantic, hierarchical chunkers
+    embeddings.py           # Mock / SentenceTransformer / OpenAI / HuggingFace
+    vectorstore.py          # Simple / Chroma / Qdrant / Pinecone stores
+    index.py                # RAGIndex, MultiIndexManager
+    retrieval.py            # BM25, hybrid, fusion, MMR, rerankers, filters
+    pipeline.py             # LLM providers and RAGPipeline
+    enterprise.py           # TenantManager, RetrievalLogger, UsageTracker
+    api.py                  # FastAPI application
+  tests/                    # Unit + integration tests (mock components)
+  docs/
+    BLUEPRINT.md            # Full architecture and design
+    SETUP.md                # Detailed environment setup
+    API.md, ARCHITECTURE.md, DEPLOYMENT.md, CONTRIBUTING.md
 ```
-
-## API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/index/documents` | Index documents |
-| POST | `/api/v1/index/upload` | Upload and index file |
-| GET | `/api/v1/index/documents/{id}` | Get document info |
-| DELETE | `/api/v1/index/documents/{id}` | Delete document |
-| POST | `/api/v1/index/search` | Search documents |
-| POST | `/api/v1/rag/query` | RAG query |
-| GET | `/api/v1/rag/stream` | Streaming query |
-| POST | `/api/v1/feedback` | Submit feedback |
-
-## Performance Benchmarks
-
-| Operation | Average Time | Throughput |
-|-----------|-------------|------------|
-| Document Indexing | 0.5s/doc | 120 docs/min |
-| Vector Search | 50ms | 20 queries/s |
-| RAG Query | 1.2s | 50 queries/min |
-| Streaming Response | 100ms TTFB | - |
-
-## Roadmap
-
-### Version 2.0 (Q2 2024)
-- [ ] Graph-based retrieval
-- [ ] Multi-modal support (images, tables)
-- [ ] Fine-tuning pipeline
-- [ ] Advanced caching strategies
-
-### Version 3.0 (Q4 2024)
-- [ ] Distributed vector index
-- [ ] Multi-language support
-- [ ] Active learning
-- [ ] AutoML for configuration
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](docs/CONTRIBUTING.md).
-
-```bash
-# Setup development environment
-git clone https://github.com/your-org/rag-baseline.git
-cd rag-baseline
-pip install -e ".[dev]"
-pre-commit install
-
-# Create feature branch
-git checkout -b feature/your-feature
-
-# Make changes and test
-pytest
-black ragbaseline/
-flake8 ragbaseline/
-
-# Submit PR
-git push origin feature/your-feature
-```
-
-## Support
-
-- 📖 [Documentation](https://docs.example.com/rag-baseline)
-- 💬 [Discord Community](https://discord.gg/rag-baseline)
-- 🐛 [Issue Tracker](https://github.com/your-org/rag-baseline/issues)
-- 📧 Email: support@example.com
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Citation
-
-If you use this project in your research, please cite:
-
-```bibtex
-@software{rag_baseline,
-  title = {RAG Baseline: Production-Ready Retrieval-Augmented Generation},
-  author = {Your Organization},
-  year = {2024},
-  url = {https://github.com/your-org/rag-baseline}
-}
-```
-
-## Acknowledgments
-
-- OpenAI for GPT models
-- Anthropic for Claude models
-- The open-source community for various components
-- Our contributors and users
-
----
-
-<p align="center">
-Built with ❤️ by the RAG Baseline Team
-</p>
+MIT — see [../LICENSE](../LICENSE).

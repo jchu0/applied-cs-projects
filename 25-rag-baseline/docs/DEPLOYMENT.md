@@ -791,11 +791,3 @@ kubectl rollout status deployment/rag-api -n rag-system
 # Rollback if needed
 kubectl rollout undo deployment/rag-api -n rag-system
 ```
-
-## Support
-
-For deployment support, consult:
-- [Documentation](https://docs.example.com/rag-baseline)
-- [GitHub Issues](https://github.com/your-org/rag-baseline/issues)
-- [Community Forum](https://forum.example.com/rag)
-- Email: support@example.com

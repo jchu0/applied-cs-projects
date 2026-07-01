@@ -518,13 +518,6 @@ stats.print_stats(10)
    - Use TYPE_CHECKING for type hints
    - Restructure modules if necessary
 
-## Questions and Support
-
-- **GitHub Issues**: For bugs and feature requests
-- **Discussions**: For questions and ideas
-- **Discord/Slack**: For real-time help (if available)
-- **Email**: maintainers@example.com
-
 ## Recognition
 
 Contributors will be recognized in:

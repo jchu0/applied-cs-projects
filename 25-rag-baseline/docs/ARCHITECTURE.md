@@ -6,58 +6,28 @@ The RAG Baseline project implements a production-ready Retrieval-Augmented Gener
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         User Query                          │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      RAG Pipeline                           │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │                  Query Processing                     │  │
-│  │  • Input validation                                  │  │
-│  │  • Query embedding                                   │  │
-│  │  • Metadata extraction                              │  │
-│  └──────────────────────────┬───────────────────────────┘  │
-│                              │                              │
-│  ┌──────────────────────────▼───────────────────────────┐  │
-│  │                Document Retrieval                     │  │
-│  │  • Vector similarity search                          │  │
-│  │  • Metadata filtering                                │  │
-│  │  • Result ranking                                    │  │
-│  └──────────────────────────┬───────────────────────────┘  │
-│                              │                              │
-│  ┌──────────────────────────▼───────────────────────────┐  │
-│  │                Context Construction                   │  │
-│  │  • Document ranking                                  │  │
-│  │  • Context window management                         │  │
-│  │  • Prompt template formatting                        │  │
-│  └──────────────────────────┬───────────────────────────┘  │
-│                              │                              │
-│  ┌──────────────────────────▼───────────────────────────┐  │
-│  │                  LLM Generation                       │  │
-│  │  • Context-aware generation                          │  │
-│  │  • Response streaming                                │  │
-│  │  • Citation tracking                                 │  │
-│  └──────────────────────────┬───────────────────────────┘  │
-└──────────────────────────────┼──────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Response Output                        │
-│  • Answer text                                             │
-│  • Source documents                                        │
-│  • Confidence scores                                       │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Query[User Query]
+    subgraph Pipeline[RAG Pipeline]
+        QP[Query Processing: input validation, query embedding, metadata extraction]
+        DR[Document Retrieval: vector similarity search, metadata filtering, result ranking]
+        CC[Context Construction: document ranking, context window management, prompt template formatting]
+        LG[LLM Generation: context-aware generation, response streaming, citation tracking]
+        QP --> DR --> CC --> LG
+    end
+    Output[Response Output: answer text, source documents, confidence scores]
+    Query --> Pipeline
+    LG --> Output
 ```
 
 ## Core Components
 
 ### 1. Document Processing Pipeline
 
-```python
-Document Input → Parsing → Chunking → Embedding → Indexing
+```mermaid
+flowchart LR
+    A[Document Input] --> B[Parsing] --> C[Chunking] --> D[Embedding] --> E[Indexing]
 ```
 
 #### Parsers (`parsers.py`)
@@ -115,22 +85,23 @@ Document Input → Parsing → Chunking → Embedding → Indexing
 
 ### 1. Document Ingestion Flow
 
-```
-Documents → Parser Selection → Content Extraction → Chunking Strategy →
-Embedding Generation → Vector Store → Index Update
+```mermaid
+flowchart LR
+    A[Documents] --> B[Parser Selection] --> C[Content Extraction] --> D[Chunking Strategy] --> E[Embedding Generation] --> F[Vector Store] --> G[Index Update]
 ```
 
 ### 2. Query Processing Flow
 
-```
-User Query → Query Embedding → Vector Search → Result Retrieval →
-Context Construction → LLM Prompt → Response Generation → Output
+```mermaid
+flowchart LR
+    A[User Query] --> B[Query Embedding] --> C[Vector Search] --> D[Result Retrieval] --> E[Context Construction] --> F[LLM Prompt] --> G[Response Generation] --> H[Output]
 ```
 
 ### 3. Feedback Loop
 
-```
-Response → User Feedback → Relevance Scoring → Index Optimization
+```mermaid
+flowchart LR
+    A[Response] --> B[User Feedback] --> C[Relevance Scoring] --> D[Index Optimization]
 ```
 
 ## Storage Architecture
@@ -333,27 +304,3 @@ Alerts:
   - Resource exhaustion
 ```
 
-## Future Architecture Considerations
-
-### Planned Enhancements
-
-1. **Advanced Retrieval**
-   - Graph-based retrieval
-   - Multi-modal search
-   - Cross-lingual support
-
-2. **Improved Generation**
-   - Fine-tuned models
-   - Multi-turn conversations
-   - Fact verification
-
-3. **Scalability**
-   - Distributed vector indices
-   - Edge deployment
-   - Serverless functions
-
-### Research Integration
-
-- Active learning for index improvement
-- Reinforcement learning for query optimization
-- Neural architecture search for model selection

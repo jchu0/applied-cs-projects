@@ -6,29 +6,26 @@ The LLM Agentic Runtime is a comprehensive framework for building, orchestrating
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Application Layer                       │
-│                   (User Applications/APIs)                   │
-├─────────────────────────────────────────────────────────────┤
-│                    Agent Orchestration Layer                 │
-│              (Multi-Agent Coordination & Management)         │
-├─────────────────────────────────────────────────────────────┤
-│                       Core Agent Layer                       │
-│  ┌──────────┬──────────┬──────────┬──────────┬──────────┐ │
-│  │  Agent   │ Planner  │ Executor │  Memory  │   Tools   │ │
-│  │  Core    │  Module  │  Module  │  Store   │ Registry  │ │
-│  └──────────┴──────────┴──────────┴──────────┴──────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│                    Supporting Components                     │
-│  ┌──────────┬──────────┬──────────┬──────────┬──────────┐ │
-│  │Guardrails│ Tracing  │  State   │  Events  │  Metrics  │ │
-│  │          │          │  Manager │  System  │  Collector│ │
-│  └──────────┴──────────┴──────────┴──────────┴──────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│                        LLM Layer                             │
-│            (OpenAI, Anthropic, Local Models, etc.)           │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    App[Application Layer: User Applications/APIs]
+    Orch[Agent Orchestration Layer: Multi-Agent Coordination & Management]
+    subgraph Core[Core Agent Layer]
+        AgentCore[Agent Core]
+        Planner[Planner Module]
+        Executor[Executor Module]
+        Memory[Memory Store]
+        Tools[Tools Registry]
+    end
+    subgraph Support[Supporting Components]
+        Guardrails
+        Tracing
+        StateMgr[State Manager]
+        Events[Events System]
+        Metrics[Metrics Collector]
+    end
+    LLM[LLM Layer: OpenAI, Anthropic, Local Models, etc.]
+    App --> Orch --> Core --> Support --> LLM
 ```
 
 ## Core Components
@@ -67,8 +64,9 @@ Implements various planning strategies for decomposing complex tasks.
 - **Adaptive**: Dynamic strategy selection
 
 **Planning Flow:**
-```
-Goal → Analysis → Decomposition → Step Generation → Validation → Plan
+```mermaid
+flowchart LR
+    Goal --> Analysis --> Decomposition --> Step[Step Generation] --> Validation --> Plan
 ```
 
 ### 3. Execution Module (`executor.rs`)
@@ -150,30 +148,38 @@ Ensures safe and compliant agent behavior.
 
 ## Agent Lifecycle
 
-```
-Initialize → Configure → Ready → Execute → Learn → Adapt
-     ↑                                                ↓
-     └────────────── Reset/Reconfigure ←─────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Initialize
+    Initialize --> Configure
+    Configure --> Ready
+    Ready --> Execute
+    Execute --> Learn
+    Learn --> Adapt
+    Adapt --> Initialize: Reset/Reconfigure
 ```
 
 ## Communication Patterns
 
 ### Inter-Agent Communication
 
-```
-Agent A → Message Queue → Router → Agent B
-           ↓                ↑
-         Event Bus ← Responses
+```mermaid
+flowchart LR
+    AgentA[Agent A] --> MQ[Message Queue] --> Router --> AgentB[Agent B]
+    MQ --> EventBus[Event Bus]
+    Responses --> Router
+    EventBus --> Responses
 ```
 
 ### Tool Communication
 
-```
-Agent → Tool Request → Tool Registry → Tool Instance
-                           ↓               ↓
-                      Validation      Execution
-                           ↓               ↓
-                        Results ←──────────┘
+```mermaid
+flowchart TD
+    Agent --> Req[Tool Request] --> Registry[Tool Registry] --> Instance[Tool Instance]
+    Registry --> Validation
+    Instance --> Execution
+    Validation --> Results
+    Execution --> Results
 ```
 
 ## State Management
@@ -188,10 +194,16 @@ Agent → Tool Request → Tool Registry → Tool Instance
 
 ### State Transitions
 
-```
-Idle ─→ Thinking ─→ Acting ─→ Observing ─→ Idle
-  ↑        ↓           ↓          ↓         ↓
-  └───── Error ←───────┴──────────┴─────────┘
+```mermaid
+stateDiagram-v2
+    Idle --> Thinking
+    Thinking --> Acting
+    Acting --> Observing
+    Observing --> Idle
+    Thinking --> Error
+    Acting --> Error
+    Observing --> Error
+    Error --> Idle
 ```
 
 ## Concurrency Model

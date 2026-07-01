@@ -577,12 +577,6 @@ Any other relevant information
 
 ## Community
 
-### Getting Help
-
-- **Discord**: [Join our Discord](https://discord.gg/rag-baseline)
-- **Discussions**: [GitHub Discussions](https://github.com/org/rag-baseline/discussions)
-- **Stack Overflow**: Tag questions with `rag-baseline`
-
 ### Weekly Meetings
 
 - **Community Call**: Thursdays at 3 PM UTC

@@ -6,45 +6,34 @@ The ML Compiler is a high-performance compiler for machine learning models, desi
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         Frontend                             │
-│  (Model Import: ONNX, TensorFlow, PyTorch, JAX)            │
-└─────────────────┬───────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    IR Construction                           │
-│         (Graph Builder, Type System, Operations)             │
-└─────────────────┬───────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  Optimization Pipeline                       │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │
-│  │ Constant │ │   Dead   │ │   CSE    │ │ Operator │      │
-│  │ Folding  │ │   Code   │ │          │ │  Fusion  │      │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘      │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │
-│  │  Memory  │ │   Loop   │ │  Graph   │ │  Layout  │      │
-│  │   Opt    │ │   Opt    │ │ Rewrite  │ │   Opt    │      │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘      │
-└─────────────────┬───────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Code Generation                           │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │
-│  │   CPU    │ │   CUDA   │ │  OpenCL  │ │  WebGPU  │      │
-│  │  Codegen │ │  Codegen │ │ Codegen  │ │ Codegen  │      │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘      │
-└─────────────────┬───────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 Runtime & Execution                          │
-│          (JIT Compilation, Memory Management)                │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Frontend["Frontend (Model Import: ONNX, TensorFlow, PyTorch, JAX)"]
+    IRConstruction["IR Construction (Graph Builder, Type System, Operations)"]
+    Runtime["Runtime & Execution (JIT Compilation, Memory Management)"]
+
+    Frontend --> IRConstruction
+    IRConstruction --> Pipeline
+    Pipeline --> Codegen
+    Codegen --> Runtime
+
+    subgraph Pipeline["Optimization Pipeline"]
+        ConstFold["Constant Folding"]
+        DCE["Dead Code"]
+        CSE["CSE"]
+        Fusion["Operator Fusion"]
+        MemOpt["Memory Opt"]
+        LoopOpt["Loop Opt"]
+        GraphRewrite["Graph Rewrite"]
+        LayoutOpt["Layout Opt"]
+    end
+
+    subgraph Codegen["Code Generation"]
+        CPU["CPU Codegen"]
+        CUDA["CUDA Codegen"]
+        OpenCL["OpenCL Codegen"]
+        WebGPU["WebGPU Codegen"]
+    end
 ```
 
 ## Core Components
@@ -221,10 +210,14 @@ The runtime system executes compiled models.
 
 ### Memory Flow
 
-```
-Input Data → Input Buffers → Computation → Intermediate Buffers
-    ↓                                              ↓
-Output Buffers ← Final Computation ← Intermediate Results
+```mermaid
+flowchart LR
+    InputData["Input Data"] --> InputBuffers["Input Buffers"]
+    InputBuffers --> Computation
+    Computation --> IntermediateBuffers["Intermediate Buffers"]
+    IntermediateBuffers --> IntermediateResults["Intermediate Results"]
+    IntermediateResults --> FinalComputation["Final Computation"]
+    FinalComputation --> OutputBuffers["Output Buffers"]
 ```
 
 ## Optimization Strategies
@@ -344,11 +337,3 @@ class CustomBackend(CodeGenerator):
 - Property-based testing
 - Differential testing
 
-## Future Directions
-
-1. **Dynamic Shapes**: Support for dynamic tensor dimensions
-2. **Sparse Tensors**: Efficient sparse computation
-3. **Quantization**: INT8/INT4 inference
-4. **Distributed**: Multi-device compilation
-5. **Auto-tuning**: Machine learning for optimization
-6. **Differentiable Programming**: First-class gradient support

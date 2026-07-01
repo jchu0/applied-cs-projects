@@ -1,308 +1,165 @@
 # ML Compiler
 
-A high-performance compiler for machine learning models, providing XLA/TVM-like functionality with advanced optimization capabilities for various hardware targets.
-
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/Tests-Passing-green)](tests/)
-[![Documentation](https://img.shields.io/badge/Docs-Available-green)](docs/)
+A from-scratch ML compiler in the spirit of XLA and TVM. It takes a tensor
+computation expressed in a typed SSA intermediate representation, runs a pipeline
+of classic optimization passes over it, plans buffer memory with lifetime-based
+reuse, and emits target source code for CPU (C with BLAS), CUDA, or Triton. The
+whole pipeline is pure Python and NumPy with no external compiler toolchain.
 
 ## Features
 
-- **Multi-Framework Support:** Import models from ONNX, TensorFlow, PyTorch, and JAX
-- **Advanced Optimizations:** Operator fusion, constant folding, loop optimization, memory planning
-- **Multiple Backends:** CPU (x86/ARM), CUDA, OpenCL, WebGPU, Metal
-- **High Performance:** Competitive with XLA and TVM on standard benchmarks
-- **Easy to Use:** Simple Python API for compilation and deployment
-- **Extensible:** Plugin architecture for custom operations and optimizations
+- **Typed SSA IR** — tensors carry shape and `DType`; operations are SSA `Value`
+  nodes grouped into `Block`s and `Function`s (`ir/operations.py`, `ir/module.py`).
+- **Builder API** — `IRBuilder` constructs graphs with automatic shape inference
+  for matmul, transpose, reductions, conv2d, attention, and elementwise ops
+  (`ir/builder.py`).
+- **Optimization passes** — constant folding, dead-code elimination, CSE,
+  operator fusion, algebraic simplification, strength reduction, and layout
+  hints, driven to a fixpoint by a `PassManager` (`optimization/passes.py`).
+- **Operator fusion** — fuses elementwise chains, matmul-plus-bias, and the
+  Q/K/softmax/V attention pattern into single `FUSED`/`ATTENTION` ops.
+- **Memory planning** — lifetime analysis plus greedy, linear-scan, or best-fit
+  buffer allocation with reuse tracking (`memory/planner.py`).
+- **Three code generators** — `CPUCodeGenerator` (C with `cblas_sgemm`),
+  `CUDACodeGenerator` (kernels plus cuBLAS host code), and `TritonCodeGenerator`
+  (`@triton.jit` Python), all sharing a base in `codegen/base.py`.
+- **Compiler driver** — `MLCompiler` wires passes, planning, and codegen together
+  and reports per-stage timing and op-count statistics (`compiler.py`).
+- **Configurable optimization levels** — `OptLevel.O0` through `O3` select the
+  pass pipeline and iteration budget.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    Builder["IRBuilder (shape inference)"] --> Module["IRModule (typed SSA)"]
+    Module --> PM["PassManager (run to fixpoint)"]
+    PM --> Planner["MemoryPlanner (lifetime + reuse)"]
+    Planner --> Codegen["CodeGenerator (per target)"]
+    Codegen --> CPU["CPU (C with BLAS)"]
+    Codegen --> CUDA["CUDA (kernels with cuBLAS)"]
+    Codegen --> Triton["Triton (Python DSL)"]
+    PM --> Result["CompilationResult (source plus stats)"]
+    Planner --> Result
+```
+
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| IR types | `ir/types.py` | `DType`, `TensorType`, `Value`, `Constant`, memory spaces |
+| Operations | `ir/operations.py` | `OpCode`, `Operation`, `Block`, `Region`, shape inference |
+| Module | `ir/module.py` | `Function`, `FunctionType`, `IRModule`, verification |
+| Builder | `ir/builder.py` | `IRBuilder` graph construction helpers |
+| Passes | `optimization/passes.py` | optimization passes and `PassManager` |
+| Memory | `memory/planner.py` | lifetime analysis, allocation strategies, stats |
+| Codegen | `codegen/base.py`, `codegen/cuda.py` | CPU / CUDA / Triton source emission |
+| Driver | `compiler.py` | `MLCompiler`, `CompilerConfig`, `create_compiler` |
 
 ## Quick Start
+
+### Prerequisites
+
+- Python 3.9+
+- NumPy (installed as a dependency); no GPU, CUDA toolkit, or C compiler is
+  needed to run the compiler or the tests — codegen produces source as a string.
 
 ### Installation
 
 ```bash
-# Install from PyPI
-pip install mlcompiler
-
-# Or install from source
-git clone https://github.com/your-org/ml-compiler.git
-cd ml-compiler
-pip install -e .
+cd 31-ml-compiler
+pip install -e ".[dev]"
 ```
 
-### Basic Example
+### Running
+
+The package is a library. Import it and compile a function:
+
+```bash
+python -c "from mlcompiler.compiler import example_compilation; example_compilation()"
+```
+
+## Usage
+
+Build a function with the `IRBuilder` and compile it to CPU C source:
 
 ```python
-from mlcompiler import MLCompiler, CompilerConfig, Target
-from mlcompiler.ir import IRBuilder
-from mlcompiler.ir.types import TensorType, DataType, Shape
+from mlcompiler import create_compiler, TensorType, DType
+from mlcompiler.ir import IRBuilder, Value
 
-# Create and compile a simple model
-builder = IRBuilder()
-builder.begin_block("simple_model")
+compiler = create_compiler(target="cpu", opt_level=2)
 
-# Define inputs
-x = builder.create_input(
-    TensorType(DataType.FLOAT32, Shape([32, 784])),
-    name="input"
-)
+input_types = [
+    TensorType((128, 512), DType.FLOAT32),   # a
+    TensorType((512, 256), DType.FLOAT32),   # b
+]
+output_types = [TensorType((128, 256), DType.FLOAT32)]
 
-# Build computation
-w = builder.create_weight(
-    TensorType(DataType.FLOAT32, Shape([784, 10])),
-    name="weight"
-)
-logits = builder.add_matmul(x, w)
-output = builder.add_softmax(logits)
+def build(builder: IRBuilder, args: list[Value]):
+    a, b = args
+    c = builder.matmul(a, b)
+    c = builder.relu(c)
+    builder.return_op([c])
 
-builder.set_return(output)
+result = compiler.compile_function("matmul_relu", input_types, output_types, build)
 
-# Compile the model
-config = CompilerConfig(target=Target.CPU, optimization_level="O2")
-compiler = MLCompiler(config)
-module = builder.get_module()
-compiled_model = compiler.compile(module)
-
-# Run inference
-import numpy as np
-input_data = np.random.randn(32, 784).astype(np.float32)
-predictions = compiled_model.run(input_data)
-print(f"Predictions shape: {predictions.shape}")
+print(result.code.language)            # "c"
+print(result.stats["num_ops_before"], "->", result.stats["num_ops_after"])
+print("peak bytes:", result.memory_plan.peak_memory)
+print(result.code.source)              # generated C source
 ```
 
-### Compile from ONNX
+Target CUDA or Triton by changing one argument:
 
 ```python
-# Load and compile ONNX model
-compiled_model = compiler.compile_from_onnx("model.onnx")
-
-# Run inference
-output = compiled_model.run(input_data)
+cuda = create_compiler(target="cuda", opt_level=3)
+result = cuda.compile_function("matmul_relu", input_types, output_types, build)
+print(result.code.source)              # CUDA kernels + cuBLAS host code
 ```
 
-## Architecture
+## What's Real vs Simulated
 
-The ML Compiler consists of several key components:
-
-1. **Frontend:** Imports models from various frameworks
-2. **IR (Intermediate Representation):** Graph-based representation for optimizations
-3. **Optimization Pipeline:** Multiple optimization passes for performance
-4. **Code Generation:** Target-specific code generation
-5. **Runtime:** Efficient execution engine
-
-See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture information.
-
-## Supported Operations
-
-### Neural Network Layers
-- Convolution (1D, 2D, 3D)
-- Pooling (Max, Average, Global)
-- Batch Normalization
-- Layer Normalization
-- Dropout
-- Fully Connected (Dense)
-
-### Activations
-- ReLU, Leaky ReLU, PReLU
-- Sigmoid, Tanh
-- GELU, SiLU, Mish
-- Softmax, LogSoftmax
-
-### Tensor Operations
-- MatMul, BatchMatMul
-- Reshape, Transpose, Permute
-- Concat, Split, Slice
-- Reduce (Sum, Mean, Max, Min)
-- Gather, Scatter
-
-### Advanced Operations
-- Attention (Multi-head, Flash)
-- Embedding, Positional Encoding
-- RNN, LSTM, GRU cells
-- Custom operations via plugins
-
-## Performance
-
-Benchmark results on common models (relative to baseline PyTorch):
-
-| Model | CPU Speedup | GPU Speedup | Memory Reduction |
-|-------|------------|-------------|------------------|
-| ResNet-50 | 2.3x | 1.8x | 35% |
-| BERT-Base | 2.1x | 2.5x | 42% |
-| GPT-2 | 1.9x | 2.2x | 38% |
-| EfficientNet | 2.5x | 1.9x | 40% |
-| Transformer | 2.2x | 2.8x | 45% |
+- **Real:** the IR, shape inference, every optimization pass, the `PassManager`
+  fixpoint loop, all three memory allocation strategies with lifetime analysis,
+  and the three code generators. The compiler produces correct, readable target
+  source and accurate compilation statistics, all exercised by the test suite.
+- **Simulated / not included:** the emitted C/CUDA/Triton source is **generated
+  as text and never compiled or executed** — there is no runtime, JIT, or
+  inference engine. There is **no model frontend** (no ONNX, TensorFlow, PyTorch,
+  or JAX import); graphs are built only through `IRBuilder`. The CUDA and Triton
+  generators target hardware that is not invoked here. Some operations fall
+  through to `// TODO` comments rather than full kernels.
 
 ## Testing
 
-Run the test suite:
-
 ```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=mlcompiler --cov-report=html
-
-# Run specific test category
-pytest tests/test_optimization.py
-
-# Run benchmarks
-pytest benchmarks/ --benchmark-only
+pytest tests/ -v
 ```
 
-Current test coverage: **85%**
+The suite runs with NumPy only — no GPU or external services. The
+`_actual` suites plus `test_memory_planning.py` and `test_cuda_codegen.py`
+exercise the real API: DType/TensorType behavior, shape inference for every
+opcode, each optimization pass, all allocation strategies, and CPU/CUDA/Triton
+codegen output. Several older suites (`test_codegen.py`, `test_integration.py`,
+`test_ir_builder.py`, `test_ir_operations.py`, `test_optimization_passes.py`)
+are guarded with `skipif` against a legacy API that this codebase does not
+implement, and skip cleanly.
 
-## Documentation
+## Project Structure
 
-- [Architecture Guide](docs/ARCHITECTURE.md) - System design and components
-- [API Reference](docs/API.md) - Complete API documentation
-- [Deployment Guide](docs/DEPLOYMENT.md) - Production deployment instructions
-- [Contributing Guide](docs/CONTRIBUTING.md) - How to contribute
-
-## Examples
-
-### CNN Model Compilation
-
-```python
-# Build a CNN model
-builder = IRBuilder()
-builder.begin_block("cnn_model")
-
-# Input image
-image = builder.create_input(
-    TensorType(DataType.FLOAT32, Shape([1, 3, 224, 224])),
-    name="image"
-)
-
-# Convolutional layers
-conv1_w = builder.create_weight(
-    TensorType(DataType.FLOAT32, Shape([64, 3, 7, 7]))
-)
-conv1 = builder.add_convolution(image, conv1_w, stride=(2, 2), padding=(3, 3))
-conv1 = builder.add_batch_norm(conv1)
-conv1 = builder.add_relu(conv1)
-
-# ... more layers ...
-
-# Compile with optimizations
-config = CompilerConfig(
-    target=Target.CUDA,
-    optimization_level="O3",
-    use_tensor_cores=True
-)
-compiler = MLCompiler(config)
-compiled = compiler.compile(builder.get_module())
 ```
-
-### Custom Optimization Pass
-
-```python
-from mlcompiler.optimization import OptimizationPass
-
-class CustomFusionPass(OptimizationPass):
-    def run(self, module):
-        # Implement custom fusion logic
-        return optimized_module
-
-# Register and use custom pass
-compiler.register_pass(CustomFusionPass())
-```
-
-### Distributed Deployment
-
-```python
-from mlcompiler.distributed import DistributedCompiler
-
-# Compile for multiple GPUs
-dist_compiler = DistributedCompiler(
-    devices=["cuda:0", "cuda:1"],
-    strategy="data_parallel"
-)
-dist_model = dist_compiler.compile(module)
-```
-
-## Roadmap
-
-### Current Release (v1.0)
-- ✅ Core compiler infrastructure
-- ✅ CPU and CUDA backends
-- ✅ Basic optimization passes
-- ✅ ONNX import support
-
-### Next Release (v1.1)
-- 🚧 Dynamic shape support
-- 🚧 Quantization (INT8/INT4)
-- 🚧 More optimization passes
-- 🚧 TensorFlow/PyTorch import
-
-### Future (v2.0)
-- 📋 Distributed compilation
-- 📋 Auto-tuning
-- 📋 Custom DSL
-- 📋 Hardware accelerator support
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details.
-
-### Development Setup
-
-```bash
-# Clone repository
-git clone https://github.com/your-org/ml-compiler.git
-cd ml-compiler
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install development dependencies
-pip install -r requirements-dev.txt
-
-# Install pre-commit hooks
-pre-commit install
-
-# Run tests
-pytest
-```
-
-## Community
-
-- **GitHub Issues:** [Bug reports and feature requests](https://github.com/your-org/ml-compiler/issues)
-- **Discord:** [Join our community](https://discord.gg/mlcompiler)
-- **Twitter:** [@mlcompiler](https://twitter.com/mlcompiler)
-- **Blog:** [https://blog.mlcompiler.org](https://blog.mlcompiler.org)
-
-## Citation
-
-If you use ML Compiler in your research, please cite:
-
-```bibtex
-@software{mlcompiler2024,
-  title = {ML Compiler: High-Performance Compilation for Machine Learning Models},
-  author = {ML Compiler Team},
-  year = {2024},
-  url = {https://github.com/your-org/ml-compiler}
-}
+31-ml-compiler/
+  README.md                       # this file
+  pyproject.toml                  # package metadata and dev tooling
+  src/mlcompiler/
+    __init__.py                   # public exports
+    compiler.py                   # MLCompiler driver, create_compiler
+    ir/                           # types, operations, module, builder
+    optimization/passes.py        # passes and PassManager
+    memory/planner.py             # lifetime analysis and allocation
+    codegen/                      # base (CPU), cuda (CUDA, Triton)
+  tests/                          # pytest suites
+  docs/BLUEPRINT.md               # full architecture and design
 ```
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Inspired by XLA, TVM, and MLIR projects
-- Built on top of LLVM infrastructure
-- Community contributors and supporters
-
-## Support
-
-- Documentation: [https://mlcompiler.readthedocs.io](https://mlcompiler.readthedocs.io)
-- Commercial support: [support@mlcompiler.com](mailto:support@mlcompiler.com)
-- Enterprise solutions: [https://mlcompiler.com/enterprise](https://mlcompiler.com/enterprise)
-
----
-
-Made with ❤️ by the ML Compiler Team
+MIT — see ../LICENSE

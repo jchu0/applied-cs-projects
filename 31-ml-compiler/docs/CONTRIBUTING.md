@@ -505,15 +505,6 @@ open _build/html/index.html
 - **Discord:** Real-time chat and support
 - **Mailing List:** Announcements and discussions
 
-### Getting Help
-
-If you need help:
-
-1. Check the documentation
-2. Search existing issues
-3. Ask in GitHub Discussions
-4. Join our Discord server
-
 ### Recognition
 
 We recognize contributors in several ways:
