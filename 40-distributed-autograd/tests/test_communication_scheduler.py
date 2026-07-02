@@ -496,6 +496,53 @@ class TestPipelineScheduler:
 
         assert pipeline._target_bandwidth_gbps == 25.0
 
+    def test_wait_for_stage_logs_failure(self, comm_scheduler, caplog):
+        """_wait_for_stage must log (not silently swallow) a stage failure.
+
+        A stage whose AllReduce raised should be surfaced via the logger and
+        the scheduler should return rather than hang or hide the error.
+        """
+        import logging
+        pipeline = PipelineScheduler(comm_scheduler, num_pipeline_stages=2)
+
+        # Submit a work item that raises so its future carries an exception.
+        def boom(_):
+            raise RuntimeError("allreduce exploded")
+
+        bucket = GradientBucket(index=0, size_bytes=100)
+        bucket.params = [MockParameter((3, 3))]
+        bucket.params[0].grad = np.ones((3, 3))
+
+        future = comm_scheduler.schedule_allreduce(bucket, boom)
+        # Let the worker thread run the failing job.
+        try:
+            future.result(timeout=5.0)
+        except RuntimeError:
+            pass
+
+        pipeline._stage_futures[0] = future
+
+        with caplog.at_level(logging.ERROR):
+            # Should not raise, should not hang; should log the failure.
+            pipeline._wait_for_stage()
+
+        assert any("Pipeline stage" in rec.message for rec in caplog.records)
+
+    def test_wait_for_stage_completes_normally(self, comm_scheduler):
+        """_wait_for_stage returns cleanly when a stage has finished."""
+        pipeline = PipelineScheduler(comm_scheduler, num_pipeline_stages=2)
+
+        bucket = GradientBucket(index=0, size_bytes=100)
+        bucket.params = [MockParameter((3, 3))]
+        bucket.params[0].grad = np.ones((3, 3))
+
+        future = comm_scheduler.schedule_allreduce(bucket, lambda x: x)
+        future.result(timeout=5.0)
+        pipeline._stage_futures[0] = future
+
+        # A completed, successful future should simply return.
+        pipeline._wait_for_stage()
+
 
 # =============================================================================
 # GradientBucket Enhanced Tests

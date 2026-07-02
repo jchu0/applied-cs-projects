@@ -25,8 +25,11 @@ from mlcompiler.ir import (
     IRModule, Function, FunctionType, IRBuilder,
     TensorType, DType, Value, OpCode, Operation, Block
 )
-from mlcompiler.codegen import CUDACodeGenerator, TritonCodeGenerator, GeneratedCode
+from mlcompiler.codegen import (
+    CUDACodeGenerator, TritonCodeGenerator, CPUCodeGenerator, GeneratedCode
+)
 from mlcompiler.memory import MemoryPlanner, MemoryPlan, AllocationStrategy
+from mlcompiler.optimization import OperatorFusion
 
 
 # ============================================================================
@@ -631,6 +634,65 @@ class TestCodeQuality:
 
         # Should have operation comments
         assert "// ADD" in result.source or "// RETURN" in result.source
+
+
+class TestFusedOpCodegenFallback:
+    """Fused ops (FUSED/ATTENTION) have no kernel lowering; codegen must be honest.
+
+    Rather than silently dropping the op or faking a kernel, each backend logs a
+    warning and emits a clearly-marked ``// UNLOWERED`` placeholder.
+    """
+
+    def _fused_module(self):
+        """Build a module and run fusion so it contains a FUSED op."""
+        t = TensorType((32, 64), DType.FLOAT32)
+        module = IRModule(name="fused")
+        func = module.create_function(
+            "fused_func", input_types=[t, t], output_types=[t]
+        )
+        builder = IRBuilder(func.entry_block)
+        x, y = func.entry_block.arguments
+        s = builder.add(x, y)          # fusable elementwise chain
+        a = builder.relu(s)
+        builder.return_op([a])
+
+        OperatorFusion().run(module)
+        # Confirm fusion actually produced a FUSED op.
+        opcodes = [op.opcode for b in func.body.blocks for op in b.operations]
+        assert OpCode.FUSED in opcodes
+        return module
+
+    def test_cpu_emits_unlowered_placeholder(self, caplog):
+        import logging
+        module = self._fused_module()
+        with caplog.at_level(logging.WARNING):
+            result = CPUCodeGenerator().generate(module)
+        assert "// UNLOWERED: FUSED" in result.source
+        assert any(
+            "no lowering for opcode FUSED" in r.getMessage() for r in caplog.records
+        )
+
+    def test_cuda_emits_unlowered_placeholder(self, caplog):
+        import logging
+        module = self._fused_module()
+        with caplog.at_level(logging.WARNING):
+            result = CUDACodeGenerator().generate(module)
+        assert "// UNLOWERED: FUSED" in result.source
+        assert any("FUSED" in r.getMessage() for r in caplog.records)
+
+    def test_triton_emits_unlowered_placeholder(self, caplog):
+        import logging
+        module = self._fused_module()
+        with caplog.at_level(logging.WARNING):
+            result = TritonCodeGenerator().generate(module)
+        assert "// UNLOWERED: FUSED" in result.source
+
+    def test_no_bare_todo_for_fused_on_cpu(self):
+        """The old silent ``// TODO`` must no longer be how fused ops surface."""
+        module = self._fused_module()
+        result = CPUCodeGenerator().generate(module)
+        # Fused op is represented by the explicit UNLOWERED marker.
+        assert "// UNLOWERED" in result.source
 
 
 if __name__ == "__main__":

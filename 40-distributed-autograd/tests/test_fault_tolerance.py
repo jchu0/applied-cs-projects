@@ -499,6 +499,45 @@ class TestCheckpointer:
 
         checkpointer.shutdown()
 
+    def test_load_external_path_rejected(self, temp_checkpoint_dir):
+        """An existing checkpoint outside save_dir is refused by default.
+
+        Guards the pickle deserialization: load() must not unpickle files
+        outside the trusted save_dir unless allow_external=True.
+        """
+        checkpointer = Checkpointer(save_dir=temp_checkpoint_dir, async_save=False)
+
+        # Write a real pickle file in a *different* directory.
+        outside_dir = tempfile.mkdtemp()
+        try:
+            outside_path = os.path.join(outside_dir, "evil.pt")
+            import pickle
+            with open(outside_path, "wb") as f:
+                pickle.dump({"iteration": 7}, f)
+
+            with pytest.raises(ValueError, match="outside the trusted save_dir"):
+                checkpointer.load(outside_path)
+
+            # Explicit opt-in bypasses the guard for trusted paths.
+            loaded = checkpointer.load(outside_path, allow_external=True)
+            assert loaded is not None
+            assert loaded["iteration"] == 7
+        finally:
+            shutil.rmtree(outside_dir, ignore_errors=True)
+            checkpointer.shutdown()
+
+    def test_load_from_save_dir_allowed(self, temp_checkpoint_dir):
+        """A checkpoint written into save_dir loads without allow_external."""
+        checkpointer = Checkpointer(save_dir=temp_checkpoint_dir, async_save=False)
+
+        filepath = checkpointer.save({"iteration": 42}, iteration=42, force=True)
+        # Path lives inside save_dir, so the default guard permits it.
+        loaded = checkpointer.load(filepath)
+        assert loaded is not None
+        assert loaded["iteration"] == 42
+
+        checkpointer.shutdown()
+
     def test_async_save(self, temp_checkpoint_dir):
         """Test async checkpoint saving."""
         checkpointer = Checkpointer(

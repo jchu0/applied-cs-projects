@@ -3,6 +3,7 @@
 import pytest
 import asyncio
 import os
+import pickle
 import tempfile
 import numpy as np
 
@@ -243,6 +244,83 @@ class TestCheckpointManager:
 
         loaded = await manager.load_checkpoint(path)
         assert loaded.worker_clocks == clocks
+
+
+class TestCheckpointLoadGuard:
+    """Tests for the trusted-directory guard on load_checkpoint.
+
+    Checkpoints are unpickled (arbitrary code execution), so load_checkpoint
+    refuses paths outside storage_path unless allow_external=True.
+    """
+
+    @pytest.fixture
+    def temp_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield tmpdir
+
+    @pytest.fixture
+    def manager(self, temp_dir):
+        return CheckpointManager(storage_path=temp_dir, max_checkpoints=10)
+
+    def _write_pickle(self, path):
+        """Write a valid Checkpoint pickle at an arbitrary path."""
+        ckpt = Checkpoint(
+            checkpoint_id="external",
+            epoch=1,
+            global_step=42,
+            params={"w": np.array([1.0])},
+        )
+        with open(path, "wb") as f:
+            pickle.dump(ckpt, f)
+
+    @pytest.mark.asyncio
+    async def test_rejects_path_outside_storage(self, manager):
+        """A path outside storage_path is rejected with a clear error."""
+        with tempfile.TemporaryDirectory() as other_dir:
+            outside = os.path.join(other_dir, "checkpoint_evil.pkl")
+            self._write_pickle(outside)
+            with pytest.raises(ValueError, match="outside the trusted storage"):
+                await manager.load_checkpoint(outside)
+
+    @pytest.mark.asyncio
+    async def test_rejects_parent_traversal(self, manager):
+        """A `..` traversal escaping storage_path is rejected."""
+        with tempfile.TemporaryDirectory() as other_dir:
+            outside = os.path.join(other_dir, "checkpoint_evil.pkl")
+            self._write_pickle(outside)
+            # Reference the same file via a traversal through storage_path.
+            traversal = os.path.join(
+                str(manager.storage_path), "..", os.path.basename(other_dir),
+                "checkpoint_evil.pkl",
+            )
+            with pytest.raises(ValueError, match="outside the trusted storage"):
+                await manager.load_checkpoint(traversal)
+
+    @pytest.mark.asyncio
+    async def test_allows_external_when_opted_in(self, manager):
+        """allow_external=True permits loading a trusted file outside storage."""
+        with tempfile.TemporaryDirectory() as other_dir:
+            outside = os.path.join(other_dir, "checkpoint_trusted.pkl")
+            self._write_pickle(outside)
+            loaded = await manager.load_checkpoint(outside, allow_external=True)
+            assert loaded is not None
+            assert loaded.global_step == 42
+
+    @pytest.mark.asyncio
+    async def test_allows_path_inside_storage(self, manager):
+        """A normally-saved checkpoint (inside storage_path) loads without opt-in."""
+        path = await manager.save_checkpoint(
+            params={"w": np.array([1.0, 2.0])}, epoch=0, global_step=10,
+        )
+        loaded = await manager.load_checkpoint(path)
+        assert loaded is not None
+        assert loaded.global_step == 10
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_external_returns_none(self, manager):
+        """A missing path returns None before the guard triggers."""
+        loaded = await manager.load_checkpoint("/nonexistent/evil.pkl")
+        assert loaded is None
 
 
 class TestCheckpointConcurrency:

@@ -1,6 +1,6 @@
 //! Unit tests for service discovery functionality
 
-use service_mesh::discovery::{LoadBalancerType, ServiceKey};
+use service_mesh::discovery::{ConsistentHashRing, LoadBalancerType, ServiceKey};
 use service_mesh::{
     Endpoint, EndpointHealth, LoadBalancer, ServiceEndpoints, ServiceIdentity, ServiceRegistry,
 };
@@ -239,6 +239,76 @@ fn test_service_key_creation() {
     assert_eq!(key.name, "my-service");
     assert_eq!(key.namespace, "production");
     assert_eq!(key.port, 443);
+}
+
+fn hashring_endpoints(n: usize) -> Vec<Endpoint> {
+    (0..n)
+        .map(|i| Endpoint {
+            address: format!("10.1.0.{}:8080", i + 1).parse().unwrap(),
+            weight: 100,
+            health: EndpointHealth::Healthy,
+            metadata: Default::default(),
+            tls_identity: default_identity(),
+        })
+        .collect()
+}
+
+#[test]
+fn test_ring_hash_stable_key_mapping() {
+    let endpoints = hashring_endpoints(4);
+    let lb = LoadBalancer::new(LoadBalancerType::RingHash);
+
+    // A given key must map to the same backend across many calls.
+    for k in 0..20 {
+        let key = format!("customer-{k}");
+        let first = lb.select_with_key(&endpoints, &key).unwrap().address;
+        for _ in 0..10 {
+            assert_eq!(lb.select_with_key(&endpoints, &key).unwrap().address, first);
+        }
+    }
+}
+
+#[test]
+fn test_ring_hash_distributes_keys_across_backends() {
+    let endpoints = hashring_endpoints(4);
+    let lb = LoadBalancer::new(LoadBalancerType::RingHash);
+
+    let mut seen: HashMap<SocketAddr, usize> = HashMap::new();
+    for k in 0..2000 {
+        let a = lb.select_with_key(&endpoints, &format!("k{k}")).unwrap().address;
+        *seen.entry(a).or_default() += 1;
+    }
+
+    // Not all keys land on one backend.
+    assert_eq!(seen.len(), 4, "keys should spread across all 4 backends");
+    for (_, c) in seen {
+        assert!(c > 100, "each backend should get a meaningful share");
+    }
+}
+
+#[test]
+fn test_ring_hash_bounded_reassignment_on_membership_change() {
+    let addrs: Vec<SocketAddr> = hashring_endpoints(5).iter().map(|e| e.address).collect();
+    let before = ConsistentHashRing::new(&addrs);
+
+    // Drop one backend.
+    let removed = addrs[3];
+    let after_addrs: Vec<SocketAddr> = addrs.iter().copied().filter(|a| *a != removed).collect();
+    let after = ConsistentHashRing::new(&after_addrs);
+
+    let total = 4000;
+    let mut moved = 0;
+    for k in 0..total {
+        let key = format!("k{k}");
+        let b = before.lookup(&key).unwrap();
+        let a = after.lookup(&key).unwrap();
+        if b != a {
+            moved += 1;
+            assert_eq!(b, removed, "only keys on the removed node may move");
+        }
+    }
+    let frac = moved as f64 / total as f64;
+    assert!(frac < 0.35, "reassignment fraction too high: {frac}");
 }
 
 #[test]

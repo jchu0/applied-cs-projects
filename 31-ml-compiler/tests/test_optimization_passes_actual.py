@@ -25,8 +25,30 @@ from mlcompiler.optimization import (
     Pass, FunctionPass, ConstantFolding, DeadCodeElimination,
     CommonSubexpressionElimination, OperatorFusion,
     LayoutOptimization, StrengthReduction, AlgebraicSimplification,
-    PassManager, create_default_pipeline
+    PassManager, PassError, create_default_pipeline
 )
+
+
+class _BoomPass(Pass):
+    """A pass that always raises, for testing PassManager resilience."""
+
+    name = "boom"
+
+    def run(self, module):
+        raise ValueError("kaboom")
+
+
+class _CountingPass(Pass):
+    """A pass that records how many times it ran and never modifies."""
+
+    name = "counter"
+
+    def __init__(self):
+        self.calls = 0
+
+    def run(self, module):
+        self.calls += 1
+        return False
 
 
 # ============================================================================
@@ -786,6 +808,101 @@ class TestOptimizationEdgeCases:
         assert OpCode.RETURN in opcodes
         assert OpCode.RELU not in opcodes
         assert OpCode.SIGMOID not in opcodes
+
+
+class TestPassManagerErrorHandling:
+    """Tests for PassManager resilience and failure visibility."""
+
+    def _empty_module(self):
+        module = IRModule(name="err")
+        func = module.create_function(
+            "f",
+            input_types=[TensorType((4,), DType.FLOAT32)],
+            output_types=[TensorType((4,), DType.FLOAT32)],
+        )
+        builder = IRBuilder(func.entry_block)
+        builder.return_op([func.entry_block.arguments[0]])
+        return module
+
+    def test_failing_pass_is_recorded_not_swallowed(self, caplog):
+        """A failing pass is logged and recorded on errors, pipeline survives."""
+        module = self._empty_module()
+        pm = PassManager(max_iterations=1)
+        pm.add_pass(_BoomPass())
+
+        import logging
+        with caplog.at_level(logging.ERROR):
+            result = pm.run(module)
+
+        assert result is module  # pipeline still returns the module
+        assert pm.has_errors
+        assert len(pm.errors) == 1
+        err = pm.errors[0]
+        assert isinstance(err, PassError)
+        assert err.pass_name == "boom"
+        assert isinstance(err.exception, ValueError)
+        assert "boom" in str(err)
+        # The failure was logged (not silent).
+        assert any("boom" in rec.getMessage() for rec in caplog.records)
+
+    def test_failing_pass_does_not_block_other_passes(self):
+        """A failing pass does not prevent subsequent passes from running."""
+        module = self._empty_module()
+        counter = _CountingPass()
+        pm = PassManager(max_iterations=1)
+        pm.add_pass(_BoomPass())
+        pm.add_pass(counter)
+
+        pm.run(module)
+
+        assert counter.calls == 1  # ran despite the earlier failure
+        assert pm.has_errors
+
+    def test_strict_mode_reraises(self):
+        """strict=True re-raises the first pass failure."""
+        module = self._empty_module()
+        pm = PassManager(max_iterations=1, strict=True)
+        pm.add_pass(_BoomPass())
+
+        with pytest.raises(ValueError, match="kaboom"):
+            pm.run(module)
+
+        # Still recorded even though it re-raised.
+        assert pm.has_errors
+
+    def test_pass_results_track_success_and_failure(self):
+        """pass_results records every invocation with ok/modified flags."""
+        module = self._empty_module()
+        pm = PassManager(max_iterations=1)
+        pm.add_pass(_BoomPass())
+        pm.add_pass(_CountingPass())
+
+        pm.run(module)
+
+        names = [r[0] for r in pm.pass_results]
+        assert "boom" in names
+        assert "counter" in names
+        boom_result = next(r for r in pm.pass_results if r[0] == "boom")
+        assert boom_result[2] is False  # ok flag is False for the failure
+
+    def test_errors_reset_between_runs(self):
+        """Diagnostics are reset at the start of each run."""
+        module = self._empty_module()
+        pm = PassManager(max_iterations=1)
+        pm.add_pass(_BoomPass())
+
+        pm.run(module)
+        assert len(pm.errors) == 1
+        pm.run(module)
+        assert len(pm.errors) == 1  # not accumulated across runs
+
+    def test_clean_pipeline_has_no_errors(self):
+        """A pipeline with only working passes reports no errors."""
+        module = self._empty_module()
+        pm = create_default_pipeline()
+        pm.run(module)
+        assert not pm.has_errors
+        assert pm.errors == []
 
 
 if __name__ == "__main__":

@@ -146,20 +146,27 @@ Two stateless authentication classes back the API. Both are registered (alongsid
 and validates the token, loads the user, and rejects inactive accounts.
 
 ```python
-def create_jwt_token(user, expires_in_hours=24):
+def create_jwt_token(user, expires_in_hours=None):
     payload = {
         'user_id': str(user.id),
         'email': user.email,
         'exp': datetime.utcnow() + timedelta(hours=expires_in_hours),
         'iat': datetime.utcnow(),
     }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm='HS256')
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 ```
 
-Because JWTs are stateless, logout is a no-op on the server (the client discards the token)
-and token refresh decodes the refresh token with `verify_exp=False` to mint a fresh access
-token. This is the standard trade-off: cheap, horizontally scalable verification at the
-cost of not being able to revoke an individual token before it expires.
+Tokens are signed and verified with `settings.JWT_SECRET_KEY` — a secret kept distinct from
+Django's `SECRET_KEY` so the two can be rotated independently. It is sourced from the
+environment (`JWT_SECRET_KEY`); base settings supply no insecure default and production
+settings raise `ImproperlyConfigured` when it is missing, so a misconfigured deployment
+fails loudly instead of signing tokens with a predictable key.
+
+Because JWTs are stateless, logout is a no-op on the server (the client discards the token).
+Token refresh verifies the refresh token's signature and expiry through the same
+`decode_jwt_token` helper before minting a fresh access token — an expired or forged refresh
+token is rejected. This is the standard trade-off: cheap, horizontally scalable verification
+at the cost of not being able to revoke an individual token before it expires.
 
 **API keys.** `generate_api_key` produces a URL-safe secret, takes the first 8 characters
 as a `prefix` (indexed for fast lookup), and stores only the SHA-256 hash. On each request
@@ -735,8 +742,13 @@ prefix — so a database leak does not expose usable keys; Stripe webhooks are s
 with `STRIPE_WEBHOOK_SECRET` before any state change; the password-reset endpoint returns the
 same response whether or not the email exists, avoiding account enumeration; and audit logging
 captures the actor, IP (honoring `X-Forwarded-For`), and user agent for every mutating action.
-JWTs are stateless, so individual tokens cannot be revoked before expiry — the mitigation is
-short access-token lifetimes (1 hour) backed by longer refresh tokens.
+The sensitive auth endpoints (login, register, token refresh, and password reset/confirm)
+carry a per-scope DRF `ScopedRateThrottle` to blunt credential-stuffing and brute-force
+attempts; the limits are configurable via settings (`DEFAULT_THROTTLE_RATES`, env-overridable)
+and default to 10/min for login, 5/min for register and password reset, and 30/min for
+refresh, on top of the baseline anon/user throttles. JWTs are stateless, so individual tokens
+cannot be revoked before expiry — the mitigation is short access-token lifetimes (1 hour)
+backed by longer refresh tokens.
 
 ## Testing Strategy
 

@@ -27,3 +27,6 @@ audit/
 # Internal doc-authoring framework — referenced locally, not pushed
 DOC_STYLE_GUIDE.md
 templates/
+
+# Benchmark/run output artifacts
+results/

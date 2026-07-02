@@ -325,5 +325,131 @@ class SessionManagementTestCase(TestCase):
         )
 
 
+class JWTSecretConsolidationTestCase(TestCase):
+    """Regression tests: JWTs are signed/verified with JWT_SECRET_KEY.
+
+    Phase 0 signed tokens with ``settings.SECRET_KEY`` while a separate
+    ``JWT_SECRET_KEY`` existed. Token signing must consistently use
+    ``JWT_SECRET_KEY`` so the two secrets can be rotated independently.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email='jwt@example.com',
+            password='JwtPass123!',
+        )
+
+    def test_token_is_signed_with_jwt_secret_key(self):
+        from django.conf import settings
+        from apps.users.authentication import create_jwt_token
+
+        token = create_jwt_token(self.user, expires_in_hours=1)
+
+        # Decodable with JWT_SECRET_KEY...
+        payload = jwt.decode(
+            token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
+        )
+        self.assertEqual(payload['user_id'], str(self.user.id))
+
+        # ...and NOT with Django's SECRET_KEY (the two secrets differ in dev).
+        self.assertNotEqual(settings.SECRET_KEY, settings.JWT_SECRET_KEY)
+        with self.assertRaises(jwt.InvalidSignatureError):
+            jwt.decode(
+                token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM]
+            )
+
+    def test_decode_rejects_token_signed_with_django_secret_key(self):
+        """A token minted with the wrong secret must not authenticate."""
+        from django.conf import settings
+        from rest_framework import exceptions
+        from apps.users.authentication import decode_jwt_token
+
+        forged = jwt.encode(
+            {
+                'user_id': str(self.user.id),
+                'email': self.user.email,
+                'exp': datetime.utcnow() + timedelta(hours=1),
+                'iat': datetime.utcnow(),
+            },
+            settings.SECRET_KEY,
+            algorithm=settings.JWT_ALGORITHM,
+        )
+        with self.assertRaises(exceptions.AuthenticationFailed):
+            decode_jwt_token(forged)
+
+    def test_authenticated_request_uses_jwt_secret_key(self):
+        """End-to-end: a Bearer token from login authenticates a protected view."""
+        from apps.users.authentication import create_jwt_token
+
+        token = create_jwt_token(self.user, expires_in_hours=1)
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {token}')
+        response = client.get(reverse('auth:current-user'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['email'], 'jwt@example.com')
+
+    def test_refresh_rejects_token_with_bad_signature(self):
+        """TokenRefreshView must reject refresh tokens signed with SECRET_KEY."""
+        from django.conf import settings
+
+        forged = jwt.encode(
+            {
+                'user_id': str(self.user.id),
+                'email': self.user.email,
+                'exp': datetime.utcnow() + timedelta(days=7),
+                'iat': datetime.utcnow(),
+            },
+            settings.SECRET_KEY,
+            algorithm=settings.JWT_ALGORITHM,
+        )
+        client = APIClient()
+        response = client.post(
+            reverse('auth:token-refresh'),
+            {'refresh_token': forged},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class AuthThrottlingTestCase(TestCase):
+    """Regression tests: sensitive auth endpoints are rate limited."""
+
+    def setUp(self):
+        from django.core.cache import cache
+        # Throttle history lives in the cache; start each test clean so the
+        # counts are deterministic.
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.client = APIClient()
+
+    def test_login_endpoint_throttles_after_limit(self):
+        from unittest.mock import patch
+        from rest_framework.throttling import ScopedRateThrottle
+
+        # SimpleRateThrottle reads THROTTLE_RATES (a class attribute captured at
+        # import time), so patch it directly to make the limit deterministic
+        # regardless of DEFAULT_THROTTLE_RATES / test ordering.
+        rates = dict(ScopedRateThrottle.THROTTLE_RATES, auth_login='3/min')
+        with patch.object(ScopedRateThrottle, 'THROTTLE_RATES', rates):
+            url = reverse('auth:login')
+            data = {'email': 'nobody@example.com', 'password': 'whatever'}
+            statuses = [
+                self.client.post(url, data, format='json').status_code
+                for _ in range(5)
+            ]
+        # First 3 allowed (401 invalid creds), then throttled (429).
+        self.assertIn(status.HTTP_429_TOO_MANY_REQUESTS, statuses, statuses)
+        self.assertEqual(statuses[:3], [status.HTTP_401_UNAUTHORIZED] * 3, statuses)
+        self.assertEqual(statuses[3:], [status.HTTP_429_TOO_MANY_REQUESTS] * 2, statuses)
+
+    def test_login_view_declares_scoped_throttle(self):
+        from rest_framework.throttling import ScopedRateThrottle
+        from apps.users.views import LoginView, RegisterView, PasswordResetView
+
+        for view in (LoginView, RegisterView, PasswordResetView):
+            self.assertIn(ScopedRateThrottle, view.throttle_classes)
+            self.assertTrue(view.throttle_scope)
+
+
 if __name__ == '__main__':
     pytest.main([__file__])

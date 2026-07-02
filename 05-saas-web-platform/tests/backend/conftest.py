@@ -34,9 +34,15 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(scope='session')
-def django_db_setup():
-    """Set up the test database."""
-    pass
+def django_db_setup(django_db_setup, django_db_blocker):
+    """Set up the test database.
+
+    Defer to pytest-django's own ``django_db_setup`` (which creates the test
+    database and applies all migrations). This wrapper exists so a checked-in
+    set of app migrations is exercised end-to-end by the suite; without
+    migrations the custom-model tables (e.g. ``users``) never get created.
+    """
+    return
 
 
 @pytest.fixture

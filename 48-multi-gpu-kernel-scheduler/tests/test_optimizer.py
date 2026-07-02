@@ -112,12 +112,100 @@ class TestConstantFolder:
         """Test constant folder creation."""
         assert constant_folder is not None
 
-    def test_constant_folder_passthrough(self, constant_folder, simple_graph):
-        """Test that constant folder returns graph."""
+    def test_constant_folder_no_constants_is_noop(self, constant_folder, simple_graph):
+        """Graphs with no constant nodes are returned unchanged in structure."""
         optimized = constant_folder.optimize(simple_graph)
 
-        # Current implementation is a passthrough
-        assert optimized is simple_graph
+        # No kernels are marked constant, so nothing folds.
+        assert constant_folder.folded_count == 0
+        assert set(optimized.kernels.keys()) == set(simple_graph.kernels.keys())
+        # Original graph is not mutated.
+        for kid, kernel in simple_graph.kernels.items():
+            assert optimized.kernels[kid].kernel_type == kernel.kernel_type
+
+    def test_constant_folder_folds_derived_constant(self, constant_folder):
+        """A kernel whose only input is a constant is folded to a MEMORY node."""
+        graph = ComputeGraph()
+
+        # A marked constant source (e.g. a weight) feeding a compute kernel.
+        weight = create_gemm_kernel(64, 64, 64)
+        weight.attributes["is_constant"] = True
+        consumer = create_elementwise_kernel((64, 64), op="add")
+
+        graph.add_kernel(weight)
+        graph.add_kernel(consumer)
+        graph.add_dependency(weight.kernel_id, consumer.kernel_id, "w_c")
+
+        optimized = constant_folder.optimize(graph)
+
+        # The consumer's inputs are all constant, so it folds.
+        assert constant_folder.folded_count == 1
+        folded = optimized.kernels[consumer.kernel_id]
+        assert folded.kernel_type == KernelType.MEMORY
+        assert folded.attributes.get("is_constant") is True
+        assert folded.attributes.get("original_type") == "elementwise"
+        # Its outputs are preserved so downstream consumers still resolve.
+        assert [t.tensor_id for t in folded.outputs] == \
+            [t.tensor_id for t in consumer.outputs]
+
+    def test_constant_folder_propagates_transitively(self, constant_folder):
+        """Constant-ness propagates through a chain of derived nodes."""
+        graph = ComputeGraph()
+
+        src = create_gemm_kernel(32, 32, 32)
+        src.attributes["is_constant"] = True
+        mid = create_elementwise_kernel((32, 32), op="mul")
+        end = create_elementwise_kernel((32, 32), op="add")
+
+        for k in (src, mid, end):
+            graph.add_kernel(k)
+        graph.add_dependency(src.kernel_id, mid.kernel_id, "s_m")
+        graph.add_dependency(mid.kernel_id, end.kernel_id, "m_e")
+
+        optimized = constant_folder.optimize(graph)
+
+        # Both derived kernels fold (the leaf source stays as-is).
+        assert constant_folder.folded_count == 2
+        assert optimized.kernels[mid.kernel_id].kernel_type == KernelType.MEMORY
+        assert optimized.kernels[end.kernel_id].kernel_type == KernelType.MEMORY
+        # Edges into folded nodes are removed as redundant.
+        assert optimized.dependencies == []
+
+    def test_constant_folder_leaves_nonconstant_inputs(self, constant_folder):
+        """A kernel with a non-constant input is not folded."""
+        graph = ComputeGraph()
+
+        const = create_gemm_kernel(16, 16, 16)
+        const.attributes["is_constant"] = True
+        variable = create_gemm_kernel(16, 16, 16)  # not constant
+        consumer = create_elementwise_kernel((16, 16), op="add")
+
+        for k in (const, variable, consumer):
+            graph.add_kernel(k)
+        graph.add_dependency(const.kernel_id, consumer.kernel_id, "c_c")
+        graph.add_dependency(variable.kernel_id, consumer.kernel_id, "v_c")
+
+        optimized = constant_folder.optimize(graph)
+
+        # consumer depends on a non-constant, so it is left untouched.
+        assert constant_folder.folded_count == 0
+        assert optimized.kernels[consumer.kernel_id].kernel_type == \
+            KernelType.ELEMENTWISE
+
+    def test_constant_folder_preserves_topological_validity(self, constant_folder):
+        """Folded graph is still topologically sortable."""
+        graph = ComputeGraph()
+
+        src = create_gemm_kernel(32, 32, 32)
+        src.attributes["is_constant"] = True
+        mid = create_elementwise_kernel((32, 32), op="mul")
+        graph.add_kernel(src)
+        graph.add_kernel(mid)
+        graph.add_dependency(src.kernel_id, mid.kernel_id, "s_m")
+
+        optimized = constant_folder.optimize(graph)
+        topo = optimized.topological_sort()
+        assert len(topo) == len(optimized.kernels)
 
 
 class TestDeadCodeEliminator:
@@ -273,11 +361,12 @@ class TestCreateDefaultPipeline:
         """Test default pipeline creation."""
         pipeline = create_default_pipeline()
 
-        assert len(pipeline.passes) == 3
+        assert len(pipeline.passes) == 4
 
         pass_names = [name for name, _ in pipeline.passes]
         assert "dead_code" in pass_names
         assert "fusion" in pass_names
+        assert "constant_folding" in pass_names
         assert "memory" in pass_names
 
     def test_default_pipeline_order(self):

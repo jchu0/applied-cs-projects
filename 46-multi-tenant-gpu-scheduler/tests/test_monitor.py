@@ -546,3 +546,49 @@ class TestGPUMonitor:
         assert isinstance(json_metrics, dict)
         assert "metrics" in json_metrics
         assert "timestamp" in json_metrics
+
+
+class TestPublicExports:
+    """Tests that documented public API is exported from the package roots."""
+
+    def test_monitor_subpackage_exports(self):
+        """Types documented in docs/API.md are importable from gpusched.monitor."""
+        import gpusched.monitor as m
+
+        for name in [
+            "MetricType", "MetricPoint", "GPUMetrics", "NodeMetrics",
+            "JobMetrics", "TenantMetrics", "ClusterMetrics", "MetricsCollector",
+            "MetricsAggregator", "HealthChecker", "AlertLevel", "Alert",
+            "AlertManager", "QuotaManager", "PreemptionManager",
+            "ClusterMonitor", "GPUMonitor",
+        ]:
+            assert name in m.__all__, f"{name} missing from gpusched.monitor.__all__"
+            assert hasattr(m, name), f"{name} not importable from gpusched.monitor"
+
+    def test_alertmanager_exported_from_package_root(self):
+        """AlertManager is named in the README features and must be public."""
+        import gpusched
+
+        for name in ["AlertManager", "AlertLevel", "Alert", "HealthChecker",
+                     "ClusterMonitor", "MetricsCollector"]:
+            assert name in gpusched.__all__, f"{name} missing from gpusched.__all__"
+
+        from gpusched import AlertManager as RootAlertManager
+        from gpusched.monitor.monitor import AlertManager as ModAlertManager
+        assert RootAlertManager is ModAlertManager
+
+    def test_readme_alert_example_runs(self):
+        """The AlertManager usage shown in docs/API.md works end to end."""
+        from gpusched import AlertManager, AlertLevel
+
+        am = AlertManager()
+        alert_id = am.create_alert(
+            level=AlertLevel.WARNING,
+            message="GPU utilization above 90%",
+            source="gpu-001",
+            details={"utilization": 92.5},
+        )
+        assert alert_id in am.active_alerts
+        assert am.get_active_alerts(min_level=AlertLevel.WARNING)
+        assert am.resolve_alert(alert_id) is True
+        assert alert_id not in am.active_alerts

@@ -322,8 +322,10 @@ class TestScheduledTaskViewSet:
 
         assert response.status_code == status.HTTP_200_OK
 
-    def test_create_task(self, authenticated_client):
+    def test_create_task(self, authenticated_client, db):
         """Test creating a scheduled task."""
+        from apps.scheduler.models import ScheduledTask, TaskStatus
+
         client, user = authenticated_client
 
         data = {
@@ -332,20 +334,27 @@ class TestScheduledTaskViewSet:
             'schedule_type': 'once',
         }
 
+        # Patch the scheduler used inside the create serializer so we don't
+        # touch Celery, but return a real persisted ScheduledTask so the
+        # endpoint's response serialization exercises the real model path.
+        created = ScheduledTask.objects.create(
+            name='New Task',
+            task_name='core.new_task',
+            schedule_type='once',
+            status=TaskStatus.SCHEDULED,
+        )
+
         with patch('apps.scheduler.serializers.TaskScheduler') as mock_scheduler:
             mock_instance = Mock()
             mock_scheduler.return_value = mock_instance
-            mock_instance.create_task.return_value = Mock(
-                id='task-123',
-                name='New Task',
-                task_name='core.new_task',
-                status='scheduled',
-            )
+            mock_instance.create_task.return_value = created
 
             response = client.post('/api/v1/scheduler/tasks/', data, format='json')
 
         # Should create successfully or validation error if missing deps
         assert response.status_code in [status.HTTP_201_CREATED, status.HTTP_400_BAD_REQUEST]
+        # The create serializer must route through the scheduler service.
+        mock_instance.create_task.assert_called_once()
 
     def test_run_task(self, authenticated_client, scheduled_task):
         """Test running a task immediately."""
