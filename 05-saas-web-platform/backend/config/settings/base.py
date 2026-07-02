@@ -127,6 +127,21 @@ REST_FRAMEWORK = {
         'rest_framework.filters.OrderingFilter',
     ],
     'EXCEPTION_HANDLER': 'apps.core.exceptions.custom_exception_handler',
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        # Baseline limits for anonymous and authenticated clients.
+        'anon': os.environ.get('THROTTLE_RATE_ANON', '60/min'),
+        'user': os.environ.get('THROTTLE_RATE_USER', '1000/hour'),
+        # Scoped limits for sensitive auth endpoints. These are deliberately
+        # tighter to slow down credential stuffing / brute-force attempts.
+        'auth_login': os.environ.get('THROTTLE_RATE_AUTH_LOGIN', '10/min'),
+        'auth_register': os.environ.get('THROTTLE_RATE_AUTH_REGISTER', '5/min'),
+        'auth_password_reset': os.environ.get('THROTTLE_RATE_AUTH_PASSWORD_RESET', '5/min'),
+        'auth_token_refresh': os.environ.get('THROTTLE_RATE_AUTH_TOKEN_REFRESH', '30/min'),
+    },
 }
 
 # Email Settings

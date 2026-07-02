@@ -12,21 +12,46 @@ from rest_framework import authentication, exceptions
 from .models import User, APIKey
 
 
-def create_jwt_token(user, expires_in_hours=24):
+def _jwt_secret():
+    """Return the secret used to sign/verify JWTs.
+
+    Tokens are signed with ``settings.JWT_SECRET_KEY`` (env-sourced; see
+    ``config/settings``). This is intentionally distinct from Django's
+    ``SECRET_KEY`` so the two secrets can be rotated independently. Production
+    settings raise ``ImproperlyConfigured`` when it is missing, and the base
+    settings provide no insecure default, so a misconfigured deployment fails
+    loudly rather than signing tokens with a predictable key.
+    """
+    secret = getattr(settings, 'JWT_SECRET_KEY', None)
+    if not secret:
+        raise exceptions.AuthenticationFailed('JWT signing key is not configured')
+    return secret
+
+
+def create_jwt_token(user, expires_in_hours=None):
     """Create a JWT token for a user."""
+    if expires_in_hours is None:
+        expires_in_hours = getattr(settings, 'JWT_EXPIRATION_HOURS', 24)
     payload = {
         'user_id': str(user.id),
         'email': user.email,
         'exp': datetime.utcnow() + timedelta(hours=expires_in_hours),
         'iat': datetime.utcnow(),
     }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm='HS256')
+    algorithm = getattr(settings, 'JWT_ALGORITHM', 'HS256')
+    return jwt.encode(payload, _jwt_secret(), algorithm=algorithm)
 
 
-def decode_jwt_token(token):
+def decode_jwt_token(token, verify_exp=True):
     """Decode and validate a JWT token."""
+    algorithm = getattr(settings, 'JWT_ALGORITHM', 'HS256')
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
+        payload = jwt.decode(
+            token,
+            _jwt_secret(),
+            algorithms=[algorithm],
+            options={'verify_exp': verify_exp},
+        )
         return payload
     except jwt.ExpiredSignatureError:
         raise exceptions.AuthenticationFailed('Token has expired')

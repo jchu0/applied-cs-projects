@@ -4,6 +4,7 @@ User views for authentication and profile management.
 from rest_framework import status, views
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.throttling import ScopedRateThrottle
 from django.contrib.auth import authenticate
 from django.utils import timezone
 
@@ -14,12 +15,14 @@ from .serializers import (
     LoginSerializer,
     ChangePasswordSerializer,
 )
-from .authentication import create_jwt_token
+from .authentication import create_jwt_token, decode_jwt_token
 
 
 class RegisterView(views.APIView):
     """Register a new user."""
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_register'
 
     def post(self, request):
         serializer = RegisterSerializer(data=request.data)
@@ -45,6 +48,8 @@ class RegisterView(views.APIView):
 class LoginView(views.APIView):
     """Login and get JWT token."""
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_login'
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
@@ -122,6 +127,8 @@ class ChangePasswordView(views.APIView):
 class TokenRefreshView(views.APIView):
     """Refresh JWT token."""
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_token_refresh'
 
     def post(self, request):
         refresh_token = request.data.get('refresh_token')
@@ -131,33 +138,30 @@ class TokenRefreshView(views.APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # In a real implementation, validate the refresh token
-        # For now, just return a new token if a valid user ID can be extracted
+        # Validate the refresh token's signature (using the consolidated JWT
+        # secret) and issue a fresh access token for the encoded user.
+        from rest_framework.exceptions import AuthenticationFailed
         try:
-            import jwt
-            from django.conf import settings
-            payload = jwt.decode(
-                refresh_token,
-                settings.SECRET_KEY,
-                algorithms=['HS256'],
-                options={'verify_exp': False}
-            )
+            payload = decode_jwt_token(refresh_token)
             user = User.objects.get(id=payload.get('user_id'))
-            token = create_jwt_token(user)
-            return Response({
-                'access_token': token,
-                'token_type': 'Bearer',
-            })
-        except (jwt.InvalidTokenError, User.DoesNotExist):
+        except (AuthenticationFailed, User.DoesNotExist, ValueError):
             return Response(
                 {'error': 'Invalid refresh token'},
                 status=status.HTTP_401_UNAUTHORIZED
             )
 
+        token = create_jwt_token(user)
+        return Response({
+            'access_token': token,
+            'token_type': 'Bearer',
+        })
+
 
 class PasswordResetView(views.APIView):
     """Request password reset email."""
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_password_reset'
 
     def post(self, request):
         email = request.data.get('email')
@@ -183,6 +187,8 @@ class PasswordResetView(views.APIView):
 class PasswordResetConfirmView(views.APIView):
     """Confirm password reset with token."""
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_password_reset'
 
     def post(self, request):
         token = request.data.get('token')
