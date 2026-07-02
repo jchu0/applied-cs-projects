@@ -310,6 +310,14 @@ class CUDACodeGenerator(CodeGenerator):
                 self._emit(f"cudaMemcpy(d_out{i}, {val_ptr}, {n * 4}, cudaMemcpyDeviceToDevice);")
             self._emit()
 
+        else:
+            # No launch for this opcode (e.g. CONSTANT is a no-op on device, or
+            # a fused FUSED/ATTENTION op whose fused-kernel lowering is not
+            # implemented). Emit an honest placeholder instead of silently
+            # skipping so the generated source shows the gap.
+            if op.opcode in (OpCode.FUSED, OpCode.ATTENTION):
+                self._emit_unlowered(op)
+
     def _generate_cublas_matmul(self, op: Operation):
         """Generate cuBLAS matrix multiplication."""
         out = op.outputs[0]
@@ -443,6 +451,9 @@ class TritonCodeGenerator(CodeGenerator):
         elif op.opcode == OpCode.SQRT:
             self._emit(f"result = tl.sqrt({input_var})")
             return "result"
+        elif op.opcode in (OpCode.FUSED, OpCode.ATTENTION):
+            # Fused-kernel lowering is not implemented for the Triton backend.
+            self._emit_unlowered(op)
 
         return input_var
 

@@ -11,6 +11,7 @@ from .passes import (
     StrengthReduction,
     AlgebraicSimplification,
     PassManager,
+    PassError,
     create_default_pipeline,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "StrengthReduction",
     "AlgebraicSimplification",
     "PassManager",
+    "PassError",
     "create_default_pipeline",
 ]

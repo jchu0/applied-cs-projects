@@ -17,7 +17,9 @@ whole pipeline is pure Python and NumPy with no external compiler toolchain.
   operator fusion, algebraic simplification, strength reduction, and layout
   hints, driven to a fixpoint by a `PassManager` (`optimization/passes.py`).
 - **Operator fusion** — fuses elementwise chains, matmul-plus-bias, and the
-  Q/K/softmax/V attention pattern into single `FUSED`/`ATTENTION` ops.
+  Q/K/softmax/V attention pattern into single `FUSED`/`ATTENTION` ops. The
+  fused ops carry the original opcodes in their attributes; **backend codegen
+  for the fused forms is partial** — see [Fused-op codegen](#fused-op-codegen).
 - **Memory planning** — lifetime analysis plus greedy, linear-scan, or best-fit
   buffer allocation with reuse tracking (`memory/planner.py`).
 - **Three code generators** — `CPUCodeGenerator` (C with `cblas_sgemm`),
@@ -115,6 +117,26 @@ result = cuda.compile_function("matmul_relu", input_types, output_types, build)
 print(result.code.source)              # CUDA kernels + cuBLAS host code
 ```
 
+### Fused-op codegen
+
+Operator fusion (on at O2/O3) rewrites chains into `FUSED` and `ATTENTION` ops,
+but the backends **do not yet emit dedicated fused kernels** for them. When a
+generator meets an op it cannot lower it does not silently drop it: it logs a
+`WARNING` naming the opcode and target, and emits a clearly-marked
+`// UNLOWERED: <OPCODE> ...` comment in the generated source. What each backend
+lowers today:
+
+| Backend | Lowered opcodes | Falls back to `// UNLOWERED` |
+|---------|-----------------|------------------------------|
+| CPU (C) | `ADD`, `SUB`, `MUL`, `DIV`, `NEG`, `SQRT`, `EXP`, `LOG`, `MATMUL`, `RELU`, `SIGMOID`, `SOFTMAX`, `REDUCE_SUM`, 2D `TRANSPOSE`, `CONSTANT`, `RETURN` | `FUSED`, `ATTENTION`, and any other opcode (incl. rank-3+ `TRANSPOSE`) |
+| CUDA | `ADD`, `SUB`, `MUL`, `DIV`, `RELU`, `SOFTMAX`, `REDUCE_SUM` (kernels); `MATMUL` (cuBLAS); `RETURN` | `FUSED`, `ATTENTION` |
+| Triton | `ADD`, `MUL`, `RELU`, `SIGMOID`, `EXP`, `SQRT` | `FUSED`, `ATTENTION` |
+
+If you need fully-lowered source, compile at `opt_level=0` or `1` (fusion off),
+or pass the un-fused graph. The fused ops are a real, documented extension
+point — the fusion rewrite is correct, but the fused-kernel lowering is not
+faked.
+
 ## What's Real vs Simulated
 
 - **Real:** the IR, shape inference, every optimization pass, the `PassManager`
@@ -125,8 +147,11 @@ print(result.code.source)              # CUDA kernels + cuBLAS host code
   as text and never compiled or executed** — there is no runtime, JIT, or
   inference engine. There is **no model frontend** (no ONNX, TensorFlow, PyTorch,
   or JAX import); graphs are built only through `IRBuilder`. The CUDA and Triton
-  generators target hardware that is not invoked here. Some operations fall
-  through to `// TODO` comments rather than full kernels.
+  generators target hardware that is not invoked here. **Fused-op codegen is
+  partial:** `FUSED`/`ATTENTION` ops (and a few other opcodes) have no backend
+  kernel and are emitted as logged `// UNLOWERED` placeholders rather than being
+  faked — see [Fused-op codegen](#fused-op-codegen) for the exact per-backend
+  coverage.
 
 ## Testing
 

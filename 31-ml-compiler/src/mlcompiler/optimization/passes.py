@@ -499,15 +499,52 @@ class AlgebraicSimplification(FunctionPass):
 
 
 @dataclass
+class PassError:
+    """Record of a single optimization pass that raised an exception.
+
+    The pipeline is resilient by default: a failing pass is logged and
+    recorded here, then skipped, so the compile continues with the IR
+    as it stood before the failure rather than silently no-op'ing.
+    """
+
+    pass_name: str
+    iteration: int
+    exception: Exception
+
+    def __str__(self) -> str:
+        return (
+            f"pass '{self.pass_name}' failed on iteration {self.iteration}: "
+            f"{type(self.exception).__name__}: {self.exception}"
+        )
+
+
+@dataclass
 class PassManager:
-    """Manages and runs optimization passes."""
+    """Manages and runs optimization passes.
+
+    By default the manager is *resilient*: if a pass raises, the exception is
+    logged with the pass name and recorded on ``errors`` (and in
+    ``pass_results``), and the pipeline continues with the un-optimized IR. Set
+    ``strict=True`` to re-raise the first failure instead, which is useful when
+    developing a new pass.
+    """
 
     passes: list[Pass] = field(default_factory=list)
     max_iterations: int = 10
+    strict: bool = False
+    # Populated by ``run``: one PassError per failed pass invocation.
+    errors: list[PassError] = field(default_factory=list)
+    # Populated by ``run``: (pass_name, iteration, ok, modified) per invocation.
+    pass_results: list[tuple[str, int, bool, bool]] = field(default_factory=list)
 
     def add_pass(self, pass_: Pass):
         """Add pass to pipeline."""
         self.passes.append(pass_)
+
+    @property
+    def has_errors(self) -> bool:
+        """True if any pass failed during the last ``run``."""
+        return bool(self.errors)
 
     def run(self, module: IRModule) -> IRModule:
         """Run all passes on module.
@@ -517,17 +554,43 @@ class PassManager:
 
         Returns:
             Optimized module
+
+        Raises:
+            Exception: If ``strict`` is True and a pass raises, the original
+                exception is re-raised after being logged and recorded.
         """
+        # Reset per-run diagnostics so repeated runs do not accumulate.
+        self.errors = []
+        self.pass_results = []
+
         for iteration in range(self.max_iterations):
             modified = False
 
             for pass_ in self.passes:
                 try:
-                    if pass_.run(module):
+                    pass_modified = bool(pass_.run(module))
+                    self.pass_results.append(
+                        (pass_.name, iteration, True, pass_modified)
+                    )
+                    if pass_modified:
                         modified = True
                         logger.debug(f"Pass {pass_.name} modified module")
                 except Exception as e:
-                    logger.error(f"Pass {pass_.name} failed: {e}")
+                    # Record the failure so it is visible rather than silent.
+                    error = PassError(pass_.name, iteration, e)
+                    self.errors.append(error)
+                    self.pass_results.append((pass_.name, iteration, False, False))
+                    logger.error(
+                        "Optimization pass '%s' failed on iteration %d; "
+                        "continuing with un-optimized IR: %s: %s",
+                        pass_.name,
+                        iteration,
+                        type(e).__name__,
+                        e,
+                        exc_info=True,
+                    )
+                    if self.strict:
+                        raise
 
             if not modified:
                 logger.info(f"Optimization converged after {iteration + 1} iterations")

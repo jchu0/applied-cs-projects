@@ -15,6 +15,7 @@ from .ir import (
 from .optimization import (
     Pass,
     PassManager,
+    PassError,
     ConstantFolding,
     DeadCodeElimination,
     CommonSubexpressionElimination,
@@ -59,6 +60,7 @@ __all__ = [
     # Optimization
     "Pass",
     "PassManager",
+    "PassError",
     "ConstantFolding",
     "DeadCodeElimination",
     "CommonSubexpressionElimination",

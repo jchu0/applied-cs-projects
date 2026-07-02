@@ -252,8 +252,13 @@ and attention fusions capture the two most common ML-specific patterns where a
 fused kernel is dramatically better than the sum of its parts. Because the result
 is recorded as a `FUSED` (or `ATTENTION`) op carrying the original opcodes in its
 attributes, a downstream backend retains enough information to emit the fused
-kernel — though in this implementation the generators lower the unfused forms and
-treat `FUSED` as a documented extension point.
+kernel — though in this implementation **no backend emits a dedicated fused
+kernel yet**. `FUSED`/`ATTENTION` are a documented extension point: when a
+generator meets one it logs a warning and emits a clearly-marked
+`// UNLOWERED` placeholder (see Code Generation below) rather than silently
+dropping the op or faking a kernel. This is why the default (`O2`/`O3`) pipeline
+fuses but the generated source for a fused region is a placeholder — compile at
+`O0`/`O1` to keep the fully-lowered unfused forms.
 
 **StrengthReduction** rewrites `x * 2 -> x + x` when the multiplier is a constant
 two (the `x / 2 -> x * 0.5` case is stubbed because it would need to synthesize a
@@ -267,8 +272,14 @@ chooses to honor them.
 `PassManager` holds an ordered list of passes and a `max_iterations` budget. Its
 `run` loops, applying every pass each iteration and recording whether any fired;
 when an iteration produces no change it has reached a fixpoint and stops early.
-Each pass is wrapped in try/except so one failing pass logs an error instead of
-aborting the compile. `create_default_pipeline` assembles the canonical order:
+Each pass is wrapped in try/except so one failing pass does not abort the
+compile — but the failure is **not swallowed silently**. The exception is
+logged with the pass name and iteration (with a traceback), and recorded as a
+`PassError` on `PassManager.errors` (and summarized in `pass_results`), so
+callers can inspect `pm.has_errors` after a run. The pipeline then continues
+with the IR as it stood before the failing pass. Setting `strict=True` re-raises
+the first failure instead, which surfaces bugs while developing a new pass.
+`create_default_pipeline` assembles the canonical order:
 algebraic simplification, constant folding, CSE, DCE, fusion, strength
 reduction, layout, and a final DCE cleanup.
 
@@ -343,8 +354,13 @@ by the memory plan, then lowers each operation: elementwise binary and unary ops
 become simple `for` loops; `MATMUL` becomes a `cblas_sgemm` call;
 activations (`RELU`, `SIGMOID`, `SOFTMAX`) and `REDUCE_SUM` and 2D `TRANSPOSE`
 get explicit loops; `CONSTANT` emits a small inline initializer with `memcpy`;
-and `RETURN` copies the result buffers into the output pointers. Unhandled
-opcodes emit a `// TODO` comment.
+and `RETURN` copies the result buffers into the output pointers. Any opcode a
+backend cannot lower — most notably the `FUSED`/`ATTENTION` ops produced by
+fusion — routes through the shared `_emit_unlowered`, which logs a `WARNING`
+naming the opcode and target and emits a clearly-marked `// UNLOWERED: <OPCODE>`
+comment. This keeps the gap honest: unlowered ops are visible in both the logs
+and the generated source rather than silently omitted or faked. The CUDA and
+Triton backends use the same helper for their unlowered opcodes.
 
 **CUDACodeGenerator** (in `codegen/cuda.py`) emits a `.cu` file in two parts.
 First it generates `__global__` kernels: elementwise kernels with the standard

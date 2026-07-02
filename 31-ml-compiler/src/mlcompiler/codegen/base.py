@@ -93,6 +93,28 @@ class CodeGenerator(ABC):
             return f"(buffer + {alloc.offset})"
         return f"buf_{value.id}"
 
+    def _emit_unlowered(self, op: Operation):
+        """Emit an honest placeholder for an op this backend cannot lower.
+
+        Rather than silently producing no code (which would corrupt the
+        generated program), we emit a clearly-marked ``// UNLOWERED`` comment
+        and log a warning naming the opcode and target. Fused ops
+        (``FUSED``/``ATTENTION``) hit this path because their fused-kernel
+        lowering is not implemented; see the README/BLUEPRINT for the list of
+        which opcodes lower on each backend.
+        """
+        logger.warning(
+            "codegen(%s): no lowering for opcode %s (op #%s); "
+            "emitting UNLOWERED placeholder",
+            self.target,
+            op.opcode.name,
+            op.id,
+        )
+        self._emit(
+            f"// UNLOWERED: {op.opcode.name} has no {self.target} lowering "
+            f"in this backend (see README: partial fused-op codegen)"
+        )
+
 
 class CPUCodeGenerator(CodeGenerator):
     """Code generator for CPU execution."""
@@ -194,7 +216,7 @@ class CPUCodeGenerator(CodeGenerator):
         elif op.opcode == OpCode.RETURN:
             self._generate_return(op)
         else:
-            self._emit(f"// TODO: {op.opcode.name}")
+            self._emit_unlowered(op)
 
     def _generate_elementwise(self, op: Operation, operator: str):
         """Generate elementwise binary operation."""
