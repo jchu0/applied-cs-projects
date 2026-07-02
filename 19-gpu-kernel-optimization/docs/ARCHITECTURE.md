@@ -2,282 +2,200 @@
 
 ## Overview
 
-The GPU GEMM Optimization project implements highly optimized General Matrix Multiplication (GEMM) kernels with automatic performance tuning capabilities. While implemented in Rust for CPU simulation, the patterns and optimizations directly translate to GPU kernel development.
+This project implements progressively optimized General Matrix Multiplication
+(GEMM) kernels together with GPU-oriented analysis tools (roofline, occupancy,
+shared-memory bank conflicts, memory coalescing). It is written in Rust and runs
+on the CPU, but the kernel structure and optimization concepts mirror GPU kernel
+development.
+
+The crate is **function-oriented**: kernels are free functions over `Matrix`
+values, and the supporting types are plain data structs. There is no monolithic
+"kernel object" — you pick a kernel function and, where relevant, pass a
+`GemmConfig`.
 
 ## System Components
 
-### 1. Core Components
-
 ```mermaid
 flowchart TD
-    App["Application Layer"]
+    App["Application / benchmarks"]
+    App --> Kernels
     App --> Autotuner
+    App --> Analysis
 
-    subgraph Autotuner["Autotuner"]
-        Search["Search Strategy: Grid Search, Random Search, Bayesian Opt, Genetic Algo"]
+    subgraph Kernels["GEMM Kernels (gemm.rs)"]
+        Naive["naive_gemm"]
+        Tiled["tiled_gemm / parallel_tiled_gemm"]
+        RegTiled["register_tiled_gemm (GemmConfig)"]
+        DoubleBuf["double_buffered_gemm"]
+        Fused["scaled / batched / fused / wmma"]
     end
 
-    Autotuner --> Kernel
-
-    subgraph Kernel["GEMM Kernel Layer"]
-        Tiling["Tiling Engine"]
-        Prefetch["Prefetch Control"]
-        Vector["Vector Units"]
+    subgraph Autotuner["Autotuner (autotuner.rs)"]
+        Space["ParameterSpace -> GemmConfig list"]
+        Strategy["SearchStrategy: Grid / Random / SimulatedAnnealing / Genetic"]
+        Space --> Strategy
     end
 
-    Kernel --> MatrixOps
-
-    subgraph MatrixOps["Matrix Operations"]
-        Storage["Storage Layout"]
-        Transpose["Transpose Engine"]
-        Math["Math Ops"]
+    subgraph Analysis["Analysis"]
+        Roofline["RooflineModel / RooflineAnalysis (gemm.rs)"]
+        Metrics["GemmMetrics / Benchmark (metrics.rs)"]
+        Occupancy["OccupancyCalculator (memory.rs)"]
+        Coalescing["CoalescingAnalysis (vectorize.rs)"]
     end
 
-    MatrixOps --> Metrics
-
-    subgraph Metrics["Performance Metrics"]
-        Collector["Collector"]
-        Analyzer["Analyzer"]
-        Reporter["Reporter"]
-    end
+    Kernels --> Matrix["Matrix (matrix.rs)"]
+    Autotuner --> Kernels
+    Autotuner --> Metrics
 ```
 
-### 2. Module Architecture
+## Module Architecture
 
-#### Matrix Module (`matrix.rs`)
-- **Purpose**: Core matrix data structure and operations
-- **Key Components**:
-  - `Matrix`: Main data structure with row-major storage
-  - `TransposeMode`: Enum for transpose operations
-  - Basic operations: creation, access, arithmetic
-  - Submatrix extraction and validation
+### Matrix Module (`matrix.rs`)
+- **Purpose**: Core dense matrix type and layout helpers.
+- **Key items**:
+  - `Matrix`: row-major storage with public `data`, `rows`, `cols`.
+  - Factories `zeros` / `ones` / `random` / `identity`; accessors `get` / `set` /
+    `get_mut` / `row_ptr` / `row_ptr_mut`; utilities `transpose`,
+    `frobenius_norm`, `approx_eq`, `max_diff`, `max_relative_error`.
+  - `Layout` enum (`RowMajor`, `ColumnMajor`) plus `convert_layout`,
+    `pack_matrix_a`, `pack_matrix_b`.
 
-#### GEMM Module (`gemm.rs`)
-- **Purpose**: High-performance matrix multiplication kernels
-- **Key Components**:
-  - `GemmKernel`: Main kernel implementation
-  - `GemmConfig`: Configuration for optimization parameters
-  - `TileConfig`: Tiling parameters for cache optimization
-  - `MemoryLayout`: Memory access patterns
+### GEMM Module (`gemm.rs`)
+- **Purpose**: Progressively optimized GEMM kernels and roofline analysis.
+- **Key items**:
+  - `GemmConfig`: block/thread tile sizes (`block_m/n/k`, `thread_m/n`) with
+    `validate()`.
+  - `GemmKernel`: a trait (`compute`, `name`) for wrapping a kernel behind a
+    common interface.
+  - Kernel functions: `naive_gemm`, `tiled_gemm`, `register_tiled_gemm`,
+    `parallel_tiled_gemm`, `double_buffered_gemm`, `scaled_gemm`, the batched
+    family, the fused-activation family (`Activation`, `gemm_activation`,
+    `gemm_bias_activation`, `gemm_fused`), and the WMMA simulation
+    (`WmmaConfig`, `WmmaFragment`, `wmma_mma_sync`, `wmma_gemm`).
+  - Roofline: `RooflineModel`, `RooflineAnalysis`, `PerformanceBound`.
 
-#### Autotuner Module (`autotuner.rs`)
-- **Purpose**: Automatic performance tuning and configuration selection
-- **Key Components**:
-  - `Autotuner`: Main tuning engine
-  - `SearchSpace`: Parameter exploration space
-  - `SearchStrategy`: Optimization algorithms
-  - `PerformanceModel`: Performance prediction
+### Autotuner Module (`autotuner.rs`)
+- **Purpose**: Search a configuration space for a good `GemmConfig`.
+- **Key items**:
+  - `Autotuner`: `new(config, param_space)` and `tune(a, b, kernel_fn)`.
+  - `AutotuneConfig`, `SearchStrategy` (`GridSearch`, `Random`,
+    `SimulatedAnnealing`, `Genetic`).
+  - `ParameterSpace` (with `small()` / `large()` presets, `generate_configs`).
+  - `AutotuneResult`, plus `TuningCache` and `HeuristicSelector` helpers.
 
-#### Metrics Module (`metrics.rs`)
-- **Purpose**: Performance measurement and analysis
-- **Key Components**:
-  - `MetricsCollector`: Runtime metrics collection
-  - `PerformanceAnalyzer`: Bottleneck analysis
-  - `Benchmark`: Consistent benchmarking framework
-  - Statistical aggregation methods
+### Metrics Module (`metrics.rs`)
+- **Purpose**: Performance measurement and reporting.
+- **Key items**:
+  - `GemmMetrics`: GFLOPS, bandwidth, arithmetic intensity, efficiency.
+  - `Benchmark`: warmup + measurement loop over a kernel closure.
+  - `BenchmarkResults`, `PerformanceModel`, `KernelComparison`, `MemoryProfile`.
+
+### Vectorize Module (`vectorize.rs`)
+- **Purpose**: SIMD-style vector loads/stores and coalescing analysis.
+- **Key items**:
+  - `Float4`, `Float8` vector types; `VectorizedOps` trait and `SimdVectorOps`.
+  - `CoalescingAnalysis` for memory-access-pattern evaluation.
+
+### Memory Module (`memory.rs`)
+- **Purpose**: Shared-memory and occupancy modeling.
+- **Key items**:
+  - Constants `NUM_BANKS`, `BANK_WIDTH`, `MAX_SHARED_MEM`.
+  - `BankConflictAnalysis`, `SharedMemoryConfig`.
+  - `OccupancyCalculator` (with `ampere()` / `volta()` / `turing()` presets),
+    `KernelRequirements`, `OccupancyResult`, `MemoryAccessPattern`.
 
 ## Data Flow
 
-### 1. Standard GEMM Operation
+### Standard GEMM Operation
 
 ```mermaid
 flowchart TD
-    Input["Input Matrices (A, B)"] --> Validation["Matrix Validation"]
-    Validation --> Config["Configuration Selection"]
-    Config --> TilingLoop
-
-    subgraph TilingLoop["Tiling Loop"]
-        L1["L1 Cache Tiles"]
-        Reg["Register Block"]
-        FMA["FMA Operations"]
-        Prefetch["Prefetch"]
-        Prefetch --> L1
-        L1 --> Reg
-        Reg --> FMA
-    end
-
-    TilingLoop --> Output["Output Matrix (C)"]
+    Input["A, B matrices"] --> Validate["Shape check (a.cols == b.rows)"]
+    Validate --> Kernel["Kernel function (+ GemmConfig if tiled)"]
+    Kernel --> Output["C matrix"]
 ```
 
-### 2. Autotuning Workflow
+### Autotuning Workflow
 
 ```mermaid
 flowchart TD
-    Problem["Problem Size (M, N, K)"] --> Init["Search Space Init"]
-    Init --> Generate["Generate Configs"]
-    Generate --> Eval["Parallel Evaluation"]
-    Eval --> Metrics["Performance Metrics"]
-    Metrics --> Strategy["Search Strategy (Update/Converge)"]
-    Strategy --> Generate
-    Strategy --> Best["Best Configuration"]
+    Space["ParameterSpace"] --> Configs["generate_configs -> Vec<GemmConfig>"]
+    Configs --> Search["Autotuner::tune (per strategy)"]
+    Search --> Bench["Benchmark each config -> GemmMetrics"]
+    Bench --> Result["AutotuneResult: best_config + history"]
 ```
 
-## Optimization Techniques
+## Optimization Concepts
 
-### 1. Cache Optimization
+The kernels demonstrate the standard GEMM optimization progression:
 
-#### Tiling Strategy
-- **L1 Tiles**: 32x32 to 64x64 elements
-- **L2 Tiles**: 128x128 to 256x256 elements
-- **Register Blocks**: 4x4 to 8x8 elements
+1. **Naive** (`naive_gemm`): one output element per "thread", no reuse.
+2. **Tiling** (`tiled_gemm`, `parallel_tiled_gemm`): block the computation so
+   operand tiles stay resident (simulated shared memory); the parallel variant
+   distributes tiles across threads with `rayon`.
+3. **Register blocking** (`register_tiled_gemm`): each thread accumulates a
+   `thread_m × thread_n` micro-tile in registers, driven by `GemmConfig`.
+4. **Software pipelining** (`double_buffered_gemm`): overlap loading of the next
+   tile with computation of the current one.
+5. **Fusion** (`gemm_activation`, `gemm_bias_activation`, `gemm_fused`): fold
+   bias add, activation, and scaling into the GEMM pass.
+6. **Tensor Cores** (`wmma_gemm`): tile the problem into fixed-size WMMA
+   fragments and accumulate with `wmma_mma_sync`.
 
-```rust
-// Nested tiling for cache hierarchy
-for tile_i in 0..m/tile_m {
-    for tile_j in 0..n/tile_n {
-        for tile_k in 0..k/tile_k {
-            // L1 cache resident computation
-            gemm_kernel_tile(
-                &a[tile_i..tile_i+tile_m],
-                &b[tile_j..tile_j+tile_n],
-                &mut c[tile_i..tile_i+tile_m]
-            );
-        }
-    }
-}
-```
+## Performance Analysis
 
-### 2. Vectorization
+### Roofline Model
 
-#### SIMD Utilization
-- Vector width adaptation (4, 8, 16 elements)
-- Aligned memory access patterns
-- Fused multiply-add (FMA) operations
-
-```rust
-// Vectorized inner loop
-for i in (0..tile_m).step_by(vector_width) {
-    let a_vec = load_vector(&a[i..i+vector_width]);
-    let b_vec = load_vector(&b[j..j+vector_width]);
-    let c_vec = fma(a_vec, b_vec, c_vec);
-    store_vector(&mut c[i..i+vector_width], c_vec);
-}
-```
-
-### 3. Memory Access Patterns
-
-#### Layout Optimizations
-- **Row-Major**: Best for row-wise access
-- **Column-Major**: Best for column-wise access
-- **Packed**: Optimized for kernel access patterns
-
-### 4. Prefetching
-
-#### Software Prefetch
-- Distance-based prefetching
-- Adaptive prefetch distance
-- Non-temporal hints for streaming
-
-## Performance Models
-
-### 1. Roofline Model
+`RooflineModel` classifies a workload as `ComputeBound`, `MemoryBound`, or
+`Balanced` by comparing its arithmetic intensity to the hardware ridge point:
 
 ```
-Performance = min(Peak_Compute, Peak_Bandwidth × AI)
-AI = Arithmetic Intensity = FLOPs / Bytes
+theoretical_peak = min(peak_gflops, arithmetic_intensity * peak_bandwidth_gbs)
+ridge_point       = peak_gflops / peak_bandwidth_gbs
 ```
 
-### 2. Cost Model
+`analyze_gemm` returns a `RooflineAnalysis` (arithmetic intensity, theoretical
+peak, achieved GFLOPS, efficiency percent, bound, ridge point) and
+`recommendations()` yields tuning hints based on the bound.
 
-```rust
-pub struct PerformanceCost {
-    compute_cycles: u64,
-    memory_cycles: u64,
-    synchronization_cycles: u64,
-    total_cycles: u64,
-}
-```
+### Occupancy
 
-### 3. Efficiency Metrics
+`OccupancyCalculator` models an SM (threads, blocks, registers, and shared
+memory per SM) and, given `KernelRequirements`, returns an `OccupancyResult`
+including the achieved occupancy and its `LimitingFactor`.
 
-- **Compute Efficiency**: Actual FLOPs / Peak FLOPs
-- **Memory Efficiency**: Effective bandwidth / Peak bandwidth
-- **Cache Efficiency**: Hit rate × Access frequency
-- **Energy Efficiency**: FLOPs / Joule
+### Metrics
 
-## Parallelization Strategy
-
-### 1. Thread-Level Parallelism
-- Work distribution across thread blocks
-- Load balancing strategies
-- Synchronization minimization
-
-### 2. Data Parallelism
-- Independent tile computation
-- Parallel reduction operations
-- Atomic-free accumulation
-
-### 3. Pipeline Parallelism
-- Overlapped computation and memory access
-- Double buffering for continuous operation
-- Asynchronous prefetching
-
-## Configuration Management
-
-### 1. Static Configuration
-```rust
-pub struct GemmConfig {
-    tile_config: TileConfig,
-    prefetch_distance: usize,
-    vector_width: usize,
-    use_fma: bool,
-    memory_layout: MemoryLayout,
-}
-```
-
-### 2. Dynamic Tuning
-- Runtime parameter adjustment
-- Performance feedback loop
-- Adaptive optimization
+`GemmMetrics::calculate` derives GFLOPS, effective bandwidth, arithmetic
+intensity, and efficiency from a measured `Duration` and a peak-GFLOPS estimate.
+`Benchmark` wraps warmup and repeated measurement, returning the median-time
+`GemmMetrics`.
 
 ## Error Handling
 
-### 1. Input Validation
-- Dimension compatibility checking
-- Numerical stability validation
-- Memory alignment verification
+The crate uses a single error enum, `Error`, with two variants:
 
-### 2. Runtime Errors
-- Out-of-memory handling
-- Numerical overflow detection
-- Performance degradation alerts
+- `Error::DimensionMismatch(String)` — incompatible matrix or batch shapes.
+- `Error::InvalidConfig(String)` — an invalid `GemmConfig` (block tile not
+  divisible by thread tile), reported by `GemmConfig::validate`.
 
-## Testing Strategy
-
-### 1. Correctness Testing
-- Unit tests for individual components
-- Integration tests for full pipeline
-- Numerical accuracy validation
-
-### 2. Performance Testing
-- Benchmark suite for various sizes
-- Regression testing for optimizations
-- Scalability analysis
+All fallible operations return `Result<T> = std::result::Result<T, Error>`.
 
 ## Dependencies
 
-### Core Dependencies
-- `rayon`: Parallel computation
-- `rand`: Random number generation
-- `thiserror`: Error handling
+### Core
+- `rayon`: data-parallel tile execution.
+- `rand`: random matrix / config generation.
+- `thiserror`: `Error` derivation.
 
-### Development Dependencies
-- `criterion`: Benchmarking framework
-- Test infrastructure
+### Development
+- `criterion`: benchmarking harness (`gemm_benchmarks`).
 
 ## Performance Characteristics
 
 ### Time Complexity
-- Standard GEMM: O(M×N×K)
-- Tiled GEMM: O(M×N×K) with better constants
-- Cache misses: O((M×N×K) / (√cache_size))
+- GEMM: O(M × N × K) for all kernels; tiling and register blocking improve the
+  constant factor and cache behavior, not the asymptotic cost.
 
 ### Space Complexity
-- Input storage: O(M×K + K×N)
-- Output storage: O(M×N)
-- Working memory: O(tile_size²)
-
-### Scalability
-- Strong scaling: Limited by memory bandwidth
-- Weak scaling: Near-linear with problem size
-- Cache efficiency: Decreases with problem size
+- Inputs: O(M×K + K×N); output: O(M×N); per-tile working memory: O(tile_size²).

@@ -2,73 +2,137 @@
 
 ## Overview
 
-The RAG Baseline API provides a comprehensive interface for document indexing, retrieval, and question answering using Retrieval-Augmented Generation. The API is built with FastAPI and supports both REST and WebSocket protocols.
+The RAG Baseline API is a FastAPI application (`ragbaseline.api`) that exposes
+document ingestion, retrieval, and Retrieval-Augmented Generation over a
+multi-tenant index. It is created with `create_app(...)` and defaults to a mock
+LLM provider, so it runs without any external credentials.
+
+Interactive OpenAPI docs are served by FastAPI at `/docs` (Swagger UI) and
+`/redoc`, with the schema at `/openapi.json`.
 
 ## Base URL
 
 ```
-http://localhost:8000/api/v1
+http://localhost:8000
 ```
+
+There is no `/api/v1` prefix — routes are mounted at the root.
 
 ## Authentication
 
-All API requests require authentication using API keys.
+Authentication is **opt-in** and disabled by default. It activates only when the
+`API_KEYS` environment variable is set to a comma-separated list of valid keys.
+When enabled, every request must present a key using either header form:
 
 ```http
 Authorization: Bearer <your-api-key>
 ```
 
-## API Endpoints
-
-### Document Management
-
-#### Index Documents
+or
 
 ```http
-POST /index/documents
+X-API-Key: <your-api-key>
 ```
 
-Indexes one or more documents into the RAG system.
+A missing or invalid key returns `401` with a `WWW-Authenticate: Bearer` header.
+The following paths are always open (no key required, exempt from rate limiting):
+`/`, `/health`, `/ready`, `/readiness`, `/docs`, `/redoc`, `/openapi.json`.
 
-**Request Body:**
+### Rate limiting and timeouts
 
-```json
-{
-  "documents": [
-    {
-      "id": "doc-123",
-      "content": "Document text content...",
-      "metadata": {
-        "source": "manual_upload",
-        "title": "Document Title",
-        "author": "John Doe",
-        "tags": ["ai", "machine-learning"]
-      }
-    }
-  ],
-  "chunking_strategy": "semantic",
-  "chunk_size": 512,
-  "chunk_overlap": 50
-}
-```
+Both are opt-in, in-process, and stdlib-only:
+
+- `RATE_LIMIT_PER_MINUTE` — sliding-window limit per API key (or client IP when no
+  key is present). Default `120`; set `0` to disable. Exceeding it returns `429`
+  with a `Retry-After` header.
+- `REQUEST_TIMEOUT_SECONDS` — per-request timeout (default `30`).
+
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check |
+| POST | `/query` | RAG query (retrieve + generate) |
+| POST | `/query/stream` | RAG query with SSE streaming |
+| POST | `/search` | Retrieval only, no generation |
+| POST | `/ingest` | Ingest a document from a file path |
+| POST | `/ingest/text` | Ingest raw text content |
+| GET | `/tenants` | List all tenant IDs |
+| GET | `/tenants/{tenant_id}` | Get tenant information |
+| DELETE | `/tenants/{tenant_id}` | Delete a tenant and all its data |
+| GET | `/analytics` | Aggregate retrieval analytics |
+| GET | `/usage/{tenant_id}` | Usage metrics for a tenant |
+
+---
+
+### Health
+
+#### `GET /health`
+
+Liveness check.
 
 **Response:**
 
 ```json
 {
-  "status": "success",
-  "indexed_count": 1,
-  "documents": [
-    {
-      "id": "doc-123",
-      "chunks_created": 5,
-      "embedding_time": 0.234,
-      "status": "indexed"
-    }
-  ],
-  "total_time": 0.456
+  "status": "healthy",
+  "version": "1.0.0"
 }
 ```
+
+---
+
+### RAG Query
+
+#### `POST /query`
+
+Retrieve relevant chunks for the given tenant and generate an answer with the
+configured LLM provider.
+
+**Request Body:**
+
+```json
+{
+  "question": "What is the capital of France?",
+  "tenant_id": "default",
+  "top_k": 5,
+  "filter": null,
+  "filter_string": null,
+  "rerank": false,
+  "stream": false
+}
+```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `question` | string | (required) | Question to answer |
+| `tenant_id` | string | `"default"` | Tenant whose index to query |
+| `top_k` | int | `5` | Results to retrieve (1–20) |
+| `filter` | object \| null | `null` | Metadata filter dict |
+| `filter_string` | string \| null | `null` | Filter expression parsed by `MetadataFilter`; overrides `filter` when set |
+| `rerank` | bool | `false` | Enable reranking |
+| `stream` | bool | `false` | Present for parity; use `/query/stream` for streaming |
+
+**Response:**
+
+```json
+{
+  "answer": "The capital of France is Paris.",
+  "sources": [
+    {
+      "id": "chunk-abc-123",
+      "content": "France's capital is Paris...",
+      "score": 0.92,
+      "metadata": { "source": "geography.txt" }
+    }
+  ],
+  "query": "What is the capital of France?",
+  "latency_ms": 12.4
+}
+```
+
+`sources` entries are the serialized retrieved chunks (`to_dict()`); exact keys
+depend on the chunk/document schema.
 
 **Example:**
 
@@ -76,141 +140,69 @@ Indexes one or more documents into the RAG system.
 import requests
 
 response = requests.post(
-    "http://localhost:8000/api/v1/index/documents",
-    headers={"Authorization": "Bearer your-api-key"},
-    json={
-        "documents": [
-            {
-                "id": "doc-001",
-                "content": "Artificial Intelligence is transforming industries...",
-                "metadata": {"source": "research_paper"}
-            }
-        ]
-    }
+    "http://localhost:8000/query",
+    json={"question": "What is the capital of France?", "top_k": 3},
 )
+data = response.json()
+print(data["answer"])
 ```
 
-#### Upload Document File
+#### `POST /query/stream`
 
-```http
-POST /index/upload
+Same request body as `/query`. Returns a `text/event-stream` (Server-Sent
+Events) response. Each event carries a JSON `content` fragment, and the stream
+terminates with a `[DONE]` sentinel:
+
 ```
+data: {"content": "The capital "}
 
-Upload and index a document file (PDF, TXT, MD, HTML).
+data: {"content": "of France is Paris."}
 
-**Request:** Multipart form data
+data: [DONE]
+```
 
 ```python
-files = {"file": open("document.pdf", "rb")}
-data = {"metadata": json.dumps({"source": "upload"})}
+import requests
+
+with requests.post(
+    "http://localhost:8000/query/stream",
+    json={"question": "Explain RAG in one sentence."},
+    stream=True,
+) as r:
+    for line in r.iter_lines():
+        if line:
+            print(line.decode())
 ```
 
-**Response:**
+---
 
-```json
-{
-  "status": "success",
-  "document_id": "doc-abc-123",
-  "filename": "document.pdf",
-  "chunks_created": 12,
-  "processing_time": 1.234
-}
-```
+### Search
 
-#### Get Document
+#### `POST /search`
 
-```http
-GET /index/documents/{document_id}
-```
-
-Retrieve a specific document's information.
-
-**Response:**
-
-```json
-{
-  "id": "doc-123",
-  "metadata": {
-    "source": "manual_upload",
-    "title": "Document Title",
-    "indexed_at": "2024-01-15T10:30:00Z"
-  },
-  "chunk_count": 5,
-  "status": "active"
-}
-```
-
-#### Delete Document
-
-```http
-DELETE /index/documents/{document_id}
-```
-
-Remove a document from the index.
-
-**Response:**
-
-```json
-{
-  "status": "success",
-  "message": "Document deleted successfully",
-  "chunks_removed": 5
-}
-```
-
-#### List Documents
-
-```http
-GET /index/documents
-```
-
-List all indexed documents with pagination.
-
-**Query Parameters:**
-- `page` (int): Page number (default: 1)
-- `page_size` (int): Items per page (default: 20)
-- `filter` (json): Metadata filter
-
-**Response:**
-
-```json
-{
-  "documents": [
-    {
-      "id": "doc-123",
-      "metadata": {...},
-      "chunk_count": 5,
-      "indexed_at": "2024-01-15T10:30:00Z"
-    }
-  ],
-  "total": 150,
-  "page": 1,
-  "page_size": 20
-}
-```
-
-### Search and Retrieval
-
-#### Search Documents
-
-```http
-POST /index/search
-```
-
-Search for relevant documents using vector similarity.
+Retrieval only — returns matching chunks without LLM generation.
 
 **Request Body:**
 
 ```json
 {
-  "query": "What is artificial intelligence?",
-  "k": 5,
-  "score_threshold": 0.7,
-  "filter": {
-    "source": "research_paper"
-  }
+  "query": "artificial intelligence",
+  "tenant_id": "default",
+  "top_k": 5,
+  "filter": null,
+  "hybrid": false,
+  "alpha": 0.5
 }
 ```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `query` | string | (required) | Search query |
+| `tenant_id` | string | `"default"` | Tenant whose index to search |
+| `top_k` | int | `5` | Results to return (1–50) |
+| `filter` | object \| null | `null` | Metadata filter dict |
+| `hybrid` | bool | `false` | Request hybrid (vector + keyword) search |
+| `alpha` | float | `0.5` | Vector weight for hybrid search (0–1) |
 
 **Response:**
 
@@ -219,493 +211,202 @@ Search for relevant documents using vector similarity.
   "results": [
     {
       "id": "chunk-abc-123",
-      "document_id": "doc-123",
       "content": "Artificial Intelligence (AI) is...",
       "score": 0.92,
-      "metadata": {
-        "source": "research_paper",
-        "page": 5
-      }
+      "metadata": { "source": "research_paper" }
     }
   ],
-  "query": "What is artificial intelligence?",
-  "search_time": 0.145
+  "latency_ms": 8.1
 }
 ```
 
-#### Hybrid Search
+---
 
-```http
-POST /index/hybrid-search
-```
+### Document Ingestion
 
-Perform hybrid search combining vector and keyword search.
+#### `POST /ingest`
+
+Ingest a document from a file path readable by the server. Supported formats
+include plain text, and PDF/HTML/Markdown when their optional dependencies are
+installed.
 
 **Request Body:**
 
 ```json
 {
-  "query": "machine learning algorithms",
-  "vector_weight": 0.7,
-  "keyword_weight": 0.3,
-  "k": 10,
-  "rerank": true
+  "tenant_id": "default",
+  "file_path": "/data/docs/report.pdf",
+  "metadata": { "source": "upload" }
 }
 ```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `tenant_id` | string | `"default"` | Target tenant |
+| `file_path` | string | (required) | Server-side path to the file |
+| `metadata` | object \| null | `null` | Extra metadata merged into the document |
 
 **Response:**
 
 ```json
 {
-  "results": [...],
-  "vector_results_count": 8,
-  "keyword_results_count": 6,
-  "combined_count": 10,
-  "search_time": 0.234
+  "status": "success",
+  "document_id": "doc-abc-123",
+  "chunks": 12
 }
 ```
 
-### RAG Query
+Returns `404` if the file does not exist, `500` if parsing/indexing fails.
 
-#### Standard Query
+#### `POST /ingest/text`
 
-```http
-POST /rag/query
-```
-
-Perform a RAG query to get an AI-generated answer.
+Ingest raw text content directly, without a file.
 
 **Request Body:**
 
 ```json
 {
-  "query": "What are the main applications of AI?",
-  "max_tokens": 500,
-  "temperature": 0.7,
-  "retrieval_config": {
-    "k": 5,
-    "score_threshold": 0.7
-  },
-  "include_sources": true
+  "tenant_id": "default",
+  "content": "Artificial Intelligence is transforming industries...",
+  "metadata": { "topic": "ai" },
+  "source": "manual"
 }
 ```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `tenant_id` | string | `"default"` | Target tenant |
+| `content` | string | (required) | Text to ingest |
+| `metadata` | object \| null | `null` | Document metadata |
+| `source` | string | `""` | Source identifier |
 
 **Response:**
 
 ```json
 {
-  "query": "What are the main applications of AI?",
-  "answer": "The main applications of AI include:\n\n1. Healthcare: AI is used for disease diagnosis, drug discovery...",
-  "sources": [
-    {
-      "id": "chunk-123",
-      "document_id": "doc-456",
-      "content": "AI applications in healthcare...",
-      "score": 0.89,
-      "metadata": {...}
-    }
-  ],
-  "metadata": {
-    "retrieval_time": 0.145,
-    "generation_time": 1.234,
-    "total_time": 1.379,
-    "tokens_used": 245,
-    "model": "gpt-3.5-turbo"
+  "status": "success",
+  "document_id": "doc-abc-123",
+  "chunks": 3
+}
+```
+
+---
+
+### Tenants
+
+#### `GET /tenants`
+
+List all tenant IDs.
+
+**Response:**
+
+```json
+["default", "acme", "globex"]
+```
+
+#### `GET /tenants/{tenant_id}`
+
+Get information about a single tenant.
+
+**Response:**
+
+```json
+{
+  "tenant_id": "acme",
+  "document_count": 42,
+  "created_at": "2026-01-15T10:30:00Z"
+}
+```
+
+#### `DELETE /tenants/{tenant_id}`
+
+Permanently delete a tenant and all of its data.
+
+**Response:**
+
+```json
+{
+  "status": "deleted",
+  "tenant_id": "acme"
+}
+```
+
+---
+
+### Analytics and Usage
+
+#### `GET /analytics`
+
+Aggregate retrieval analytics across tenants, derived from the query logs.
+
+**Response:**
+
+```json
+{
+  "total_queries": 1523,
+  "tenants": 3,
+  "latency": {
+    "p50": 12.4,
+    "p95": 48.9
   }
 }
 ```
 
-**Example:**
+`latency` may be `null` when no queries have been logged yet.
 
-```python
-import requests
+#### `GET /usage/{tenant_id}`
 
-response = requests.post(
-    "http://localhost:8000/api/v1/rag/query",
-    headers={"Authorization": "Bearer your-api-key"},
-    json={
-        "query": "What is deep learning?",
-        "max_tokens": 300,
-        "include_sources": True
-    }
-)
-
-data = response.json()
-print(f"Answer: {data['answer']}")
-print(f"Sources: {len(data['sources'])} documents")
-```
-
-#### Streaming Query
-
-```http
-GET /rag/stream
-```
-
-Get streaming responses for real-time generation.
-
-**WebSocket Connection:**
-
-```javascript
-const ws = new WebSocket('ws://localhost:8000/ws/rag/stream');
-
-ws.onopen = () => {
-    ws.send(JSON.stringify({
-        query: "Explain quantum computing",
-        max_tokens: 500
-    }));
-};
-
-ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    if (data.type === 'chunk') {
-        // Append to response
-        console.log(data.content);
-    } else if (data.type === 'sources') {
-        // Handle sources
-        console.log('Sources:', data.sources);
-    } else if (data.type === 'done') {
-        // Complete
-        console.log('Generation complete');
-    }
-};
-```
-
-#### Batch Query
-
-```http
-POST /rag/batch
-```
-
-Process multiple queries in batch.
-
-**Request Body:**
+Usage metrics tracked by `UsageTracker` for a single tenant (e.g. query and
+document counts). The exact shape is whatever the tracker records for the tenant.
 
 ```json
 {
-  "queries": [
-    "What is AI?",
-    "How does machine learning work?",
-    "What are neural networks?"
-  ],
-  "max_tokens": 300,
-  "parallel": true
+  "queries": 128,
+  "documents": 42
 }
 ```
 
-**Response:**
-
-```json
-{
-  "results": [
-    {
-      "query": "What is AI?",
-      "answer": "...",
-      "sources": [...]
-    },
-    {
-      "query": "How does machine learning work?",
-      "answer": "...",
-      "sources": [...]
-    }
-  ],
-  "total_time": 2.456,
-  "parallel_execution": true
-}
-```
-
-### Feedback and Analytics
-
-#### Submit Feedback
-
-```http
-POST /feedback
-```
-
-Submit feedback on a RAG response.
-
-**Request Body:**
-
-```json
-{
-  "query_id": "query-123",
-  "rating": 4,
-  "relevant": true,
-  "feedback": "The answer was helpful but could be more detailed",
-  "selected_sources": ["chunk-123", "chunk-456"]
-}
-```
-
-**Response:**
-
-```json
-{
-  "status": "success",
-  "feedback_id": "feedback-789",
-  "message": "Feedback recorded successfully"
-}
-```
-
-#### Get Analytics
-
-```http
-GET /analytics/summary
-```
-
-Get usage analytics and performance metrics.
-
-**Query Parameters:**
-- `start_date`: Start date (ISO format)
-- `end_date`: End date (ISO format)
-- `granularity`: hour|day|week|month
-
-**Response:**
-
-```json
-{
-  "period": {
-    "start": "2024-01-01T00:00:00Z",
-    "end": "2024-01-31T23:59:59Z"
-  },
-  "metrics": {
-    "total_queries": 1523,
-    "unique_users": 87,
-    "avg_response_time": 1.234,
-    "avg_tokens_per_query": 267,
-    "retrieval_accuracy": 0.85,
-    "user_satisfaction": 4.2
-  },
-  "top_queries": [...],
-  "error_rate": 0.02
-}
-```
-
-### Configuration
-
-#### Get Configuration
-
-```http
-GET /config
-```
-
-Get current system configuration.
-
-**Response:**
-
-```json
-{
-  "embedding_model": "text-embedding-ada-002",
-  "llm_model": "gpt-3.5-turbo",
-  "chunk_size": 512,
-  "chunk_overlap": 50,
-  "retrieval_k": 5,
-  "vector_store": "chroma",
-  "cache_enabled": true
-}
-```
-
-#### Update Configuration
-
-```http
-PUT /config
-```
-
-Update system configuration (admin only).
-
-**Request Body:**
-
-```json
-{
-  "chunk_size": 1024,
-  "retrieval_k": 10,
-  "cache_enabled": false
-}
-```
-
-**Response:**
-
-```json
-{
-  "status": "success",
-  "message": "Configuration updated",
-  "updated_fields": ["chunk_size", "retrieval_k", "cache_enabled"]
-}
-```
+---
 
 ## Error Handling
 
-All errors follow a consistent format:
+Errors use FastAPI's standard response shape:
 
 ```json
 {
-  "error": {
-    "code": "INVALID_REQUEST",
-    "message": "The request body is invalid",
-    "details": {
-      "field": "query",
-      "issue": "Query cannot be empty"
-    }
-  },
-  "request_id": "req-123-456"
+  "detail": "File not found: /data/docs/missing.pdf"
 }
 ```
 
-### Error Codes
+Validation errors (malformed request bodies) return `422` with FastAPI's
+per-field `detail` array.
 
-| Code | HTTP Status | Description |
-|------|-------------|-------------|
-| `INVALID_REQUEST` | 400 | Invalid request parameters |
-| `UNAUTHORIZED` | 401 | Missing or invalid API key |
-| `FORBIDDEN` | 403 | Insufficient permissions |
-| `NOT_FOUND` | 404 | Resource not found |
-| `RATE_LIMITED` | 429 | Too many requests |
-| `INTERNAL_ERROR` | 500 | Internal server error |
-| `SERVICE_UNAVAILABLE` | 503 | Service temporarily unavailable |
+### Common status codes
 
-## Rate Limiting
+| HTTP Status | When |
+|-------------|------|
+| `401` | Auth enabled and API key missing/invalid |
+| `404` | Resource not found (e.g. ingest file path) |
+| `422` | Request body failed validation |
+| `429` | Rate limit exceeded (when enabled) |
+| `500` | Ingestion or internal error |
 
-API requests are rate-limited per API key:
-
-- **Standard tier**: 100 requests/minute
-- **Premium tier**: 1000 requests/minute
-- **Enterprise tier**: Unlimited
-
-Rate limit information is included in response headers:
-
-```http
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 95
-X-RateLimit-Reset: 1642521600
-```
-
-## Pagination
-
-List endpoints support pagination using standard parameters:
-
-```http
-GET /api/v1/index/documents?page=2&page_size=50
-```
-
-Paginated responses include:
-
-```json
-{
-  "data": [...],
-  "pagination": {
-    "total": 523,
-    "page": 2,
-    "page_size": 50,
-    "total_pages": 11,
-    "has_next": true,
-    "has_prev": true
-  }
-}
-```
-
-## Webhooks
-
-Configure webhooks to receive real-time notifications:
-
-```http
-POST /webhooks
-```
-
-**Request Body:**
-
-```json
-{
-  "url": "https://your-app.com/webhook",
-  "events": ["document.indexed", "query.completed"],
-  "secret": "webhook-secret-key"
-}
-```
-
-### Webhook Events
-
-- `document.indexed`: Document successfully indexed
-- `document.deleted`: Document removed from index
-- `query.completed`: RAG query completed
-- `error.occurred`: Error during processing
-
-## SDK Examples
-
-### Python SDK
-
-```python
-from ragbaseline import RAGClient
-
-# Initialize client
-client = RAGClient(api_key="your-api-key")
-
-# Index document
-doc_id = client.index_document(
-    content="Document content...",
-    metadata={"source": "upload"}
-)
-
-# Perform query
-response = client.query(
-    "What is AI?",
-    k=5,
-    include_sources=True
-)
-
-print(response.answer)
-for source in response.sources:
-    print(f"- {source.content[:100]}...")
-```
-
-### JavaScript SDK
-
-```javascript
-import { RAGClient } from 'ragbaseline-js';
-
-// Initialize client
-const client = new RAGClient({ apiKey: 'your-api-key' });
-
-// Index document
-const docId = await client.indexDocument({
-    content: 'Document content...',
-    metadata: { source: 'upload' }
-});
-
-// Perform query
-const response = await client.query('What is AI?', {
-    k: 5,
-    includeSources: true
-});
-
-console.log(response.answer);
-```
-
-### cURL Examples
+## cURL Examples
 
 ```bash
-# Index a document
-curl -X POST http://localhost:8000/api/v1/index/documents \
-  -H "Authorization: Bearer your-api-key" \
+# Ingest raw text
+curl -X POST http://localhost:8000/ingest/text \
   -H "Content-Type: application/json" \
-  -d '{
-    "documents": [{
-      "content": "AI is transforming industries...",
-      "metadata": {"source": "manual"}
-    }]
-  }'
+  -d '{"content": "AI is transforming industries...", "source": "manual"}'
 
-# Perform RAG query
-curl -X POST http://localhost:8000/api/v1/rag/query \
+# RAG query
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is artificial intelligence?", "top_k": 3}'
+
+# With auth enabled (API_KEYS set on the server)
+curl -X POST http://localhost:8000/query \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{
-    "query": "What is artificial intelligence?",
-    "max_tokens": 300
-  }'
+  -d '{"question": "What is AI?"}'
 ```
-
-## Best Practices
-
-1. **Batch Operations**: Use batch endpoints for multiple documents/queries
-2. **Caching**: Enable caching for frequently asked questions
-3. **Filtering**: Use metadata filters to improve retrieval precision
-4. **Monitoring**: Track API usage and performance metrics
-5. **Error Handling**: Implement retry logic with exponential backoff
-6. **Security**: Rotate API keys regularly and use HTTPS

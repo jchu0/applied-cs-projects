@@ -97,12 +97,16 @@ flowchart LR
     A[User Query] --> B[Query Embedding] --> C[Vector Search] --> D[Result Retrieval] --> E[Context Construction] --> F[LLM Prompt] --> G[Response Generation] --> H[Output]
 ```
 
-### 3. Feedback Loop
+### 3. Observability Loop
 
 ```mermaid
 flowchart LR
-    A[Response] --> B[User Feedback] --> C[Relevance Scoring] --> D[Index Optimization]
+    A[Query] --> B[RetrievalLogger] --> C[Analytics] --> D[UsageTracker]
 ```
+
+Each query is logged (question, sources, response, latency) by `RetrievalLogger`
+and counted per tenant by `UsageTracker`; the aggregates are exposed via the
+`/analytics` and `/usage/{tenant_id}` endpoints.
 
 ## Storage Architecture
 
@@ -131,22 +135,38 @@ flowchart LR
 
 ## API Architecture
 
+The FastAPI app (`ragbaseline.api.create_app`) mounts all routes at the root
+(no `/api/v1` prefix) and defaults to the mock LLM provider so it runs without
+credentials. See [API.md](API.md) for full request/response schemas.
+
 ### REST API Endpoints
 
 ```
-POST   /api/index/documents      # Add documents
-GET    /api/index/search         # Search documents
-POST   /api/rag/query           # RAG query
-GET    /api/rag/stream          # Streaming query
-DELETE /api/index/documents/{id} # Remove document
+GET    /health                 # Health check
+POST   /query                  # RAG query (retrieve + generate)
+POST   /query/stream           # RAG query, SSE streaming
+POST   /search                 # Retrieval only, no generation
+POST   /ingest                 # Ingest a document from a file path
+POST   /ingest/text            # Ingest raw text content
+GET    /tenants                # List tenant IDs
+GET    /tenants/{tenant_id}    # Tenant info
+DELETE /tenants/{tenant_id}    # Delete a tenant and its data
+GET    /analytics              # Aggregate retrieval analytics
+GET    /usage/{tenant_id}      # Per-tenant usage metrics
 ```
 
-### WebSocket Endpoints
+Streaming uses Server-Sent Events over the `POST /query/stream` route (there are
+no WebSocket endpoints). Interactive OpenAPI docs are served at `/docs`,
+`/redoc`, and `/openapi.json`.
 
-```
-/ws/rag/stream     # Real-time streaming responses
-/ws/rag/feedback  # Live feedback collection
-```
+### Security middleware
+
+API-key auth (`API_KEYS`), sliding-window rate limiting
+(`RATE_LIMIT_PER_MINUTE`), and a per-request timeout (`REQUEST_TIMEOUT_SECONDS`)
+are opt-in and disabled unless their environment variables are set. When auth is
+enabled, keys are accepted via `Authorization: Bearer <key>` or `X-API-Key`, and
+`/`, `/health`, `/ready`, `/readiness`, `/docs`, `/redoc`, and `/openapi.json`
+stay open.
 
 ## Enterprise Features
 

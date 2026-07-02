@@ -1,18 +1,56 @@
 # GPU GEMM Optimization - API Documentation
 
+This crate (`gpu_gemm_optimization`) is organized as a set of **free functions**
+and plain data structs, not an object-oriented kernel API. GEMM kernels are
+functions that take `&Matrix` inputs and write into a `&mut Matrix` output.
+
 ## Table of Contents
-1. [Matrix Module](#matrix-module)
-2. [GEMM Module](#gemm-module)
-3. [Autotuner Module](#autotuner-module)
-4. [Metrics Module](#metrics-module)
-5. [Complete Examples](#complete-examples)
+1. [Error Handling](#error-handling)
+2. [Matrix Module](#matrix-module)
+3. [GEMM Module](#gemm-module)
+4. [Vectorize Module](#vectorize-module)
+5. [Memory Module](#memory-module)
+6. [Metrics Module](#metrics-module)
+7. [Autotuner Module](#autotuner-module)
+8. [Complete Examples](#complete-examples)
+
+## Error Handling
+
+The entire crate uses a single error enum and result alias, re-exported at the
+crate root:
+
+```rust
+pub enum Error {
+    DimensionMismatch(String),
+    InvalidConfig(String),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+```
+
+`DimensionMismatch` is returned when matrix / batch shapes are incompatible;
+`InvalidConfig` is returned by `GemmConfig::validate` when block/thread tiles do
+not divide evenly. There are no per-module error types.
+
+```rust
+use gpu_gemm_optimization::{naive_gemm, Error, Matrix};
+
+let a = Matrix::random(4, 8);
+let b = Matrix::random(3, 4); // wrong: b.rows != a.cols
+let mut c = Matrix::zeros(4, 3);
+
+match naive_gemm(&a, &b, &mut c) {
+    Ok(()) => println!("ok"),
+    Err(Error::DimensionMismatch(msg)) => eprintln!("shape error: {msg}"),
+    Err(Error::InvalidConfig(msg)) => eprintln!("config error: {msg}"),
+}
+```
 
 ## Matrix Module
 
-### Core Types
-
-#### `Matrix`
-Main matrix data structure for dense matrices.
+### `Matrix`
+Dense, row-major matrix. Fields are public; there is no `Matrix::new` — use a
+factory method.
 
 ```rust
 pub struct Matrix {
@@ -22,661 +60,546 @@ pub struct Matrix {
 }
 ```
 
-The `data`, `rows`, and `cols` fields are public; there is no `Matrix::new`
-constructor — use one of the factory methods below.
-
 ### Creation Methods
 
-#### `Matrix::zeros(rows: usize, cols: usize) -> Self`
-Creates a matrix filled with zeros.
+| Method | Description |
+| --- | --- |
+| `Matrix::zeros(rows, cols) -> Matrix` | All elements `0.0`. |
+| `Matrix::ones(rows, cols) -> Matrix` | All elements `1.0`. |
+| `Matrix::random(rows, cols) -> Matrix` | Random values in `[-1, 1]`. |
+| `Matrix::identity(size) -> Matrix` | `size × size` identity matrix. |
 
 ```rust
-let mat = Matrix::zeros(10, 10);
-// All elements are 0.0
-```
+use gpu_gemm_optimization::Matrix;
 
-#### `Matrix::ones(rows: usize, cols: usize) -> Self`
-Creates a matrix filled with ones.
-
-```rust
-let mat = Matrix::ones(5, 5);
-// All elements are 1.0
-```
-
-#### `Matrix::identity(size: usize) -> Self`
-Creates an identity matrix.
-
-```rust
-let mat = Matrix::identity(4);
-// 4x4 identity matrix
-```
-
-#### `Matrix::random(rows: usize, cols: usize) -> Self`
-Creates a matrix with random values in [-1, 1].
-
-```rust
-let mat = Matrix::random(50, 50);
-// Random values between -1.0 and 1.0
+let z = Matrix::zeros(10, 10);
+let i = Matrix::identity(4);
+let r = Matrix::random(50, 50);
 ```
 
 ### Access Methods
 
-#### `get(&self, row: usize, col: usize) -> f32`
-Returns the value at the specified position.
-
 ```rust
-let mut mat = Matrix::zeros(2, 2);
-mat.set(0, 1, 2.0);
-assert_eq!(mat.get(0, 1), 2.0);
+pub fn get(&self, row: usize, col: usize) -> f32;
+pub fn set(&mut self, row: usize, col: usize, value: f32);
+pub fn get_mut(&mut self, row: usize, col: usize) -> &mut f32;
+pub fn row_ptr(&self, row: usize) -> &[f32];
+pub fn row_ptr_mut(&mut self, row: usize) -> &mut [f32];
 ```
-
-#### `set(&mut self, row: usize, col: usize, value: f32)`
-Sets the value at the specified position.
 
 ```rust
 let mut mat = Matrix::zeros(3, 3);
 mat.set(1, 1, 5.0);
 assert_eq!(mat.get(1, 1), 5.0);
-```
 
-### Operations
-
-#### `transpose(&self) -> Matrix`
-Returns the transpose of the matrix.
-
-```rust
-let mat = Matrix::random(2, 3);
-let transposed = mat.transpose();
-assert_eq!(transposed.rows, 3);
-assert_eq!(transposed.cols, 2);
-```
-
-#### `row_ptr(&self, row: usize) -> &[f32]` / `row_ptr_mut(&mut self, row: usize) -> &mut [f32]`
-Borrow a single row as a slice.
-
-```rust
-let mat = Matrix::ones(4, 8);
-let row = mat.row_ptr(2);
+let row = Matrix::ones(4, 8).row_ptr(2).to_vec();
 assert_eq!(row.len(), 8);
 ```
 
-### Utility Methods
-
-#### `frobenius_norm(&self) -> f32`
-Computes the Frobenius norm.
+### Operations & Utilities
 
 ```rust
-let mat = Matrix::ones(2, 2);
-let norm = mat.frobenius_norm();
-// sqrt(4) = 2.0
+pub fn transpose(&self) -> Matrix;
+pub fn frobenius_norm(&self) -> f32;
+pub fn approx_eq(&self, other: &Matrix, tolerance: f32) -> bool;
+pub fn max_diff(&self, other: &Matrix) -> f32;
+pub fn max_relative_error(&self, other: &Matrix) -> f32;
 ```
-
-#### `approx_eq(&self, other: &Matrix, tolerance: f32) -> bool`
-Checks if two matrices are approximately equal (relative tolerance).
 
 ```rust
-let a = Matrix::ones(1, 2);
-let b = Matrix::ones(1, 2);
-assert!(a.approx_eq(&b, 1e-3));
+let m = Matrix::random(2, 3);
+let t = m.transpose();
+assert_eq!((t.rows, t.cols), (3, 2));
+
+let norm = Matrix::ones(2, 2).frobenius_norm(); // sqrt(4) = 2.0
 ```
 
-#### `max_diff(&self, other: &Matrix) -> f32` / `max_relative_error(&self, other: &Matrix) -> f32`
-Maximum absolute / relative element-wise difference between two matrices.
+### Layout Helpers
+
+```rust
+pub enum Layout {
+    RowMajor,
+    ColumnMajor,
+}
+
+pub fn convert_layout(data: &[f32], rows: usize, cols: usize, from: Layout, to: Layout) -> Vec<f32>;
+pub fn pack_matrix_a(/* ... */) -> Vec<f32>;
+pub fn pack_matrix_b(/* ... */) -> Vec<f32>;
+```
+
+`Layout` is a two-variant enum (`RowMajor`, `ColumnMajor`). `convert_layout`
+re-lays out a flat buffer; `pack_matrix_a` / `pack_matrix_b` pack operand tiles
+for blocked kernels.
 
 ## GEMM Module
 
-### Core Types
-
-#### `GemmKernel`
-Main GEMM computation kernel.
-
-```rust
-pub struct GemmKernel {
-    config: GemmConfig,
-    // Internal state
-}
-```
-
-#### `GemmParams`
-Parameters for GEMM operation: C = α×A×B + β×C
-
-```rust
-pub struct GemmParams {
-    pub m: usize,              // Rows of A and C
-    pub n: usize,              // Columns of B and C
-    pub k: usize,              // Columns of A, rows of B
-    pub alpha: f32,            // Scaling factor for A×B
-    pub beta: f32,             // Scaling factor for C
-    pub trans_a: TransposeMode, // Transpose mode for A
-    pub trans_b: TransposeMode, // Transpose mode for B
-}
-```
-
-#### `GemmConfig`
-Configuration for kernel optimization.
+### Configuration
 
 ```rust
 pub struct GemmConfig {
-    pub tile_config: TileConfig,
-    pub prefetch_distance: usize,
-    pub vector_width: usize,
-    pub use_fma: bool,
-    pub memory_layout: MemoryLayout,
+    pub block_m: usize,   // block tile size, M
+    pub block_n: usize,   // block tile size, N
+    pub block_k: usize,   // block tile size, K
+    pub thread_m: usize,  // per-thread tile, M
+    pub thread_n: usize,  // per-thread tile, N
 }
 ```
 
-### Main Operations
+`GemmConfig::default()` yields `block_m=64, block_n=64, block_k=8, thread_m=8,
+thread_n=8`. `config.validate() -> Result<()>` fails with `Error::InvalidConfig`
+if `block_m % thread_m != 0` or `block_n % thread_n != 0`.
 
-#### `GemmKernel::new(config: GemmConfig) -> Self`
-Creates a new GEMM kernel with the specified configuration.
+`GemmKernel` is a **trait** (`compute(&self, a, b, c) -> Result<()>` and
+`name(&self) -> &'static str`), not a struct — implement it to wrap a kernel
+behind a common interface. The kernels below are plain free functions.
+
+### Core GEMM Kernels
+
+All compute `C = A × B` and return `Result<()>`, validating that
+`a.cols == b.rows`.
 
 ```rust
-use gpu_gemm_optimization::gemm::{GemmKernel, GemmConfig};
-
-let config = GemmConfig::default();
-let kernel = GemmKernel::new(config);
+pub fn naive_gemm(a: &Matrix, b: &Matrix, c: &mut Matrix) -> Result<()>;
+pub fn tiled_gemm(a: &Matrix, b: &Matrix, c: &mut Matrix, tile_size: usize) -> Result<()>;
+pub fn register_tiled_gemm(a: &Matrix, b: &Matrix, c: &mut Matrix, config: &GemmConfig) -> Result<()>;
+pub fn parallel_tiled_gemm(a: &Matrix, b: &Matrix, c: &mut Matrix, tile_size: usize) -> Result<()>;
+pub fn double_buffered_gemm(a: &Matrix, b: &Matrix, c: &mut Matrix, tile_size: usize) -> Result<()>;
 ```
 
-#### `execute(&self, a: &Matrix, b: &Matrix, c: &mut Matrix, params: &GemmParams) -> Result<(), GemmError>`
-Executes the GEMM operation.
+```rust
+use gpu_gemm_optimization::{Matrix, tiled_gemm};
+
+let a = Matrix::random(128, 256);
+let b = Matrix::random(256, 64);
+let mut c = Matrix::zeros(128, 64);
+tiled_gemm(&a, &b, &mut c, 32)?;
+```
+
+### Scaled GEMM
 
 ```rust
-use gpu_gemm_optimization::gemm::{GemmKernel, GemmParams};
-use gpu_gemm_optimization::matrix::{Matrix, TransposeMode};
+// C = alpha * (A * B) + beta * C
+pub fn scaled_gemm(a: &Matrix, b: &Matrix, c: &mut Matrix, alpha: f32, beta: f32) -> Result<()>;
+```
 
-let a = Matrix::random(100, 200);
-let b = Matrix::random(200, 150);
-let mut c = Matrix::zeros(100, 150);
+### Batched GEMM
 
-let params = GemmParams {
-    m: 100,
-    n: 150,
-    k: 200,
-    alpha: 1.0,
-    beta: 0.0,
-    trans_a: TransposeMode::NoTranspose,
-    trans_b: TransposeMode::NoTranspose,
+```rust
+// C[i] = A[i] * B[i]
+pub fn batched_gemm(a_batch: &[Matrix], b_batch: &[Matrix], c_batch: &mut [Matrix]) -> Result<()>;
+
+// C[i] = alpha * (A[i] * B[i]) + beta * C[i]
+pub fn batched_scaled_gemm(
+    a_batch: &[Matrix], b_batch: &[Matrix], c_batch: &mut [Matrix],
+    alpha: f32, beta: f32,
+) -> Result<()>;
+
+// Contiguous 3D-tensor layout addressed by per-operand strides
+pub fn strided_batched_gemm(
+    a_data: &[f32], b_data: &[f32], c_data: &mut [f32],
+    batch_size: usize, m: usize, n: usize, k: usize,
+    stride_a: usize, stride_b: usize, stride_c: usize,
+) -> Result<()>;
+```
+
+### Fused Activation GEMM
+
+```rust
+pub enum Activation {
+    None,
+    ReLU,
+    LeakyReLU(f32),
+    GeLU,
+    Sigmoid,
+    Tanh,
+    SiLU,
+}
+
+impl Activation {
+    pub fn apply(&self, x: f32) -> f32;
+}
+
+// C = activation(A * B)
+pub fn gemm_activation(a: &Matrix, b: &Matrix, c: &mut Matrix, activation: Activation) -> Result<()>;
+
+// C = activation(A * B + bias)   (bias.len() == b.cols)
+pub fn gemm_bias_activation(
+    a: &Matrix, b: &Matrix, c: &mut Matrix, bias: &[f32], activation: Activation,
+) -> Result<()>;
+
+// C = alpha * activation(A * B + bias) + beta * C   (bias optional)
+pub fn gemm_fused(
+    a: &Matrix, b: &Matrix, c: &mut Matrix,
+    alpha: f32, beta: f32, bias: Option<&[f32]>, activation: Activation,
+) -> Result<()>;
+```
+
+```rust
+use gpu_gemm_optimization::{Matrix, Activation, gemm_activation};
+
+let a = Matrix::random(32, 64);
+let b = Matrix::random(64, 16);
+let mut c = Matrix::zeros(32, 16);
+gemm_activation(&a, &b, &mut c, Activation::ReLU)?;
+```
+
+### Tensor Core / WMMA Simulation
+
+```rust
+pub struct WmmaConfig { pub m: usize, pub n: usize, pub k: usize }
+
+impl WmmaConfig {
+    pub fn m16n16k16() -> Self; // also: m8n32k16(), m32n8k16(), Default = 16x16x16
+}
+
+pub struct WmmaFragment { /* rows, cols, data */ }
+
+impl WmmaFragment {
+    pub fn new(rows: usize, cols: usize) -> Self;
+    pub fn load_matrix_sync(&mut self, matrix: &Matrix, row_offset: usize, col_offset: usize);
+    pub fn store_matrix_sync(&self, matrix: &mut Matrix, row_offset: usize, col_offset: usize);
+    pub fn fill(&mut self, value: f32);
+    pub fn get(&self, row: usize, col: usize) -> f32;
+    pub fn set(&mut self, row: usize, col: usize, value: f32);
+}
+
+// D = A * B + C over WMMA fragments
+pub fn wmma_mma_sync(
+    a_frag: &WmmaFragment, b_frag: &WmmaFragment,
+    c_frag: &WmmaFragment, d_frag: &mut WmmaFragment,
+) -> Result<()>;
+
+// Full GEMM tiled into WMMA fragments
+pub fn wmma_gemm(a: &Matrix, b: &Matrix, c: &mut Matrix, config: WmmaConfig) -> Result<()>;
+```
+
+### Roofline Analysis
+
+```rust
+pub enum PerformanceBound { ComputeBound, MemoryBound, Balanced }
+
+pub struct RooflineModel {
+    pub peak_gflops: f64,
+    pub peak_bandwidth_gbs: f64,
+}
+
+impl RooflineModel {
+    pub fn new(peak_gflops: f64, peak_bandwidth_gbs: f64) -> Self; // Default = 10000, 900
+    pub fn ridge_point(&self) -> f64;
+    pub fn theoretical_peak(&self, arithmetic_intensity: f64) -> f64;
+    pub fn classify_bound(&self, arithmetic_intensity: f64) -> PerformanceBound;
+    pub fn gemm_arithmetic_intensity(m: usize, n: usize, k: usize) -> f64;
+    pub fn tiled_gemm_arithmetic_intensity(m, n, k, tile_m, tile_n, tile_k: usize) -> f64;
+    pub fn analyze_gemm(&self, m: usize, n: usize, k: usize, achieved_gflops: f64) -> RooflineAnalysis;
+}
+
+pub struct RooflineAnalysis {
+    pub arithmetic_intensity: f64,
+    pub theoretical_peak_gflops: f64,
+    pub achieved_gflops: f64,
+    pub efficiency_percent: f64,
+    pub bound: PerformanceBound,
+    pub ridge_point: f64,
+}
+
+impl RooflineAnalysis {
+    pub fn recommendations(&self) -> Vec<&'static str>;
+}
+```
+
+```rust
+use gpu_gemm_optimization::RooflineModel;
+
+let model = RooflineModel::default();
+let analysis = model.analyze_gemm(1024, 1024, 1024, 350.0);
+println!("{:?}: {:.1}% of peak", analysis.bound, analysis.efficiency_percent);
+for rec in analysis.recommendations() {
+    println!("- {rec}");
+}
+```
+
+## Vectorize Module
+
+```rust
+pub struct Float4 { pub x: f32, pub y: f32, pub z: f32, pub w: f32 }
+impl Float4 {
+    pub fn new(data: [f32; 4]) -> Self;
+    pub fn zero() -> Self;
+    pub fn to_array(self) -> [f32; 4];
+    pub fn add(self, other: Self) -> Self;
+    pub fn scale(self, s: f32) -> Self;
+    pub fn fma(self, a: f32, b: Self) -> Self;
+}
+
+pub struct Float8 { pub data: [f32; 8] }
+impl Float8 {
+    pub fn new(data: [f32; 8]) -> Self;
+    pub fn zero() -> Self;
+    pub fn add(self, other: Self) -> Self;
+    pub fn scale(self, s: f32) -> Self;
+}
+
+pub trait VectorizedOps {
+    fn load_float4(data: &[f32], offset: usize) -> Float4;
+    fn load_float8(data: &[f32], offset: usize) -> Float8;
+    fn store_float4(data: &mut [f32], offset: usize, value: Float4);
+    fn store_float8(data: &mut [f32], offset: usize, value: Float8);
+    fn is_aligned(offset: usize, alignment: usize) -> bool;
+}
+
+pub struct SimdVectorOps; // implements VectorizedOps
+
+pub struct CoalescingAnalysis { /* ... */ }
+impl CoalescingAnalysis {
+    pub fn analyze(/* ... */) -> Self;
+}
+```
+
+`vectorized_gemm` and `vectorized_gemm_transposed_b` are also provided as module
+functions (`gpu_gemm_optimization::vectorize::*`) but are not re-exported at the
+crate root.
+
+## Memory Module
+
+Shared-memory bank-conflict and occupancy analysis for GPU kernels.
+
+```rust
+pub const NUM_BANKS: usize = 32;
+pub const BANK_WIDTH: usize = 4;
+pub const MAX_SHARED_MEM: usize = 49152;
+
+pub struct BankConflictAnalysis { /* ... */ }
+impl BankConflictAnalysis {
+    pub fn analyze(addresses: &[usize]) -> Self;
+    pub fn is_conflict_free(&self) -> bool;
+}
+
+pub struct SharedMemoryConfig { /* width, height, element_size, padding */ }
+impl SharedMemoryConfig {
+    pub fn new(width: usize, height: usize, element_size: usize) -> Self;
+    pub fn with_auto_padding(width: usize, height: usize, element_size: usize) -> Self;
+    pub fn stride(&self) -> usize;
+    pub fn size_bytes(&self) -> usize;
+    pub fn index(&self, row: usize, col: usize) -> usize;
+    pub fn fits_in_shared_memory(&self) -> bool;
+}
+
+pub struct OccupancyCalculator {
+    pub max_threads_per_sm: usize,
+    pub max_blocks_per_sm: usize,
+    pub registers_per_sm: usize,
+    pub shared_mem_per_sm: usize,
+}
+impl OccupancyCalculator {
+    pub fn ampere() -> Self;  // also volta(), turing()
+    pub fn calculate(&self, reqs: &KernelRequirements) -> OccupancyResult;
+    pub fn find_optimal_block_size(/* ... */);
+}
+
+pub struct KernelRequirements {
+    pub threads_per_block: usize,
+    pub registers_per_thread: usize,
+    pub shared_mem_per_block: usize,
+}
+
+pub struct OccupancyResult {
+    pub blocks_per_sm: usize,
+    pub warps_per_sm: usize,
+    pub max_warps_per_sm: usize,
+    pub occupancy: f32,
+    pub limiting_factor: LimitingFactor, // module-local enum
+}
+
+pub struct MemoryAccessPattern { /* ... */ }
+impl MemoryAccessPattern {
+    pub fn analyze(addresses: &[usize]) -> Self;
+}
+```
+
+```rust
+use gpu_gemm_optimization::{OccupancyCalculator, KernelRequirements};
+
+let calc = OccupancyCalculator::ampere();
+let reqs = KernelRequirements {
+    threads_per_block: 256,
+    registers_per_thread: 32,
+    shared_mem_per_block: 8192,
 };
-
-let kernel = GemmKernel::new(GemmConfig::default());
-kernel.execute(&a, &b, &mut c, &params)?;
-```
-
-### Configuration Options
-
-#### `TileConfig`
-Tiling parameters for cache optimization.
-
-```rust
-pub struct TileConfig {
-    pub tile_m: usize,  // M dimension tile size
-    pub tile_n: usize,  // N dimension tile size
-    pub tile_k: usize,  // K dimension tile size
-}
-
-// Example: Custom tiling
-let config = GemmConfig {
-    tile_config: TileConfig {
-        tile_m: 64,
-        tile_n: 64,
-        tile_k: 16,
-    },
-    ..GemmConfig::default()
-};
-```
-
-#### `MemoryLayout`
-Memory access pattern optimization.
-
-```rust
-pub enum MemoryLayout {
-    RowMajor,      // Row-major storage
-    ColumnMajor,   // Column-major storage
-    Packed,        // Packed format for kernels
-}
-```
-
-## Autotuner Module
-
-### Core Types
-
-#### `Autotuner`
-Automatic performance tuning system.
-
-```rust
-pub struct Autotuner {
-    config: AutotuneConfig,
-    // Internal state
-}
-```
-
-#### `AutotuneConfig`
-Configuration for autotuning process.
-
-```rust
-pub struct AutotuneConfig {
-    pub search_space: SearchSpace,
-    pub max_iterations: usize,
-    pub convergence_threshold: f32,
-    pub timeout_seconds: u64,
-    pub parallel_evaluations: usize,
-    pub optimization_objective: OptimizationObjective,
-    pub search_strategy: SearchStrategy,
-}
-```
-
-### Main Operations
-
-#### `Autotuner::new(config: AutotuneConfig) -> Result<Self, AutotunerError>`
-Creates a new autotuner.
-
-```rust
-use gpu_gemm_optimization::autotuner::{
-    Autotuner, AutotuneConfig, SearchSpace, OptimizationObjective, SearchStrategy
-};
-
-let search_space = SearchSpace {
-    tile_m_options: vec![32, 64, 128],
-    tile_n_options: vec![32, 64, 128],
-    tile_k_options: vec![8, 16, 32],
-    prefetch_options: vec![1, 2, 4],
-    vector_width_options: vec![4, 8, 16],
-    memory_layouts: vec![MemoryLayout::RowMajor, MemoryLayout::ColumnMajor],
-};
-
-let config = AutotuneConfig {
-    search_space,
-    max_iterations: 100,
-    convergence_threshold: 0.01,
-    timeout_seconds: 300,
-    parallel_evaluations: 4,
-    optimization_objective: OptimizationObjective::Throughput,
-    search_strategy: SearchStrategy::BayesianOptimization,
-};
-
-let mut tuner = Autotuner::new(config)?;
-```
-
-#### `tune(&mut self, a: &Matrix, b: &Matrix, c: &Matrix) -> Result<GemmConfig, AutotunerError>`
-Finds the optimal configuration for given matrices.
-
-```rust
-let a = Matrix::random(512, 512);
-let b = Matrix::random(512, 512);
-let c = Matrix::zeros(512, 512);
-
-let best_config = tuner.tune(&a, &b, &c)?;
-println!("Best tile size: {}x{}x{}",
-         best_config.tile_config.tile_m,
-         best_config.tile_config.tile_n,
-         best_config.tile_config.tile_k);
-```
-
-### Search Strategies
-
-```rust
-pub enum SearchStrategy {
-    GridSearch,           // Exhaustive search
-    RandomSearch,         // Random sampling
-    BayesianOptimization, // Gaussian process based
-    GeneticAlgorithm,     // Evolutionary optimization
-}
-```
-
-### Optimization Objectives
-
-```rust
-pub enum OptimizationObjective {
-    Throughput,        // Maximize GFLOPS
-    Latency,          // Minimize execution time
-    EnergyEfficiency, // Maximize GFLOPS/Watt
-    MemoryBandwidth,  // Maximize bandwidth utilization
-}
+let result = calc.calculate(&reqs);
+println!("occupancy: {:.1}%", result.occupancy);
 ```
 
 ## Metrics Module
 
-### Core Types
-
-#### `PerformanceMetrics`
-Complete performance measurement structure.
-
 ```rust
-pub struct PerformanceMetrics {
-    pub throughput_gflops: f32,
-    pub latency_ms: f32,
-    pub memory_bandwidth_gb: f32,
-    pub cache_hit_rate: f32,
-    pub register_pressure: u32,
-    pub occupancy: f32,
-    pub energy_joules: Option<f32>,
-    pub power_watts: Option<f32>,
+pub struct GemmMetrics {
+    pub execution_time: std::time::Duration,
+    pub dimensions: (usize, usize, usize),
+    pub gflops: f64,
+    pub bandwidth_gbs: f64,
+    pub arithmetic_intensity: f64,
+    pub efficiency: f64,
+}
+
+impl GemmMetrics {
+    pub fn calculate(m: usize, n: usize, k: usize, execution_time: Duration, peak_gflops: f64) -> Self;
+    pub fn format(&self) -> String;
 }
 ```
 
-#### `MetricsCollector`
-Runtime metrics collection system.
+`GemmMetrics` is the only metrics type re-exported at the crate root. The
+`metrics` module additionally provides `Benchmark`, `BenchmarkResults`,
+`PerformanceModel`, `KernelComparison`, and `MemoryProfile`
+(`gpu_gemm_optimization::metrics::*`):
 
 ```rust
-pub struct MetricsCollector {
-    // Internal storage for metrics
+pub struct Benchmark {
+    pub warmup_iters: usize,
+    pub measure_iters: usize,
+    pub peak_gflops: f64,
+}
+
+impl Benchmark {
+    pub fn new(warmup_iters: usize, measure_iters: usize, peak_gflops: f64) -> Self;
+
+    // F: Fn(&Matrix, &Matrix, &mut Matrix) -> Result<()>
+    pub fn run<F>(&self, a: &Matrix, b: &Matrix, kernel: F) -> Result<GemmMetrics>;
+    pub fn run_detailed<F>(&self, a: &Matrix, b: &Matrix, kernel: F) -> Result<BenchmarkResults>;
 }
 ```
 
-### Collection Operations
-
-#### `MetricsCollector::new() -> Self`
-Creates a new metrics collector.
-
 ```rust
-use gpu_gemm_optimization::metrics::MetricsCollector;
+use gpu_gemm_optimization::Matrix;
+use gpu_gemm_optimization::metrics::Benchmark;
+use gpu_gemm_optimization::naive_gemm;
 
-let mut collector = MetricsCollector::new();
+let a = Matrix::random(128, 128);
+let b = Matrix::random(128, 128);
+
+let bench = Benchmark::new(3, 10, 100.0);
+let metrics = bench.run(&a, &b, |a, b, c| naive_gemm(a, b, c))?;
+println!("{}", metrics.format());
 ```
 
-#### `record(&mut self, metric_type: MetricType, value: f64)`
-Records a metric value.
+## Autotuner Module
+
+The autotuner searches a `ParameterSpace` of `GemmConfig`s using a kernel
+closure. Types live in `gpu_gemm_optimization::autotuner::*`; only `Autotuner`
+is re-exported at the crate root.
 
 ```rust
-use gpu_gemm_optimization::metrics::MetricType;
+pub struct AutotuneConfig {
+    pub strategy: SearchStrategy,
+    pub max_trials: usize,
+    pub time_budget: Option<std::time::Duration>,
+    pub early_stop: usize,
+    pub benchmark_iters: usize,
+}
+// Default: GridSearch, max_trials=100, time_budget=None, early_stop=20, benchmark_iters=5
 
-collector.record(MetricType::Throughput, 150.5);
-collector.record(MetricType::Latency, 12.3);
-```
+pub enum SearchStrategy { GridSearch, Random, SimulatedAnnealing, Genetic }
 
-#### `aggregate(&self, metric_type: MetricType, method: AggregationMethod) -> f64`
-Aggregates collected metrics.
+pub struct ParameterSpace {
+    pub block_m: Vec<usize>,
+    pub block_n: Vec<usize>,
+    pub block_k: Vec<usize>,
+    pub thread_m: Vec<usize>,
+    pub thread_n: Vec<usize>,
+}
+impl ParameterSpace {
+    pub fn small() -> Self;   // also large(), Default
+    pub fn generate_configs(&self) -> Vec<GemmConfig>;
+    pub fn num_configs(&self) -> usize;
+}
 
-```rust
-use gpu_gemm_optimization::metrics::AggregationMethod;
+pub struct AutotuneResult {
+    pub best_config: GemmConfig,
+    pub best_metrics: GemmMetrics,
+    pub num_trials: usize,
+    pub total_time: std::time::Duration,
+    pub history: Vec<(GemmConfig, GemmMetrics)>,
+}
+impl AutotuneResult {
+    pub fn format(&self) -> String;
+}
 
-let avg_throughput = collector.aggregate(
-    MetricType::Throughput,
-    AggregationMethod::Average
-);
+pub struct Autotuner {
+    pub config: AutotuneConfig,
+    pub param_space: ParameterSpace,
+    pub benchmark: Benchmark,
+}
 
-let p95_latency = collector.aggregate(
-    MetricType::Latency,
-    AggregationMethod::Percentile95
-);
-```
+impl Autotuner {
+    pub fn new(config: AutotuneConfig, param_space: ParameterSpace) -> Self;
 
-### Analysis Operations
-
-#### `PerformanceAnalyzer::compare(&self, a: &PerformanceMetrics, b: &PerformanceMetrics) -> ComparisonResult`
-Compares two performance measurements.
-
-```rust
-use gpu_gemm_optimization::metrics::PerformanceAnalyzer;
-
-let analyzer = PerformanceAnalyzer::new();
-let comparison = analyzer.compare(&metrics1, &metrics2);
-
-println!("Throughput improvement: {:.2}%",
-         comparison.throughput_improvement * 100.0);
-```
-
-#### `identify_bottlenecks(&self, metrics: &PerformanceMetrics) -> Vec<String>`
-Identifies performance bottlenecks.
-
-```rust
-let bottlenecks = analyzer.identify_bottlenecks(&metrics);
-for bottleneck in bottlenecks {
-    println!("Bottleneck detected: {}", bottleneck);
+    // F: Fn(&Matrix, &Matrix, &mut Matrix, &GemmConfig) -> Result<()>
+    pub fn tune<F>(&self, a: &Matrix, b: &Matrix, kernel_fn: F) -> Result<AutotuneResult>;
 }
 ```
 
-### Benchmarking
-
-#### `Benchmark::run<F>(&mut self, f: F) -> Result<BenchmarkResult, BenchmarkError>`
-Runs a benchmark with warmup and statistics.
-
-```rust
-use gpu_gemm_optimization::metrics::{Benchmark, BenchmarkConfig};
-use std::time::Duration;
-
-let config = BenchmarkConfig {
-    warmup_iterations: 10,
-    measurement_iterations: 100,
-    timeout_per_iteration: Duration::from_secs(10),
-};
-
-let mut benchmark = Benchmark::new(config);
-
-let result = benchmark.run(|| {
-    // Code to benchmark
-    kernel.execute(&a, &b, &mut c, &params).unwrap();
-})?;
-
-println!("Mean time: {:?}", result.mean_time);
-println!("Std deviation: {:?}", result.std_deviation);
-```
+The autotuner module also exposes `TuningCache` (an M/N/K → `GemmConfig` cache
+with `get_or_tune`) and `HeuristicSelector` (rule-based config selection).
 
 ## Complete Examples
 
-### Example 1: Basic GEMM Operation
+### Example 1: Basic GEMM
 
 ```rust
-use gpu_gemm_optimization::{
-    matrix::{Matrix, TransposeMode},
-    gemm::{GemmKernel, GemmParams, GemmConfig},
-};
+use gpu_gemm_optimization::{Matrix, naive_gemm};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create matrices
-    let m = 256;
-    let n = 256;
-    let k = 256;
-
+fn main() -> gpu_gemm_optimization::Result<()> {
+    let (m, n, k) = (256, 256, 256);
     let a = Matrix::random(m, k);
     let b = Matrix::random(k, n);
     let mut c = Matrix::zeros(m, n);
 
-    // Setup GEMM parameters
-    let params = GemmParams {
-        m,
-        n,
-        k,
-        alpha: 1.0,
-        beta: 0.0,
-        trans_a: TransposeMode::NoTranspose,
-        trans_b: TransposeMode::NoTranspose,
-    };
+    naive_gemm(&a, &b, &mut c)?;
 
-    // Create and execute kernel
-    let kernel = GemmKernel::new(GemmConfig::default());
-    kernel.execute(&a, &b, &mut c, &params)?;
-
-    println!("GEMM completed successfully");
-    println!("Result norm: {}", c.frobenius_norm());
-
+    println!("GEMM completed, result norm: {}", c.frobenius_norm());
     Ok(())
 }
 ```
 
-### Example 2: Autotuning for Performance
+### Example 2: Autotuning
 
 ```rust
-use gpu_gemm_optimization::{
-    matrix::Matrix,
-    gemm::{GemmKernel, GemmParams, MemoryLayout},
-    autotuner::{
-        Autotuner, AutotuneConfig, SearchSpace,
-        OptimizationObjective, SearchStrategy
-    },
-};
+use gpu_gemm_optimization::{Matrix, register_tiled_gemm};
+use gpu_gemm_optimization::autotuner::{Autotuner, AutotuneConfig, ParameterSpace};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Problem size
-    let size = 1024;
+fn main() -> gpu_gemm_optimization::Result<()> {
+    let a = Matrix::random(512, 512);
+    let b = Matrix::random(512, 512);
 
-    // Create test matrices
-    let a = Matrix::random(size, size);
-    let b = Matrix::random(size, size);
-    let c = Matrix::zeros(size, size);
+    let tuner = Autotuner::new(AutotuneConfig::default(), ParameterSpace::large());
+    let result = tuner.tune(&a, &b, |a, b, c, config| register_tiled_gemm(a, b, c, config))?;
 
-    // Define search space
-    let search_space = SearchSpace {
-        tile_m_options: vec![32, 64, 128, 256],
-        tile_n_options: vec![32, 64, 128, 256],
-        tile_k_options: vec![8, 16, 32, 64],
-        prefetch_options: vec![1, 2, 4, 8],
-        vector_width_options: vec![4, 8, 16],
-        memory_layouts: vec![
-            MemoryLayout::RowMajor,
-            MemoryLayout::ColumnMajor,
-            MemoryLayout::Packed,
-        ],
-    };
-
-    // Configure autotuner
-    let config = AutotuneConfig {
-        search_space,
-        max_iterations: 50,
-        convergence_threshold: 0.01,
-        timeout_seconds: 120,
-        parallel_evaluations: 4,
-        optimization_objective: OptimizationObjective::Throughput,
-        search_strategy: SearchStrategy::BayesianOptimization,
-    };
-
-    // Run autotuning
-    let mut tuner = Autotuner::new(config)?;
-    let best_config = tuner.tune(&a, &b, &c)?;
-
-    // Use optimized configuration
-    let kernel = GemmKernel::new(best_config);
-    let mut c_result = Matrix::zeros(size, size);
-
-    let params = GemmParams {
-        m: size,
-        n: size,
-        k: size,
-        alpha: 1.0,
-        beta: 0.0,
-        trans_a: TransposeMode::NoTranspose,
-        trans_b: TransposeMode::NoTranspose,
-    };
-
-    kernel.execute(&a, &b, &mut c_result, &params)?;
-
-    println!("Autotuning completed");
-    println!("Best configuration found:");
-    println!("  Tile: {}x{}x{}",
-             best_config.tile_config.tile_m,
-             best_config.tile_config.tile_n,
-             best_config.tile_config.tile_k);
-
-    Ok(())
-}
-```
-
-### Example 3: Performance Analysis
-
-```rust
-use gpu_gemm_optimization::{
-    matrix::Matrix,
-    gemm::{GemmKernel, GemmParams, GemmConfig},
-    metrics::{
-        MetricsCollector, PerformanceAnalyzer,
-        MetricType, AggregationMethod, Benchmark, BenchmarkConfig
-    },
-};
-use std::time::{Duration, Instant};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let size = 512;
-    let a = Matrix::random(size, size);
-    let b = Matrix::random(size, size);
-
-    // Create metrics collector
-    let mut collector = MetricsCollector::new();
-
-    // Benchmark different configurations
-    let configs = vec![
-        GemmConfig::default(),
-        GemmConfig {
-            tile_config: TileConfig { tile_m: 64, tile_n: 64, tile_k: 16 },
-            ..GemmConfig::default()
-        },
-        GemmConfig {
-            tile_config: TileConfig { tile_m: 128, tile_n: 128, tile_k: 32 },
-            ..GemmConfig::default()
-        },
-    ];
-
-    for (i, config) in configs.iter().enumerate() {
-        let kernel = GemmKernel::new(config.clone());
-        let mut c = Matrix::zeros(size, size);
-
-        let params = GemmParams {
-            m: size,
-            n: size,
-            k: size,
-            alpha: 1.0,
-            beta: 0.0,
-            trans_a: TransposeMode::NoTranspose,
-            trans_b: TransposeMode::NoTranspose,
-        };
-
-        // Run benchmark
-        let bench_config = BenchmarkConfig {
-            warmup_iterations: 5,
-            measurement_iterations: 20,
-            timeout_per_iteration: Duration::from_secs(5),
-        };
-
-        let mut benchmark = Benchmark::new(bench_config);
-        let result = benchmark.run(|| {
-            kernel.execute(&a, &b, &mut c, &params).unwrap();
-        })?;
-
-        // Calculate and record metrics
-        let gflops = (2.0 * size as f64 * size as f64 * size as f64) /
-                     (result.mean_time.as_secs_f64() * 1e9);
-
-        collector.record(MetricType::Throughput, gflops);
-        collector.record(MetricType::Latency, result.mean_time.as_millis() as f64);
-
-        println!("Config {}: {:.2} GFLOPS, {:.2} ms",
-                 i, gflops, result.mean_time.as_millis());
-    }
-
-    // Analyze results
-    let avg_throughput = collector.aggregate(
-        MetricType::Throughput,
-        AggregationMethod::Average
+    println!("{}", result.format());
+    let best = result.best_config;
+    println!(
+        "best: block {}x{}x{}, thread {}x{}",
+        best.block_m, best.block_n, best.block_k, best.thread_m, best.thread_n
     );
-    let max_throughput = collector.aggregate(
-        MetricType::Throughput,
-        AggregationMethod::Max
-    );
-
-    println!("\nPerformance Summary:");
-    println!("  Average: {:.2} GFLOPS", avg_throughput);
-    println!("  Maximum: {:.2} GFLOPS", max_throughput);
-
     Ok(())
 }
 ```
 
-## Error Handling
-
-All operations that can fail return `Result<T, E>` types with specific error enums:
-
-- `MatrixError`: Matrix operation errors (dimension mismatch, out of bounds)
-- `GemmError`: GEMM execution errors (invalid parameters, numerical issues)
-- `AutotunerError`: Autotuning failures (timeout, convergence failure)
-- `BenchmarkError`: Benchmarking errors (timeout, measurement failure)
-
-Example error handling:
+### Example 3: Benchmark + Roofline
 
 ```rust
-match kernel.execute(&a, &b, &mut c, &params) {
-    Ok(()) => println!("Success"),
-    Err(GemmError::DimensionMismatch { expected, actual }) => {
-        eprintln!("Dimension mismatch: expected {}, got {}", expected, actual);
-    },
-    Err(e) => eprintln!("GEMM failed: {}", e),
+use gpu_gemm_optimization::{Matrix, tiled_gemm, RooflineModel};
+use gpu_gemm_optimization::metrics::Benchmark;
+
+fn main() -> gpu_gemm_optimization::Result<()> {
+    let (m, n, k) = (512, 512, 512);
+    let a = Matrix::random(m, k);
+    let b = Matrix::random(k, n);
+
+    let bench = Benchmark::new(3, 20, 100.0);
+    let metrics = bench.run(&a, &b, |a, b, c| tiled_gemm(a, b, c, 32))?;
+    println!("{}", metrics.format());
+
+    let analysis = RooflineModel::default().analyze_gemm(m, n, k, metrics.gflops);
+    println!("{:?} at {:.1}% of peak", analysis.bound, analysis.efficiency_percent);
+    Ok(())
 }
 ```

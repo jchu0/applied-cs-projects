@@ -1,652 +1,144 @@
 # Long-Context Attention API Documentation
 
+This crate (`long-context-attention`) is a CPU-only, pure-Rust library. All
+attention kernels operate on flat `&[f32]` buffers described by a
+[`TensorShape`], and every fallible entry point returns [`crate::Result`].
+There is no GPU backend, binary, or server component.
+
+The convention throughout is a **row-major** logical layout of
+`[batch, seq_len, num_heads, head_dim]`, and all `forward` methods take
+borrowed input buffers plus explicit query/key/value shapes.
+
 ## Table of Contents
 
-- [Core API](#core-api)
+- [Common Types](#common-types)
+- [Configuration](#configuration)
+- [Standard Attention](#standard-attention)
 - [Flash Attention](#flash-attention)
-- [Block Sparse Attention](#block-sparse-attention)
+- [Linear Attention](#linear-attention)
 - [Sliding Window Attention](#sliding-window-attention)
+- [Block Sparse Attention](#block-sparse-attention)
+- [RoPE and Positional Bias](#rope-and-positional-bias)
 - [KV Cache](#kv-cache)
-- [RoPE Embeddings](#rope-embeddings)
-- [Auto-Selector](#auto-selector)
-- [Configuration Types](#configuration-types)
+- [Auto-Selection](#auto-selection)
+- [Streaming Inference](#streaming-inference)
 - [Examples](#examples)
 
-## Core API
+## Common Types
 
-### `Attention`
+### `TensorShape`
 
-The main attention interface that provides a unified API for all attention mechanisms.
-
-```rust
-pub struct Attention {
-    config: AttentionConfig,
-    implementation: Box<dyn AttentionMechanism>,
-}
-
-impl Attention {
-    /// Create a new attention instance with automatic selection
-    pub fn new(config: AttentionConfig) -> Self;
-
-    /// Create with specific Flash Attention implementation
-    pub fn new_flash(config: AttentionConfig, flash_config: FlashAttentionConfig) -> Self;
-
-    /// Create with Block Sparse implementation
-    pub fn new_sparse(config: AttentionConfig, sparse_config: SparsityConfig) -> Self;
-
-    /// Create with Sliding Window implementation
-    pub fn new_sliding(config: AttentionConfig, window_config: SlidingWindowConfig) -> Self;
-
-    /// Forward pass
-    pub fn forward(
-        &mut self,
-        q: &ArrayView4<f32>,  // [batch, heads, seq_len, head_dim]
-        k: &ArrayView4<f32>,  // [batch, heads, seq_len, head_dim]
-        v: &ArrayView4<f32>,  // [batch, heads, seq_len, head_dim]
-    ) -> Array4<f32>;
-
-    /// Forward pass with attention mask
-    pub fn forward_masked(
-        &mut self,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        v: &ArrayView4<f32>,
-        mask: &ArrayView3<f32>,  // [batch, seq_len, seq_len]
-    ) -> Array4<f32>;
-
-    /// Backward pass
-    pub fn backward(
-        &mut self,
-        d_out: &ArrayView4<f32>,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        v: &ArrayView4<f32>,
-    ) -> (Array4<f32>, Array4<f32>, Array4<f32>);
-}
-```
-
-#### Example
+Describes the logical shape of a flat attention buffer.
 
 ```rust
-use long_context_attention::{Attention, AttentionConfig, AttentionType};
-
-let config = AttentionConfig {
-    attention_type: AttentionType::Auto,
-    num_heads: 8,
-    head_dim: 64,
-    max_seq_len: 2048,
-    dropout: 0.1,
-    use_bias: false,
-};
-
-let mut attention = Attention::new(config);
-
-// Forward pass
-let output = attention.forward(&q, &k, &v);
-```
-
-## Flash Attention
-
-### `FlashAttention`
-
-Implementation of the Flash Attention algorithm for memory-efficient exact attention.
-
-```rust
-pub struct FlashAttention {
-    config: FlashAttentionConfig,
-    max_seq_len: usize,
-    head_dim: usize,
-}
-
-impl FlashAttention {
-    /// Create a new Flash Attention instance
-    pub fn new(config: FlashAttentionConfig, max_seq_len: usize, head_dim: usize) -> Self;
-
-    /// Forward pass with optional mask
-    pub fn forward(
-        &mut self,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        v: &ArrayView4<f32>,
-        mask: Option<&ArrayView3<f32>>,
-    ) -> Array4<f32>;
-
-    /// Backward pass
-    pub fn backward(
-        &mut self,
-        d_out: &ArrayView4<f32>,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        v: &ArrayView4<f32>,
-    ) -> (Array4<f32>, Array4<f32>, Array4<f32>);
-
-    /// Estimate memory usage in bytes
-    pub fn estimate_memory_usage(&self, batch_size: usize, seq_len: usize, num_heads: usize) -> usize;
-
-    /// Set custom block size
-    pub fn set_block_size(&mut self, block_size: BlockSize);
-
-    /// Enable/disable Triton kernels
-    pub fn set_use_triton(&mut self, use_triton: bool);
-}
-```
-
-### `FlashAttentionConfig`
-
-```rust
-pub struct FlashAttentionConfig {
-    /// Block size for tiling
-    pub block_size: BlockSize,
-
-    /// Use Triton kernels if available
-    pub use_triton: bool,
-
-    /// Apply causal mask
-    pub causal: bool,
-
-    /// Backward pass strategy
-    pub backward: Backward,
-}
-
-pub enum BlockSize {
-    B32,   // 32x32 blocks
-    B64,   // 64x64 blocks
-    B128,  // 128x128 blocks
-}
-
-pub enum Backward {
-    Store,      // Store intermediate values
-    Recompute,  // Recompute in backward pass
-}
-```
-
-#### Example
-
-```rust
-use long_context_attention::flash::{FlashAttention, FlashAttentionConfig, BlockSize, Backward};
-
-let config = FlashAttentionConfig {
-    block_size: BlockSize::B64,
-    use_triton: true,
-    causal: true,
-    backward: Backward::Recompute,
-};
-
-let mut flash_attn = FlashAttention::new(config, 2048, 64);
-let output = flash_attn.forward(&q, &k, &v, None);
-```
-
-## Block Sparse Attention
-
-### `BlockSparseAttention`
-
-Attention with structured sparsity patterns for efficient long-context processing.
-
-```rust
-pub struct BlockSparseAttention {
-    config: SparsityConfig,
-    max_seq_len: usize,
-    head_dim: usize,
-}
-
-impl BlockSparseAttention {
-    /// Create a new Block Sparse Attention instance
-    pub fn new(config: SparsityConfig, max_seq_len: usize, head_dim: usize) -> Self;
-
-    /// Forward pass
-    pub fn forward(
-        &mut self,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        v: &ArrayView4<f32>,
-        mask: Option<&ArrayView3<f32>>,
-    ) -> Array4<f32>;
-
-    /// Forward with adaptive sparsity
-    pub fn forward_adaptive(
-        &mut self,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        v: &ArrayView4<f32>,
-    ) -> Array4<f32>;
-
-    /// Generate sparsity pattern
-    pub fn generate_pattern(&self, seq_len: usize) -> Array2<bool>;
-
-    /// Get current sparsity ratio
-    pub fn sparsity_ratio(&self) -> f32;
-
-    /// Update sparsity pattern
-    pub fn update_pattern(&mut self, pattern: BlockPattern);
-}
-```
-
-### `SparsityConfig`
-
-```rust
-pub struct SparsityConfig {
-    /// Block size for sparsity
-    pub block_size: usize,
-
-    /// Target sparsity ratio (0.0 = dense, 1.0 = fully sparse)
-    pub sparsity_ratio: f32,
-
-    /// Sparsity pattern type
-    pub pattern: BlockPattern,
-
-    /// Local attention window size
-    pub local_window: usize,
-
-    /// Global token positions
-    pub global_tokens: Vec<usize>,
-}
-
-pub enum BlockPattern {
-    Fixed,                    // Predefined pattern
-    Random,                   // Random sampling
-    LocalWindow,             // Local attention windows
-    GlobalLocal,             // Global + local attention
-    Adaptive,                // Content-based dynamic
-    Strided { stride: usize }, // Strided pattern
-}
-```
-
-#### Example
-
-```rust
-use long_context_attention::block_sparse::{BlockSparseAttention, SparsityConfig, BlockPattern};
-
-let config = SparsityConfig {
-    block_size: 64,
-    sparsity_ratio: 0.9,
-    pattern: BlockPattern::GlobalLocal,
-    local_window: 256,
-    global_tokens: vec![0, 512, 1024],
-};
-
-let mut sparse_attn = BlockSparseAttention::new(config, 2048, 64);
-let pattern = sparse_attn.generate_pattern(2048);
-let output = sparse_attn.forward(&q, &k, &v, None);
-```
-
-## Sliding Window Attention
-
-### `SlidingWindowAttention`
-
-Attention restricted to local windows for linear complexity.
-
-```rust
-pub struct SlidingWindowAttention {
-    config: SlidingWindowConfig,
-    max_seq_len: usize,
-    head_dim: usize,
-}
-
-impl SlidingWindowAttention {
-    /// Create a new Sliding Window Attention instance
-    pub fn new(config: SlidingWindowConfig, max_seq_len: usize, head_dim: usize) -> Self;
-
-    /// Forward pass
-    pub fn forward(
-        &mut self,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        v: &ArrayView4<f32>,
-    ) -> Array4<f32>;
-
-    /// Compute window boundaries
-    pub fn compute_windows(&self, seq_len: usize) -> Vec<(usize, usize)>;
-
-    /// Get window size
-    pub fn window_size(&self) -> usize;
-
-    /// Update window configuration
-    pub fn update_config(&mut self, config: SlidingWindowConfig);
-}
-```
-
-### `SlidingWindowConfig`
-
-```rust
-pub struct SlidingWindowConfig {
-    /// Window size in tokens
-    pub window_size: usize,
-
-    /// Overlap between windows
-    pub overlap: usize,
-
-    /// Apply causal masking
-    pub use_causal_mask: bool,
-}
-```
-
-#### Example
-
-```rust
-use long_context_attention::sliding_window::{SlidingWindowAttention, SlidingWindowConfig};
-
-let config = SlidingWindowConfig {
-    window_size: 256,
-    overlap: 64,
-    use_causal_mask: true,
-};
-
-let mut window_attn = SlidingWindowAttention::new(config, 2048, 64);
-let output = window_attn.forward(&q, &k, &v);
-```
-
-## KV Cache
-
-### `KVCache`
-
-Key-Value cache management for autoregressive generation.
-
-```rust
-pub struct KVCache {
-    config: CacheConfig,
-}
-
-impl KVCache {
-    /// Create a new KV cache
-    pub fn new(config: CacheConfig) -> Self;
-
-    /// Append new K, V tensors
-    pub fn append(
-        &mut self,
-        k: &ArrayView4<f32>,
-        v: &ArrayView4<f32>,
-        position: usize,
-    );
-
-    /// Retrieve cached K, V tensors
-    pub fn get(&self, start: usize, end: usize) -> (Array4<f32>, Array4<f32>);
-
-    /// Get last n tokens
-    pub fn get_last(&self, n: usize) -> (Array4<f32>, Array4<f32>);
-
-    /// Clear cache
-    pub fn clear(&mut self);
-
-    /// Check if cache is empty
-    pub fn is_empty(&self) -> bool;
-
-    /// Get current cache size
-    pub fn current_size(&self) -> usize;
-
-    /// Get maximum sequence length
-    pub fn max_seq_len(&self) -> usize;
-}
-```
-
-### `CacheConfig`
-
-```rust
-pub struct CacheConfig {
-    /// Maximum sequence length to cache
-    pub max_seq_len: usize,
-
-    /// Maximum batch size
-    pub max_batch_size: usize,
-
-    /// Number of attention heads
+pub struct TensorShape {
+    pub batch: usize,
+    pub seq_len: usize,
     pub num_heads: usize,
-
-    /// Head dimension
     pub head_dim: usize,
-
-    /// Cache eviction policy
-    pub eviction_policy: EvictionPolicy,
-
-    /// Compression method
-    pub compression: CompressionMethod,
 }
 
-pub enum EvictionPolicy {
-    FIFO,           // First In First Out
-    LRU,            // Least Recently Used
-    SlidingWindow,  // Keep last N tokens
-}
-
-pub enum CompressionMethod {
-    None,           // No compression
-    Quantize8Bit,   // 8-bit quantization
-    Quantize4Bit,   // 4-bit quantization
-    Pruning,        // Magnitude-based pruning
+impl TensorShape {
+    pub fn new(batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) -> Self;
+    pub fn num_elements(&self) -> usize;
 }
 ```
 
-#### Example
+### `AttentionOutput`
+
+Result of a `forward` call. `output` is a flat buffer laid out as
+`[batch, seq_len, num_heads, head_dim]`.
 
 ```rust
-use long_context_attention::kv_cache::{KVCache, CacheConfig, EvictionPolicy, CompressionMethod};
-
-let config = CacheConfig {
-    max_seq_len: 2048,
-    max_batch_size: 4,
-    num_heads: 8,
-    head_dim: 64,
-    eviction_policy: EvictionPolicy::LRU,
-    compression: CompressionMethod::Quantize8Bit,
-};
-
-let mut cache = KVCache::new(config);
-
-// During generation
-cache.append(&k_new, &v_new, current_position);
-let (k_full, v_full) = cache.get(0, current_position + 1);
+pub struct AttentionOutput {
+    pub output: Vec<f32>,
+    pub shape: TensorShape,
+    pub attention_weights: Option<Vec<f32>>,
+}
 ```
 
-## RoPE Embeddings
-
-### `RoPE`
-
-Rotary Position Embeddings for encoding position information.
+### `Error` / `Result`
 
 ```rust
-pub struct RoPE {
-    config: RoPEConfig,
-}
+pub type Result<T> = std::result::Result<T, Error>;
 
-impl RoPE {
-    /// Create a new RoPE instance
-    pub fn new(config: RoPEConfig) -> Self;
-
-    /// Apply RoPE to Q and K tensors
-    pub fn apply(
-        &mut self,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        offset: usize,
-    ) -> (Array4<f32>, Array4<f32>);
-
-    /// Apply to specific position
-    pub fn apply_to_position(
-        &mut self,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        position: usize,
-    ) -> (Array4<f32>, Array4<f32>);
-
-    /// Apply inverse RoPE
-    pub fn apply_inverse(
-        &mut self,
-        q: &ArrayView4<f32>,
-        k: &ArrayView4<f32>,
-        offset: usize,
-    ) -> (Array4<f32>, Array4<f32>);
-
-    /// Precompute frequencies for caching
-    pub fn precompute_freqs(&mut self);
+pub enum Error {
+    InvalidConfig(String),
+    DimensionMismatch { expected: usize, actual: usize },
+    OutOfMemory { required: usize, available: usize },
+    CacheError(String),
+    SequenceTooLong { length: usize, max: usize },
+    InvalidMask,
+    ShapeMismatch { name: &'static str, expected: usize, actual: usize },
 }
 ```
 
-### `RoPEConfig`
+### Free functions
 
 ```rust
-pub struct RoPEConfig {
-    /// Dimension of embeddings
-    pub dim: usize,
+/// Validate q/k/v (and optional mask) buffer lengths against their shapes.
+pub fn validate_forward_inputs(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    q_shape: TensorShape,
+    kv_shape: TensorShape,
+    attention_mask: Option<&[f32]>,
+) -> Result<()>;
 
-    /// Maximum sequence length
-    pub max_seq_len: usize,
+/// In-place row-wise softmax over a [num_rows, num_cols] score buffer.
+pub fn softmax(scores: &mut [f32], num_rows: usize, num_cols: usize);
 
-    /// Base for frequency computation
-    pub base: f32,
+/// Apply a causal mask in place to a [q_len, kv_len] score buffer.
+pub fn apply_causal_mask(scores: &mut [f32], q_len: usize, kv_len: usize);
 
-    /// Frequency scaling method
-    pub freq_scale: FrequencyScale,
-}
-
-pub enum FrequencyScale {
-    Linear,                     // Standard RoPE
-    NTKScaling { factor: f32 }, // Neural Tangent Kernel scaling
-    Yarn { factor: f32, beta: f32 }, // YaRN scaling
-}
+/// Expand KV heads to Q heads for grouped-query / multi-query attention.
+pub fn expand_kv_heads(/* see source */);
 ```
 
-#### Example
-
-```rust
-use long_context_attention::rope::{RoPE, RoPEConfig, FrequencyScale};
-
-let config = RoPEConfig {
-    dim: 64,
-    max_seq_len: 4096,
-    base: 10000.0,
-    freq_scale: FrequencyScale::NTKScaling { factor: 2.0 },
-};
-
-let mut rope = RoPE::new(config);
-rope.precompute_freqs();
-
-let (q_rotated, k_rotated) = rope.apply(&q, &k, position_offset);
-```
-
-## Auto-Selector
-
-### `AutoSelector`
-
-Automatically selects the optimal attention mechanism based on runtime conditions.
-
-```rust
-pub struct AutoSelector {
-    model_config: ModelConfig,
-}
-
-impl AutoSelector {
-    /// Create a new auto-selector
-    pub fn new(model_config: ModelConfig) -> Self;
-
-    /// Select attention mechanism
-    pub fn select_attention(&mut self, criteria: SelectionCriteria) -> AttentionSelection;
-
-    /// Update performance profile
-    pub fn update_profile(
-        &mut self,
-        attention_type: AttentionType,
-        seq_len: usize,
-        batch_size: usize,
-        latency_ms: f64,
-        memory_mb: f64,
-    );
-
-    /// Estimate memory usage
-    pub fn estimate_memory(
-        &self,
-        seq_len: usize,
-        batch_size: usize,
-        attention_type: &AttentionType,
-    ) -> usize;
-
-    /// Enable adaptive mode
-    pub fn set_adaptive_mode(&mut self, enabled: bool);
-}
-```
-
-### `SelectionCriteria`
-
-```rust
-pub struct SelectionCriteria {
-    /// Sequence length
-    pub sequence_length: usize,
-
-    /// Batch size
-    pub batch_size: usize,
-
-    /// Available memory in bytes
-    pub available_memory: usize,
-
-    /// Optimization target
-    pub optimize_for: &'static str,  // "throughput", "memory", "quality", "auto"
-}
-```
-
-### `AttentionSelection`
-
-```rust
-pub struct AttentionSelection {
-    /// Selected attention type
-    pub attention_type: AttentionType,
-
-    /// Configuration parameters
-    pub config: HashMap<String, Value>,
-
-    /// Estimated performance metrics
-    pub estimated_latency_ms: f64,
-    pub estimated_memory_mb: f64,
-}
-```
-
-#### Example
-
-```rust
-use long_context_attention::auto_select::{AutoSelector, SelectionCriteria, ModelConfig};
-
-let model_config = ModelConfig {
-    vocab_size: 50000,
-    hidden_dim: 768,
-    num_heads: 12,
-    head_dim: 64,
-    num_layers: 12,
-    max_seq_len: 4096,
-};
-
-let mut selector = AutoSelector::new(model_config);
-
-let criteria = SelectionCriteria {
-    sequence_length: 2048,
-    batch_size: 4,
-    available_memory: 8 * 1024 * 1024 * 1024, // 8GB
-    optimize_for: "throughput",
-};
-
-let selection = selector.select_attention(criteria);
-println!("Selected: {:?}", selection.attention_type);
-```
-
-## Configuration Types
+## Configuration
 
 ### `AttentionConfig`
 
+Shared configuration for every attention implementation. Uses a builder-style
+API. See defaults in the `Default` impl.
+
 ```rust
 pub struct AttentionConfig {
-    /// Attention mechanism type
-    pub attention_type: AttentionType,
-
-    /// Number of attention heads
     pub num_heads: usize,
-
-    /// Dimension per head
     pub head_dim: usize,
-
-    /// Maximum sequence length
+    pub num_kv_heads: Option<usize>,   // None => same as num_heads
     pub max_seq_len: usize,
 
-    /// Dropout probability
+    pub attention_type: AttentionType,
+    pub window_size: usize,
+
+    pub block_size: usize,
+    pub num_global_tokens: usize,
+    pub num_random_blocks: usize,
+
+    pub use_alibi: bool,
+    pub use_rope: bool,
+    pub causal: bool,
     pub dropout: f32,
 
-    /// Use bias in projections
-    pub use_bias: bool,
+    pub dtype: DataType,
+}
+
+impl AttentionConfig {
+    pub fn new(num_heads: usize, head_dim: usize) -> Self;
+
+    pub fn with_attention_type(self, attention_type: AttentionType) -> Self;
+    pub fn with_window_size(self, window_size: usize) -> Self;
+    pub fn with_causal(self, causal: bool) -> Self;
+    pub fn with_max_seq_len(self, max_seq_len: usize) -> Self;
+    pub fn with_num_kv_heads(self, num_kv_heads: usize) -> Self;
+    pub fn with_rope(self, use_rope: bool) -> Self;
+    pub fn with_alibi(self, use_alibi: bool) -> Self;
+
+    pub fn effective_num_kv_heads(&self) -> usize;
+    pub fn scale(&self) -> f32;            // head_dim^-0.5
+    pub fn validate(&self) -> Result<()>;
 }
 ```
 
@@ -654,185 +146,482 @@ pub struct AttentionConfig {
 
 ```rust
 pub enum AttentionType {
-    Standard,      // Standard scaled dot-product attention
-    Flash,         // Flash Attention
-    BlockSparse,   // Block sparse attention
+    Standard,      // Standard O(n^2) attention
+    Flash,         // Memory-efficient FlashAttention
     SlidingWindow, // Sliding window attention
-    Auto,          // Automatic selection
+    BlockSparse,   // Block sparse (Longformer / BigBird style)
+    Linear,        // Linear attention
+    Auto,          // Auto-select based on sequence length (default)
 }
 ```
 
-### `ModelConfig`
+### `DataType`
 
 ```rust
-pub struct ModelConfig {
-    /// Vocabulary size
-    pub vocab_size: usize,
+pub enum DataType { Float16, Float32, BFloat16 } // Default: Float32
+```
 
-    /// Hidden dimension
-    pub hidden_dim: usize,
+## Standard Attention
 
-    /// Number of attention heads
-    pub num_heads: usize,
+`StandardAttention` computes dense scaled dot-product attention.
 
-    /// Head dimension
-    pub head_dim: usize,
+```rust
+pub struct StandardAttention { /* private */ }
 
-    /// Number of transformer layers
-    pub num_layers: usize,
+impl StandardAttention {
+    pub fn new(config: AttentionConfig) -> Self;
 
-    /// Maximum sequence length
-    pub max_seq_len: usize,
+    pub fn forward(
+        &self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        q_shape: TensorShape,
+        kv_shape: TensorShape,
+        attention_mask: Option<&[f32]>,
+    ) -> Result<AttentionOutput>;
+}
+```
+
+## Flash Attention
+
+`FlashAttention` computes exact attention with blocked (tiled) accumulation
+for reduced peak memory.
+
+```rust
+pub struct FlashAttention { /* private */ }
+
+impl FlashAttention {
+    /// Default block sizes (64 x 64).
+    pub fn new(config: AttentionConfig) -> Self;
+
+    /// Custom tiling block sizes (block_m over queries, block_n over keys).
+    pub fn with_block_sizes(config: AttentionConfig, block_m: usize, block_n: usize) -> Self;
+
+    pub fn forward(
+        &self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        q_shape: TensorShape,
+        kv_shape: TensorShape,
+        attention_mask: Option<&[f32]>,
+    ) -> Result<AttentionOutput>;
+
+    /// Estimate working-set memory in bytes.
+    pub fn estimate_memory(&self, batch: usize, seq_len: usize) -> usize;
+}
+```
+
+## Linear Attention
+
+`LinearAttention` provides linear-complexity attention via a feature map.
+
+```rust
+pub struct LinearAttention { /* private */ }
+
+impl LinearAttention {
+    pub fn new(config: AttentionConfig) -> Self;
+
+    pub fn forward(
+        &self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        q_shape: TensorShape,
+        kv_shape: TensorShape,
+        attention_mask: Option<&[f32]>,
+    ) -> Result<AttentionOutput>;
+}
+```
+
+## Sliding Window Attention
+
+`SlidingWindowAttention` restricts each query to a local window
+(`config.window_size`). `DilatedSlidingWindowAttention` adds a dilation stride.
+
+```rust
+pub struct SlidingWindowAttention { /* private */ }
+
+impl SlidingWindowAttention {
+    pub fn new(config: AttentionConfig) -> Self;
+
+    pub fn forward(
+        &self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        q_shape: TensorShape,
+        kv_shape: TensorShape,
+        attention_mask: Option<&[f32]>,
+    ) -> Result<AttentionOutput>;
+
+    pub fn window_size(&self) -> usize;
+    pub fn estimate_memory(&self, batch: usize, seq_len: usize) -> usize;
+}
+
+pub struct DilatedSlidingWindowAttention { /* private */ }
+
+impl DilatedSlidingWindowAttention {
+    pub fn new(config: AttentionConfig, dilation: usize) -> Self;
+    pub fn forward(/* same signature as above */) -> Result<AttentionOutput>;
+}
+```
+
+## Block Sparse Attention
+
+`BlockSparseAttention` computes attention over a structured block pattern.
+`SparsePattern` is the block-level mask; `BigBirdPattern` builds
+global/window/random block index sets.
+
+Note: `forward` uses `q_shape` for the key/value layout as well, so all three
+buffers must match `q_shape`'s element count.
+
+```rust
+pub struct BlockSparseAttention { /* private */ }
+
+impl BlockSparseAttention {
+    pub fn new(config: AttentionConfig) -> Self;
+
+    /// Build the block-level sparsity pattern for a given sequence length.
+    pub fn build_pattern(&self, seq_len: usize) -> SparsePattern;
+
+    pub fn forward(
+        &self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        q_shape: TensorShape,
+        kv_shape: TensorShape,          // ignored; q_shape is used for KV
+        attention_mask: Option<&[f32]>, // ignored
+    ) -> Result<AttentionOutput>;
+
+    pub fn estimate_memory(&self, batch: usize, seq_len: usize) -> usize;
+}
+
+pub struct SparsePattern { /* private */ }
+
+impl SparsePattern {
+    pub fn new(num_blocks: usize, block_size: usize) -> Self;
+    pub fn set(&mut self, i: usize, j: usize, value: bool);
+    pub fn get(&self, i: usize, j: usize) -> bool;
+    pub fn count_active(&self) -> usize;
+    pub fn sparsity(&self) -> f32;
+}
+
+pub struct BigBirdPattern { /* private */ }
+
+impl BigBirdPattern {
+    pub fn new(num_global: usize, window_size: usize, num_random: usize) -> Self;
+    pub fn build(&self, seq_len: usize) -> Vec<Vec<usize>>;
+}
+```
+
+## RoPE and Positional Bias
+
+### `RotaryEmbedding`
+
+Rotary Position Embeddings applied in place to a flat buffer.
+
+```rust
+pub struct RotaryEmbedding { /* private */ }
+
+impl RotaryEmbedding {
+    pub fn new(head_dim: usize, max_seq_len: usize) -> Self;       // base = 10000.0
+    pub fn with_base(head_dim: usize, max_seq_len: usize, base: f32) -> Self;
+
+    /// Apply RoPE in place. `position_ids` defaults to 0..seq_len when None.
+    pub fn apply(&self, x: &mut [f32], shape: TensorShape, position_ids: Option<&[usize]>);
+
+    pub fn head_dim(&self) -> usize;
+    pub fn max_seq_len(&self) -> usize;
+}
+```
+
+### `ALiBiPositionalBias`
+
+```rust
+pub struct ALiBiPositionalBias { /* private */ }
+
+impl ALiBiPositionalBias {
+    pub fn new(num_heads: usize, max_seq_len: usize) -> Self;
+
+    /// Additive bias buffer for a [q_len, kv_len] score matrix per head.
+    pub fn compute_bias(&self, q_len: usize, kv_len: usize) -> Vec<f32>;
+    pub fn slopes(&self) -> &[f32];
+}
+```
+
+### Free function
+
+```rust
+/// Classic (non-rotary) sinusoidal position embedding vector.
+pub fn sinusoidal_position_embedding(position: usize, dim: usize) -> Vec<f32>;
+```
+
+## KV Cache
+
+Three cache backends are provided. All buffers are laid out for
+`[batch, seq_len, num_heads, head_dim]`.
+
+### `ContinuousKVCache`
+
+Contiguous per-layer cache that appends new tokens.
+
+```rust
+pub struct ContinuousKVCache { /* private */ }
+
+impl ContinuousKVCache {
+    pub fn new(
+        num_layers: usize,
+        batch_size: usize,
+        max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self;
+
+    /// Append KV for `layer`; returns the full cached (key, value) slices.
+    pub fn update(
+        &mut self,
+        layer: usize,
+        key: &[f32],
+        value: &[f32],
+        seq_len: usize,
+    ) -> Result<(&[f32], &[f32])>;
+
+    pub fn get(&self, layer: usize) -> Option<(&[f32], &[f32], usize)>;
+    pub fn reset(&mut self);
+    pub fn current_len(&self) -> usize;
+}
+```
+
+### `PagedKVCache`
+
+Block-paged cache (vLLM-style) with per-sequence block tables.
+
+```rust
+pub struct PagedKVCache { /* private */ }
+
+impl PagedKVCache {
+    pub fn new(num_blocks: usize, block_size: usize, num_heads: usize, head_dim: usize) -> Self;
+
+    pub fn allocate_sequence(&mut self, seq_id: usize, initial_tokens: usize) -> Result<()>;
+    pub fn update(/* see source */) -> Result<()>;
+    pub fn gather(&self, seq_id: usize) -> Result<(Vec<f32>, Vec<f32>)>;
+    pub fn free_sequence(&mut self, seq_id: usize);
+    pub fn num_free_blocks(&self) -> usize;
+    pub fn num_sequences(&self) -> usize;
+}
+```
+
+### `QuantizedKVCache`
+
+8-bit quantized cache with per-token scales.
+
+```rust
+pub struct QuantizedKVCache { /* private */ }
+
+impl QuantizedKVCache {
+    pub fn new(batch_size: usize, max_seq_len: usize, num_heads: usize, head_dim: usize) -> Self;
+
+    pub fn update(/* see source */) -> Result<...>;
+    pub fn get(&self) -> (Vec<f32>, Vec<f32>);   // dequantized
+    pub fn reset(&mut self);
+    pub fn memory_savings(&self) -> f32;
+}
+```
+
+## Auto-Selection
+
+`AutoSelectAttention` dispatches to Standard / Flash / SlidingWindow /
+BlockSparse based on sequence length and configured thresholds.
+
+```rust
+pub struct AutoSelectAttention { /* private */ }
+
+impl AutoSelectAttention {
+    pub fn new(config: AttentionConfig) -> Self;
+    pub fn with_thresholds(config: AttentionConfig, thresholds: SelectionThresholds) -> Self;
+    pub fn for_gpu(config: AttentionConfig, arch: GpuArchitecture) -> Self;
+
+    /// Which implementation would be chosen for `seq_len`.
+    pub fn select_impl(&self, seq_len: usize) -> AttentionType;
+
+    pub fn forward(
+        &self,
+        query: &[f32],
+        key: &[f32],
+        value: &[f32],
+        q_shape: TensorShape,
+        kv_shape: TensorShape,
+        attention_mask: Option<&[f32]>,
+    ) -> Result<AttentionOutput>;
+
+    pub fn estimate_memory(&self, batch: usize, seq_len: usize) -> usize;
+}
+
+pub struct SelectionThresholds {
+    pub flash_min: usize,
+    pub sliding_window_min: usize,
+    pub block_sparse_min: usize,
+}
+
+impl SelectionThresholds {
+    pub fn for_gpu(arch: GpuArchitecture) -> Self;
+}
+
+pub enum GpuArchitecture { A100, H100, V100, Generic }
+```
+
+`GpuArchitecture` only tunes the length thresholds used for algorithm
+selection; the crate itself performs all computation on the CPU.
+
+### Profiling and memory estimation helpers
+
+```rust
+pub struct AttentionProfiler { /* private */ }
+
+impl AttentionProfiler {
+    pub fn new() -> Self;
+    pub fn record(&mut self, seq_len: usize, impl_type: AttentionType, time_ms: f64);
+    pub fn average_time(&self, seq_len: usize, impl_type: AttentionType) -> Option<f64>;
+    pub fn best_impl(&self, seq_len: usize) -> Option<AttentionType>;
+    pub fn clear(&mut self);
+    pub fn timings(&self) -> &[(usize, AttentionType, f64)];
+}
+
+pub struct MemoryEstimator;
+
+impl MemoryEstimator {
+    pub fn standard(batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) -> usize;
+    pub fn flash(/* see source */) -> usize;
+    pub fn sliding_window(/* see source */) -> usize;
+    pub fn transformer(/* see source */) -> usize;
+    pub fn fits_in_memory(/* see source */) -> bool;
+    pub fn max_seq_len(/* see source */) -> usize;
+}
+```
+
+## Streaming Inference
+
+`StreamingInference` drives prefill + incremental decode over a KV cache;
+build it with `StreamingInferenceBuilder`.
+
+```rust
+pub struct StreamingInference { /* private */ }
+
+impl StreamingInference {
+    pub fn new(config: StreamingConfig) -> Self;
+
+    pub fn prefill(/* see source */) -> Result<...>;
+    pub fn decode_step(/* see source */) -> Result<...>;
+    pub fn forward(/* see source */) -> Result<...>;
+
+    pub fn reset(&mut self);
+    pub fn current_seq_len(&self) -> usize;
+    pub fn is_prefill_done(&self) -> bool;
+    pub fn remaining_capacity(&self) -> usize;
+}
+
+pub struct StreamingInferenceBuilder { /* private */ }
+
+impl StreamingInferenceBuilder {
+    pub fn new() -> Self;
+    pub fn num_layers(self, n: usize) -> Self;
+    pub fn batch_size(self, n: usize) -> Self;
+    pub fn max_seq_len(self, n: usize) -> Self;
+    pub fn num_heads(self, n: usize) -> Self;
+    pub fn head_dim(self, n: usize) -> Self;
+    pub fn causal(self, c: bool) -> Self;
+    pub fn standard_attention(self) -> Self;
+    pub fn flash_attention(self) -> Self;
+    pub fn sliding_window(self, window_size: usize) -> Self;
+    pub fn continuous_cache(self) -> Self;
+    pub fn paged_cache(self, block_size: usize, num_blocks: usize) -> Self;
+    pub fn quantized_cache(self) -> Self;
+    pub fn build(self) -> StreamingInference;
+}
+
+pub enum AttentionStrategy { /* see source */ }
+pub enum CacheStrategy { /* see source */ }
+
+pub struct StreamingConfig { /* fields; builder-style with_* setters */ }
+
+impl StreamingConfig {
+    pub fn new(/* see source */) -> Self;
+    pub fn with_attention_strategy(self, strategy: AttentionStrategy) -> Self;
+    pub fn with_cache_strategy(self, strategy: CacheStrategy) -> Self;
+    pub fn with_causal(self, causal: bool) -> Self;
 }
 ```
 
 ## Examples
 
-### Basic Usage
+### Standard forward pass
 
 ```rust
-use long_context_attention::{Attention, AttentionConfig, AttentionType};
-use ndarray::Array4;
-use ndarray_rand::RandomExt;
-use ndarray_rand::rand_distr::Uniform;
+use long_context_attention::{AttentionConfig, StandardAttention, TensorShape};
 
-fn main() {
-    // Configuration
-    let config = AttentionConfig {
-        attention_type: AttentionType::Auto,
-        num_heads: 8,
-        head_dim: 64,
-        max_seq_len: 2048,
-        dropout: 0.0,
-        use_bias: false,
-    };
+let batch = 2;
+let seq_len = 128;
+let num_heads = 8;
+let head_dim = 64;
 
-    // Create attention layer
-    let mut attention = Attention::new(config);
+let config = AttentionConfig::new(num_heads, head_dim).with_causal(true);
+let attn = StandardAttention::new(config);
 
-    // Generate random inputs
-    let batch_size = 2;
-    let seq_len = 1024;
-    let q = Array4::random((batch_size, 8, seq_len, 64), Uniform::new(-0.1, 0.1));
-    let k = Array4::random((batch_size, 8, seq_len, 64), Uniform::new(-0.1, 0.1));
-    let v = Array4::random((batch_size, 8, seq_len, 64), Uniform::new(-0.1, 0.1));
+let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+let n = shape.num_elements();
+let q = vec![0.01_f32; n];
+let k = vec![0.01_f32; n];
+let v = vec![0.01_f32; n];
 
-    // Forward pass
-    let output = attention.forward(&q.view(), &k.view(), &v.view());
-
-    println!("Output shape: {:?}", output.shape());
-}
+let out = attn.forward(&q, &k, &v, shape, shape, None).unwrap();
+assert_eq!(out.output.len(), n);
 ```
 
-### Autoregressive Generation with KV Cache
+### Auto-selecting an implementation
 
 ```rust
-use long_context_attention::{
-    Attention, AttentionConfig, AttentionType,
-    kv_cache::{KVCache, CacheConfig, EvictionPolicy, CompressionMethod},
-};
+use long_context_attention::{AttentionConfig, AutoSelectAttention, TensorShape};
 
-fn generate_tokens(prompt_tokens: Vec<i32>, max_new_tokens: usize) {
-    // Setup attention
-    let attention_config = AttentionConfig {
-        attention_type: AttentionType::Flash,
-        num_heads: 8,
-        head_dim: 64,
-        max_seq_len: 2048,
-        dropout: 0.0,
-        use_bias: false,
-    };
+let config = AttentionConfig::new(8, 64).with_max_seq_len(65_536);
+let attn = AutoSelectAttention::new(config);
 
-    let mut attention = Attention::new(attention_config);
+// Inspect which kernel would run for a given length.
+let chosen = attn.select_impl(32_768);
+println!("selected: {chosen:?}");
 
-    // Setup KV cache
-    let cache_config = CacheConfig {
-        max_seq_len: 2048,
-        max_batch_size: 1,
-        num_heads: 8,
-        head_dim: 64,
-        eviction_policy: EvictionPolicy::SlidingWindow,
-        compression: CompressionMethod::None,
-    };
-
-    let mut kv_cache = KVCache::new(cache_config);
-
-    // Process prompt
-    let prompt_len = prompt_tokens.len();
-    // ... compute prompt K, V ...
-    // kv_cache.append(&k_prompt, &v_prompt, 0);
-
-    // Generate new tokens
-    for i in 0..max_new_tokens {
-        let position = prompt_len + i;
-
-        // Get new token embeddings (would come from model)
-        // let q_new = ...
-        // let k_new = ...
-        // let v_new = ...
-
-        // Update cache
-        // kv_cache.append(&k_new, &v_new, position);
-
-        // Get full K, V from cache
-        // let (k_full, v_full) = kv_cache.get(0, position + 1);
-
-        // Compute attention
-        // let output = attention.forward(&q_new.view(), &k_full.view(), &v_full.view());
-
-        // ... rest of generation logic ...
-    }
-}
+let shape = TensorShape::new(1, 4096, 8, 64);
+let n = shape.num_elements();
+let (q, k, v) = (vec![0.0_f32; n], vec![0.0_f32; n], vec![0.0_f32; n]);
+let out = attn.forward(&q, &k, &v, shape, shape, None).unwrap();
 ```
 
-### Long Document Processing
+### Applying RoPE in place
 
 ```rust
-use long_context_attention::{
-    block_sparse::{BlockSparseAttention, SparsityConfig, BlockPattern},
-};
+use long_context_attention::{RotaryEmbedding, TensorShape};
 
-fn process_long_document(document_tokens: Vec<i32>) {
-    let seq_len = document_tokens.len();
+let head_dim = 64;
+let rope = RotaryEmbedding::new(head_dim, 4096);
 
-    // Use block sparse for very long documents
-    let config = SparsityConfig {
-        block_size: 128,
-        sparsity_ratio: 0.95, // 95% sparse
-        pattern: BlockPattern::GlobalLocal,
-        local_window: 512,
-        global_tokens: (0..seq_len).step_by(1024).collect(), // Every 1024th token is global
-    };
-
-    let mut attention = BlockSparseAttention::new(config, seq_len, 64);
-
-    // Process document in chunks if needed
-    // ...
-}
+let shape = TensorShape::new(1, 128, 8, head_dim);
+let mut q = vec![0.01_f32; shape.num_elements()];
+rope.apply(&mut q, shape, None); // positions 0..seq_len
 ```
 
-### Custom Attention Pattern
+### Autoregressive decode with a KV cache
 
 ```rust
-use long_context_attention::{
-    block_sparse::{BlockSparseAttention, SparsityConfig, BlockPattern},
-};
+use long_context_attention::ContinuousKVCache;
 
-fn create_custom_pattern() {
-    let config = SparsityConfig {
-        block_size: 64,
-        sparsity_ratio: 0.8,
-        pattern: BlockPattern::Adaptive, // Will adapt based on content
-        local_window: 256,
-        global_tokens: vec![0], // First token always global
-    };
+let (num_layers, batch, max_seq, heads, head_dim) = (1, 1, 2048, 8, 64);
+let mut cache = ContinuousKVCache::new(num_layers, batch, max_seq, heads, head_dim);
 
-    let mut attention = BlockSparseAttention::new(config, 2048, 64);
-
-    // Generate and inspect pattern
-    let pattern = attention.generate_pattern(2048);
-
-    // Pattern is a boolean matrix indicating which blocks are active
-    println!("Active blocks: {}", pattern.iter().filter(|&&x| x).count());
-}
+// Append one token's KV to layer 0; get back the full cached slices.
+let step = heads * head_dim;
+let (k_new, v_new) = (vec![0.0_f32; step], vec![0.0_f32; step]);
+let (k_full, v_full) = cache.update(0, &k_new, &v_new, 1).unwrap();
+assert_eq!(k_full.len(), v_full.len());
 ```
