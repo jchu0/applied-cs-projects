@@ -437,6 +437,15 @@ and optimizer state) and a small JSON sidecar (ids, step, param names, clocks) m
 operator can inspect what a checkpoint contains via `get_checkpoint_info` without paying to
 deserialize gigabytes of weights.
 
+**Security note.** Checkpoints are pickled, so `load_checkpoint` runs `pickle.load`, which
+executes arbitrary code embedded in the file — only ever load files you produced or fully
+trust. As a low-cost guard against loading a stray file, `load_checkpoint` resolves the
+requested path (following `..` and symlinks) and refuses anything outside the manager's
+`storage_path`, the documented trusted directory, unless the caller explicitly opts in with
+`allow_external=True`. This narrows the footgun without changing the serialization format;
+the honest fix for untrusted input would be a safe codec, which is out of scope for this
+trust-required, in-process design.
+
 **`ReplicaManager`** (in `fault_tolerance/replica.py`) mirrors parameter updates to
 backup servers under three `ReplicationStrategy` modes — `SYNC` (await all replicas),
 `ASYNC` (fire-and-forget), and `QUORUM` (await a majority, then cancel the rest). It
@@ -542,8 +551,16 @@ rejects absurd messages. `RpcServer` registers named async handlers and serves t
 by a lock). `serve_parameter_server(server)` registers `pull` and `push` handlers that
 delegate to a `ParameterServer`, and `RemoteParameterServer` is a client proxy exposing
 the same `pull`/`push` signatures, so it is a drop-in for the in-process shard from a
-worker's perspective. Because the payloads are pickled, the transport is for trusted
-internal networks only.
+worker's perspective.
+
+**Security note.** The payloads are pickled, so `_read_msg` unpickles peer input, and
+`pickle.loads` executes arbitrary code from the byte stream. The transport has **no
+authentication, no TLS, and no integrity check**, which makes it an arbitrary-code-execution
+sink on untrusted input. It is therefore for **trusted peers on a trusted internal network
+only**: `serve_parameter_server` defaults `host` to loopback (`127.0.0.1`) deliberately, and
+it must never be bound to a public interface or connected to a peer you do not fully control.
+Crossing an untrusted boundary would require a mutually authenticated, encrypted tunnel and a
+safe wire codec — deliberately out of scope for this trust-required design.
 
 The framing is minimal but complete: `_read_msg` reads the 4-byte length, guards it
 against `_MAX_MSG_BYTES` (256 MiB), then reads exactly that many bytes and unpickles;
@@ -741,7 +758,7 @@ windows keep that measurement cheap and bounded.
 
 ## Testing Strategy
 
-Tests live in `tests/` — 412 test functions across 21 files (~5,800 lines), configured
+Tests live in `tests/` — 423 test functions across 21 files (~5,900 lines), configured
 for `pytest` with `asyncio_mode = "auto"` so `async def` tests run directly. No external
 services are required; transport tests bind to loopback only.
 

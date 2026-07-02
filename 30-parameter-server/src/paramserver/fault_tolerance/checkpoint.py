@@ -1,4 +1,14 @@
-"""Checkpointing system for fault tolerance."""
+"""Checkpointing system for fault tolerance.
+
+.. warning::
+   **SECURITY: checkpoints are serialized with** :mod:`pickle`. Loading a
+   checkpoint calls :func:`pickle.load`, which executes arbitrary code embedded
+   in the file. Only ever load checkpoint files you produced yourself or that
+   come from a fully trusted source. Never load a ``.pkl`` file received over an
+   untrusted channel. As a guard, :meth:`CheckpointManager.load_checkpoint`
+   refuses paths outside its ``storage_path`` directory unless the caller
+   explicitly opts in with ``allow_external=True``.
+"""
 
 import asyncio
 import json
@@ -43,6 +53,11 @@ class CheckpointManager:
 
     Handles saving, loading, and rotating checkpoints. Supports both
     synchronous and asynchronous save operations.
+
+    .. warning::
+       **SECURITY:** checkpoints are pickled, so loading one executes arbitrary
+       code from the file. Only load trusted files. Loads are restricted to
+       ``storage_path`` by default (see :meth:`load_checkpoint`).
 
     Attributes:
         storage_path: Directory for storing checkpoints.
@@ -166,14 +181,29 @@ class CheckpointManager:
     async def load_checkpoint(
         self,
         checkpoint_path: Optional[str] = None,
+        allow_external: bool = False,
     ) -> Optional[Checkpoint]:
         """Load a checkpoint.
 
+        .. warning::
+           **SECURITY:** checkpoints are unpickled, which executes arbitrary code
+           embedded in the file. Only load files you trust. To reduce this
+           footgun, loads are restricted to this manager's ``storage_path`` (the
+           documented trusted directory). Loading a path outside it raises
+           :class:`ValueError` unless you explicitly pass ``allow_external=True``
+           to confirm you trust the file.
+
         Args:
             checkpoint_path: Path to checkpoint. If None, loads latest.
+            allow_external: Permit loading a path outside ``storage_path``. Only
+                set this when you fully trust the source of the file.
 
         Returns:
             Loaded Checkpoint or None if not found.
+
+        Raises:
+            ValueError: If ``checkpoint_path`` is outside ``storage_path`` and
+                ``allow_external`` is False.
         """
         if checkpoint_path is None:
             checkpoint_path = self.get_latest_checkpoint()
@@ -181,6 +211,14 @@ class CheckpointManager:
         if checkpoint_path is None or not Path(checkpoint_path).exists():
             logger.warning("No checkpoint found to load (path=%s)", checkpoint_path)
             return None
+
+        if not allow_external and not self._is_within_storage(checkpoint_path):
+            raise ValueError(
+                f"Refusing to load checkpoint {checkpoint_path!r}: it is outside the "
+                f"trusted storage directory {str(self.storage_path)!r}. Checkpoints "
+                "are unpickled (arbitrary code execution); pass allow_external=True "
+                "only if you fully trust this file."
+            )
 
         checkpoint = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -193,8 +231,28 @@ class CheckpointManager:
         )
         return checkpoint
 
+    def _is_within_storage(self, path: str) -> bool:
+        """Return True if ``path`` resolves to a file inside ``storage_path``.
+
+        Used to guard :meth:`load_checkpoint` against loading (and thus
+        unpickling) files from arbitrary locations. Resolves both paths so
+        ``..`` traversal and symlinks cannot escape the trusted directory.
+        """
+        try:
+            base = self.storage_path.resolve()
+            target = Path(path).resolve()
+        except OSError:  # pragma: no cover - resolution failure is treated as outside
+            return False
+        return target == base or base in target.parents
+
     def _load_from_file(self, path: str) -> Checkpoint:
-        """Load checkpoint from file (blocking)."""
+        """Load checkpoint from file (blocking).
+
+        .. warning::
+           **SECURITY:** uses :func:`pickle.load`, which executes arbitrary code
+           from the file. Only call on trusted files. Public loads go through
+           :meth:`load_checkpoint`, which restricts paths to ``storage_path``.
+        """
         with open(path, "rb") as f:
             return pickle.load(f)
 

@@ -161,6 +161,23 @@ await remote.push({"w": np.ones(8, dtype=np.float32)}, worker_id=1, clock=0)
   random gradients/batches for testing). The transport uses `pickle` on the wire for
   NumPy payloads and is for trusted internal networks only.
 
+## Security
+
+This library is designed for a single trusted process (and, optionally, trusted peers on
+a trusted internal network). It is **not** hardened for untrusted input:
+
+- **Pickle on the wire.** `transport.py` serializes RPC messages with `pickle`.
+  `pickle.loads` executes arbitrary code embedded in the byte stream, and the transport
+  has **no authentication, no TLS, and no integrity check**. Only serve/connect to peers
+  you fully control, and never bind to a public interface (`serve_parameter_server`
+  defaults to loopback `127.0.0.1` for this reason). To cross an untrusted boundary, put
+  it behind a mutually authenticated encrypted tunnel and replace pickle with a safe codec.
+- **Pickle in checkpoints.** `CheckpointManager` saves and loads checkpoints with
+  `pickle`, so loading a checkpoint also executes arbitrary code. **Only load checkpoint
+  files you produced or fully trust.** As a guard, `load_checkpoint` refuses paths outside
+  the manager's `storage_path` (the documented trusted directory, resolving `..` and
+  symlinks) unless you explicitly pass `allow_external=True`.
+
 ## Testing
 
 ```bash
@@ -168,7 +185,7 @@ pytest tests/ -v
 pytest tests/ --cov=src/paramserver --cov-report=term-missing
 ```
 
-The suite has 412 test functions across 21 files (~5,800 lines) covering sharding,
+The suite has 423 test functions across 21 files (~5,900 lines) covering sharding,
 push/pull and buffering, every consistency model, all optimizers and schedulers,
 compression round-trips, mixed precision, checkpoint save/load/rotation, replication and
 failover, health monitoring, metrics, staleness control, and the TCP transport. No
@@ -190,7 +207,7 @@ external services are required; transport tests bind to loopback only.
     consistency/                # Hogwild!, BSP, SSP, ConsistencyManager
     fault_tolerance/            # checkpoint, replica, health
     enterprise/                 # compression, mixed precision, staleness, metrics
-  tests/                        # 412 tests across 21 files
+  tests/                        # 423 tests across 21 files
   docs/BLUEPRINT.md             # full architecture and design
 ```
 

@@ -9,8 +9,18 @@ over the network.
 
 Wire protocol: each message is a 4-byte big-endian length prefix followed by a
 pickled ``dict``. Pickle is used because gradients and parameters are NumPy
-arrays; **only use this on a trusted internal network** — unpickling executes
-arbitrary code, so it must never be exposed to untrusted clients.
+arrays.
+
+.. warning::
+   **SECURITY: this transport is for trusted peers on a trusted network only.**
+   The wire protocol serializes messages with :mod:`pickle`, and
+   :func:`pickle.loads` executes arbitrary code embedded in the byte stream.
+   A malicious or compromised peer can therefore achieve arbitrary code
+   execution in this process. There is **no authentication, no TLS, and no
+   integrity check** on the wire. Never bind this server to a public interface
+   and never connect it to a peer you do not fully control. If you need to cross
+   an untrusted boundary, put this behind a mutually authenticated, encrypted
+   tunnel and swap pickle for a safe codec first.
 """
 
 from __future__ import annotations
@@ -35,6 +45,8 @@ class RpcError(Exception):
 
 
 async def _read_msg(reader: asyncio.StreamReader) -> Any:
+    # SECURITY: pickle.loads executes arbitrary code from the peer. Only ever
+    # read from a fully trusted peer on a trusted network. See module docstring.
     header = await reader.readexactly(_LEN.size)
     (length,) = _LEN.unpack(header)
     if length > _MAX_MSG_BYTES:
@@ -155,6 +167,13 @@ async def serve_parameter_server(
     Registers ``pull`` and ``push`` methods that delegate to the shard's async
     API, then starts listening. Returns the running :class:`RpcServer` (use
     ``rpc.port`` for the bound port and ``await rpc.stop()`` to shut down).
+
+    .. warning::
+       **SECURITY:** the RPC layer uses :mod:`pickle` on the wire with no auth
+       or TLS, so unpickling a request runs arbitrary code from the client. Only
+       serve to trusted peers on a trusted network; ``host`` defaults to
+       loopback (``127.0.0.1``) for this reason — do not widen it to ``0.0.0.0``
+       or a public interface. See the module docstring for details.
     """
     rpc = RpcServer(host, port)
 
@@ -183,6 +202,11 @@ class RemoteParameterServer:
 
     Drop-in for the in-process ``ParameterServer`` from a worker's perspective:
     ``pull`` and ``push`` behave the same, but travel over a real socket.
+
+    .. warning::
+       **SECURITY:** responses are unpickled, which executes arbitrary code from
+       the server. Only connect to a server you fully trust on a trusted
+       network. See the module docstring for details.
     """
 
     def __init__(self, host: str, port: int):
