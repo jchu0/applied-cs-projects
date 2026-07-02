@@ -186,6 +186,106 @@ class TestConv2d:
         assert len(params) == 1  # only weight
         assert layer.bias is None
 
+    def test_conv2d_gradient_exists(self):
+        """Conv2d backward populates input and parameter gradients (non-zero)."""
+        np.random.seed(0)
+        layer = Conv2d(2, 3, kernel_size=3, stride=1, padding=1)
+        x = Tensor(np.random.randn(2, 2, 5, 5).astype(np.float32), requires_grad=True)
+
+        y = layer(x)
+        y.sum().backward()
+
+        assert x.grad is not None and x.grad.shape == x.shape
+        assert layer.weight.grad is not None
+        assert layer.weight.grad.shape == layer.weight.shape
+        assert layer.bias.grad is not None
+        assert layer.bias.grad.shape == layer.bias.shape
+        # The stub returned all zeros; a real backward must not.
+        assert not np.allclose(x.grad, 0)
+        assert not np.allclose(layer.weight.grad, 0)
+
+    def test_conv2d_numerical_gradient_dx(self):
+        """Finite-difference check of Conv2d input gradient (dx)."""
+        np.random.seed(1)
+        layer = Conv2d(2, 3, kernel_size=3, stride=1, padding=1)
+        x_data = np.random.randn(2, 2, 5, 5).astype(np.float32)
+
+        x = Tensor(x_data.copy(), requires_grad=True)
+        y = layer(x)
+        y.sum().backward()
+
+        def f(inp):
+            return layer(inp)
+
+        num_grad = numerical_gradient(f, x_data)
+        np.testing.assert_allclose(x.grad, num_grad, rtol=0.05, atol=0.02)
+
+    def test_conv2d_numerical_gradient_dw(self):
+        """Finite-difference check of Conv2d weight gradient (dW)."""
+        np.random.seed(2)
+        layer = Conv2d(2, 3, kernel_size=3, stride=1, padding=0)
+        x_data = np.random.randn(1, 2, 5, 5).astype(np.float32)
+        w_data = layer.weight.data.copy()
+
+        x = Tensor(x_data.copy(), requires_grad=True)
+        y = layer(x)
+        y.sum().backward()
+        analytic_dw = layer.weight.grad.copy()
+
+        # Numerical gradient of sum(conv(x, W)) w.r.t. each weight element.
+        def f_w(w):
+            probe = Conv2d(2, 3, kernel_size=3, stride=1, padding=0)
+            probe.weight.data = w.data
+            if probe.bias is not None:
+                probe.bias.data = layer.bias.data.copy()
+            return probe(Tensor(x_data.copy()))
+
+        num_dw = numerical_gradient(f_w, w_data)
+        np.testing.assert_allclose(analytic_dw, num_dw, rtol=0.05, atol=0.02)
+
+    def test_conv2d_numerical_gradient_db(self):
+        """Finite-difference check of Conv2d bias gradient (db)."""
+        np.random.seed(3)
+        layer = Conv2d(2, 3, kernel_size=3, stride=2, padding=1)
+        x_data = np.random.randn(2, 2, 6, 6).astype(np.float32)
+        b_data = layer.bias.data.copy()
+
+        x = Tensor(x_data.copy(), requires_grad=True)
+        y = layer(x)
+        y.sum().backward()
+        analytic_db = layer.bias.grad.copy()
+
+        def f_b(b):
+            probe = Conv2d(2, 3, kernel_size=3, stride=2, padding=1)
+            probe.weight.data = layer.weight.data.copy()
+            probe.bias.data = b.data
+            return probe(Tensor(x_data.copy()))
+
+        num_db = numerical_gradient(f_b, b_data)
+        np.testing.assert_allclose(analytic_db, num_db, rtol=0.05, atol=0.02)
+
+    def test_conv2d_trainable(self):
+        """Conv2d can be trained: loss decreases with SGD on its parameters."""
+        np.random.seed(4)
+        layer = Conv2d(1, 1, kernel_size=3, padding=1)
+        x_data = np.random.randn(1, 1, 6, 6).astype(np.float32)
+        target = np.random.randn(1, 1, 6, 6).astype(np.float32)
+        loss_fn = MSELoss()
+
+        losses = []
+        for _ in range(30):
+            x = Tensor(x_data.copy())
+            layer.zero_grad()
+            pred = layer(x)
+            loss = loss_fn(pred, Tensor(target))
+            loss.backward()
+            for p in layer.parameters():
+                if p.grad is not None:
+                    p.data -= 0.05 * p.grad
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0]
+
 
 class TestBatchNorm1d:
     """Test BatchNorm1d layer."""

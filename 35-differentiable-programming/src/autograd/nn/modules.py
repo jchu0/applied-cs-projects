@@ -160,10 +160,59 @@ class Conv2d(Module):
         result = Tensor(out, requires_grad=x.requires_grad or self.weight.requires_grad)
 
         if result.requires_grad:
+            # Capture everything the backward pass needs.
+            padded_shape = padded.shape
+            stride = self.stride
+            padding = self.padding
+            out_channels = self.out_channels
+
             def grad_fn(g):
-                # Gradient w.r.t input
-                # Simplified backward pass
-                return np.zeros_like(x.data)
+                # g: (N, out_channels, H_out, W_out)
+                # Reshape upstream grad to match the (rows, out_channels) layout
+                # used in the forward matmul: rows = N * H_out * W_out.
+                g_col = g.transpose(0, 2, 3, 1).reshape(N * H_out * W_out, out_channels)
+
+                # Weight gradient: correlation of input columns with upstream
+                # grad. col is (rows, C*K*K); dW_col is (C*K*K, out_channels).
+                dW_col = col.T @ g_col
+                dW = dW_col.T.reshape(self.weight.data.shape)
+                if self.weight.requires_grad:
+                    self.weight.grad = (
+                        dW if self.weight.grad is None else self.weight.grad + dW
+                    )
+
+                # Bias gradient: sum upstream grad over batch and spatial dims.
+                if self.bias is not None and self.bias.requires_grad:
+                    db = g_col.sum(axis=0)
+                    self.bias.grad = (
+                        db if self.bias.grad is None else self.bias.grad + db
+                    )
+
+                # Input gradient: scatter (col2im) the product of upstream grad
+                # with the kernel back into the padded input, then remove pad.
+                if not x.requires_grad:
+                    return None
+
+                dcol = g_col @ weight_col.T  # (rows, C*K*K)
+                dcol = dcol.reshape(N, H_out, W_out, C, K, K).transpose(
+                    0, 3, 4, 5, 1, 2
+                )  # (N, C, K, K, H_out, W_out)
+
+                dpadded = np.zeros(padded_shape, dtype=np.float64)
+                for i in range(K):
+                    i_max = i + stride * H_out
+                    for j in range(K):
+                        j_max = j + stride * W_out
+                        dpadded[:, :, i:i_max:stride, j:j_max:stride] += dcol[
+                            :, :, i, j, :, :
+                        ]
+
+                if padding > 0:
+                    dx = dpadded[:, :, padding:padding + H, padding:padding + W]
+                else:
+                    dx = dpadded
+                return dx.astype(x.data.dtype)
+
             result._set_grad_fn(grad_fn, [x])
 
         return result

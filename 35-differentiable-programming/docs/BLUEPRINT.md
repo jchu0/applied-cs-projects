@@ -29,11 +29,12 @@ parameter, how broadcasting interacts with differentiation, why numerical gradie
 is the standard correctness test for an autodiff system, and how optimizers turn gradients
 into parameter updates.
 
-Scope is deliberately narrow. The framework targets dense (fully connected) networks and
-the operations needed to train them. It uses Python recursion for graph traversal, keeps
-everything in float32 NumPy arrays, and runs single-threaded. It is not a production engine:
-there is no operator fusion, no GPU backend, no gradient checkpointing, and convolution is
-forward-only. Those boundaries are stated explicitly in the relevant sections.
+Scope is deliberately narrow. The framework targets dense (fully connected) and small
+convolutional networks and the operations needed to train them. Graph traversal is an
+iterative reverse-topological walk (no Python recursion, so depth is unbounded), everything
+is kept in float32 NumPy arrays, and it runs single-threaded. It is not a production engine:
+there is no operator fusion, no GPU backend, and no gradient checkpointing. Those boundaries
+are stated explicitly in the relevant sections.
 
 ## Architecture
 
@@ -53,7 +54,7 @@ flowchart TD
     end
     subgraph Backward
         B(Tensor.backward parens)
-        A(Recursive accumulation into leaves)
+        A(Iterative reverse-topological accumulation into leaves)
     end
     subgraph Train
         L(Loss: MSELoss, CrossEntropyLoss)
@@ -74,9 +75,9 @@ The system is **define-by-run**: there is no separate graph-construction phase. 
 operation immediately computes the forward result and, if any input requires gradients,
 attaches a backward closure and the list of input tensors to the output tensor. The "graph"
 is therefore just the network of `Tensor` objects linked through their `_grad_fn` and
-`_inputs` fields. When `backward()` is called on a scalar loss, it recursively visits this
-linked structure in reverse, calling each node's backward closure and threading the upstream
-gradient through.
+`_inputs` fields. When `backward()` is called on a scalar loss, it builds a topological order
+of this linked structure and walks it in reverse, calling each node's backward closure once
+with its fully accumulated gradient and threading the result to that node's inputs.
 
 ### Layering
 
@@ -151,48 +152,77 @@ of the graph without polluting it.
 
 ### The backward pass
 
-The heart of the system is `Tensor.backward`:
+The heart of the system is `Tensor.backward`, an *iterative* reverse-mode pass:
 
 ```python
 def backward(self, grad=None):
     if not self.requires_grad:
         return
-
     if grad is None:
         grad = np.ones_like(self.data)
 
-    # Accumulate gradient on this tensor
-    if self.grad is None:
-        self.grad = grad.copy()
-    else:
-        self.grad += grad
+    # 1. Build a topological order via explicit-stack DFS (post-order),
+    #    visiting each node with a grad_fn exactly once.
+    topo, visited = [], set()
+    stack = [[self, 0]]
+    visited.add(id(self))
+    while stack:
+        frame = stack[-1]
+        node, child_idx = frame
+        if node._grad_fn is not None and child_idx < len(node._inputs):
+            frame[1] += 1
+            child = node._inputs[child_idx]
+            if (child.requires_grad and child._grad_fn is not None
+                    and id(child) not in visited):
+                visited.add(id(child))
+                stack.append([child, 0])
+        else:
+            topo.append(node)
+            stack.pop()
 
-    # Propagate to inputs
-    if self._grad_fn is not None:
-        input_grads = self._grad_fn(grad)
+    # 2. Walk nodes in reverse-topological order. Each node's incoming grad is
+    #    fully summed over consumers before the node is processed, so grad_fn
+    #    runs once with the total gradient.
+    incoming = {id(self): grad}
+    for node in reversed(topo):
+        g = incoming.get(id(node))
+        if g is None:
+            continue
+        node.grad = g.copy() if node.grad is None else node.grad + g
+        if node._grad_fn is None:
+            continue
+        input_grads = node._grad_fn(g)
         if not isinstance(input_grads, (list, tuple)):
             input_grads = [input_grads]
-
-        for inp, g in zip(self._inputs, input_grads):
-            if inp.requires_grad and g is not None:
-                inp.backward(g)
+        for inp, ig in zip(node._inputs, input_grads):
+            if not inp.requires_grad or ig is None:
+                continue
+            if inp._grad_fn is None:          # leaf: accumulate directly
+                inp.grad = ig.copy() if inp.grad is None else inp.grad + ig
+            else:                             # interior: defer until visited
+                key = id(inp)
+                incoming[key] = ig if key not in incoming else incoming[key] + ig
 ```
 
-This is reverse-mode automatic differentiation implemented as a depth-first recursion:
+The pass proceeds in two phases:
 
-1. If the tensor does not require gradients, stop.
-2. If no upstream gradient is supplied (the usual case for a scalar loss), seed it with
+1. If no upstream gradient is supplied (the usual case for a scalar loss), seed it with
    ones — `d(loss)/d(loss) = 1`.
-3. Accumulate the incoming gradient into `self.grad`. Accumulation (rather than assignment)
-   is what makes gradients correct when a tensor is used in more than one place.
-4. If this tensor has a `grad_fn`, call it with the upstream gradient to get the gradient
-   with respect to each input, then recurse into each input that requires gradients.
+2. **Topological sort.** An explicit-stack DFS produces a post-order list, so a node always
+   appears *after* every node it feeds. There is no Python recursion, so a graph thousands of
+   ops deep cannot exceed the interpreter's recursion limit.
+3. **Reverse walk.** Iterating that list in reverse means every consumer of a node is
+   processed before the node itself, so by the time a node is reached its incoming gradient
+   has been fully summed over all consumers. Each `grad_fn` therefore runs *exactly once* with
+   the node's total gradient. This both eliminates the redundant re-visits a naive recursion
+   would perform on diamond-shaped graphs and gives side-effecting closures (`BatchNorm1d`,
+   `LayerNorm`, `Conv2d`, which accumulate parameter gradients by hand) the correct total
+   gradient a single time.
 
-Because traversal is plain Python recursion over `_inputs`, the graph is walked once per
-edge from the root. Every operation's backward closure implements the local vector-Jacobian
-product; chaining them through the recursion realizes the chain rule. The design is simple
-and direct; its cost is that very deep graphs can exceed Python's recursion limit, and a
-node reachable by many paths is visited multiple times.
+Every operation's backward closure implements the local vector-Jacobian product; chaining
+them through the reverse walk realizes the chain rule. Accumulation (rather than assignment)
+into `self.grad` — and into the deferred `incoming` map for interior nodes — is what makes
+gradients correct when a tensor is used in more than one place.
 
 ### Gradient context managers
 
@@ -418,8 +448,15 @@ all parameters.
   column matrix where each row is one receptive field flattened across `(C, K, K)`; a single
   matrix multiply with the reshaped weight produces all output positions at once, and the
   result is reshaped back to `(N, out_channels, H_out, W_out)`. Output spatial size follows
-  `(H + 2*padding - K) / stride + 1`. Its backward closure currently returns a zero gradient,
-  so the layer is usable for forward inference but not trainable.
+  `(H + 2*padding - K) / stride + 1`. Its backward closure is the full transpose of that
+  forward pass and makes the layer trainable: the weight gradient is `col.T @ g_col` (the
+  correlation of the input columns with the reshaped upstream grad), the bias gradient is the
+  upstream grad summed over batch and spatial positions, and the input gradient is a col2im
+  scatter — `g_col @ weight_col.T` reshaped back into receptive-field patches and accumulated
+  into the padded input with the same strided-slice indexing the forward pass used, after
+  which the padding is cropped away. Like `BatchNorm1d`/`LayerNorm`, the weight and bias
+  gradients are accumulated by hand into the parameter tensors inside the closure. All three
+  gradients (`dx`, `dW`, `db`) are verified against finite differences.
 - **`BatchNorm1d`** normalizes across the batch using batch statistics during training and
   running statistics during evaluation. Running mean and variance are updated with momentum
   during training so they can stand in for batch statistics at inference time. It implements
@@ -512,20 +549,22 @@ the expression builds a small graph: `__pow__` produces `x2 = x**2` (with a clos
 `2*x`), `__rmul__`/`mul` produces `3x` (closure `3`), the two `add` nodes combine them with
 the constant. Each intermediate tensor records its `grad_fn` and `_inputs`.
 
-Calling `y.backward()` seeds the root with `1.0` and recurses:
+Calling `y.backward()` topologically sorts the graph, seeds the root with `1.0`, and walks
+the nodes in reverse:
 
 1. The outer `add` distributes `1.0` to both of its inputs unchanged (its derivative is the
-   identity for each operand).
-2. The `x**2` node receives `1.0`, multiplies by its captured derivative `2*x = 4.0`, and
-   recurses into `x`, accumulating `4.0` into `x.grad`.
-3. The `3*x` node receives `1.0`, multiplies by `3`, and recurses into `x`, accumulating
-   `3.0` — so `x.grad` becomes `4.0 + 3.0 = 7.0`.
+   identity for each operand), depositing a contribution into each input's entry in the
+   deferred-gradient map.
+2. The `x**2` node, once reached, receives `1.0`, multiplies by its captured derivative
+   `2*x = 4.0`, and deposits `4.0` into `x`'s gradient.
+3. The `3*x` node deposits `1.0 * 3 = 3.0` into `x`. Because `x` is a leaf reached along two
+   distinct paths, these deposits accumulate to `4.0 + 3.0 = 7.0`.
 
 The result `x.grad == [7.0]` matches the analytic derivative `2x + 3 = 7`. The crucial detail
-is step 3: `x` is reached along two distinct paths, and because `backward()` *accumulates*
-into `self.grad` rather than overwriting it, both contributions are summed correctly. This is
-why gradient accumulation, not assignment, is the right default, and it is checked directly by
-`test_multiple_paths`.
+is that `x` is reached along two paths and the engine *accumulates* rather than overwriting —
+both for interior nodes (summed in the `incoming` map before the node is processed once) and
+for leaves like `x` (summed directly into `.grad`). This is why gradient accumulation, not
+assignment, is the right default, and it is checked directly by `test_multiple_paths`.
 
 ## Data Structures
 
@@ -686,36 +725,36 @@ practical:
 - **In-place optimizer state.** Optimizer buffers are allocated once and updated in place;
   memory is `O(parameters)` and constant across steps.
 
-Costs and limits are equally explicit. Graph traversal is recursive Python, so memory and
-call-stack depth grow with graph depth, and a node reachable along several paths is revisited
-once per path rather than processed once in topological order. Everything runs in float32 on
-CPU, single-threaded. There is no operator fusion, no GPU backend, and no gradient
-checkpointing. No throughput or latency benchmarks are claimed; the project ships no
-benchmark suite, so any specific numbers would be invented.
+Costs and limits are equally explicit. Graph traversal builds an explicit topological order
+and processes each node exactly once, so shared nodes on diamond-shaped graphs are not
+recomputed and there is no recursion-depth ceiling; the cost is `O(nodes)` auxiliary memory
+for the topo list and the deferred-gradient map. Everything runs in float32 on CPU,
+single-threaded. There is no operator fusion, no GPU backend, and no gradient checkpointing.
+No throughput or latency benchmarks are claimed; the project ships no benchmark suite, so any
+specific numbers would be invented.
 
 ### Design rationale and trade-offs
 
-The recursive backward pass is the most consequential design choice. A production engine
-builds an explicit topological order and processes each node exactly once, which both bounds
-stack depth and avoids redundant work on diamond-shaped graphs. This framework instead
-recurses directly over `_inputs`, which keeps the engine to a few lines and makes the chain
-rule transparent — the recursion *is* the chain rule — at the cost of revisiting shared nodes
-and risking a `RecursionError` on very deep graphs. For the dense networks and test workloads
-this project targets, neither cost bites in practice, and the clarity is worth it.
+The backward pass is the most consequential design choice. It builds an explicit topological
+order (via an iterative, explicit-stack DFS) and processes each node exactly once. This both
+bounds stack usage — deep graphs cannot raise `RecursionError` — and avoids the redundant work
+a naive recursion would do on diamond-shaped graphs where a node is reachable along several
+paths. The trade-off is `O(nodes)` auxiliary memory and slightly more machinery than a direct
+recursion, but the reverse walk still mirrors the chain rule node-by-node, so the mechanics
+stay legible.
 
 Two further choices follow the same "clarity over generality" principle. Closures capture
 exactly the values each backward pass needs (an operand, a forward output, a mask) rather
 than a generic tape of saved tensors, so each gradient reads like its textbook formula.
-And modules whose parameters are not produced by a tracked op — `BatchNorm1d`, `LayerNorm` —
-write those parameters' gradients by hand inside their closures, which keeps the layer
-self-contained at the price of duplicating the engine's accumulate-or-initialize convention.
-The `Conv2d` backward stub is the one place this honesty cuts against the user: the forward
-pass is genuine im2col, but because the backward returns zeros, the layer must be treated as
-inference-only until a real gradient is implemented.
+And modules whose parameters are not produced by a tracked op — `Conv2d`, `BatchNorm1d`,
+`LayerNorm` — write those parameters' gradients by hand inside their closures, which keeps
+each layer self-contained at the price of duplicating the engine's accumulate-or-initialize
+convention. Because the engine now invokes each closure exactly once with the node's total
+gradient, this hand-accumulation is safe even when a layer's output feeds several consumers.
 
 ## Testing Strategy
 
-Correctness is verified by a 140-test pytest suite spanning three files, with numerical
+Correctness is verified by a 149-test pytest suite spanning three files, with numerical
 gradient checking as the backbone for the autodiff layer.
 
 ### Numerical gradient checking
@@ -749,19 +788,22 @@ applied to `mul`, `div`, `matmul`, `exp`, `log`, `sqrt`, `sin`, `cos`, `tanh`, `
 
 ### Operation tests
 
-`tests/test_operations.py` (70 tests) covers each operation in two ways: a forward-value
+`tests/test_operations.py` (74 tests) covers each operation in two ways: a forward-value
 check against a hand-computed expected array, and a gradient check (analytic, numerical, or
 both). It also tests broadcasting gradients, axis-wise reductions, the `max` gradient routing
 to the argmax, tensor slicing and `squeeze`/`unsqueeze`/`flatten` gradients, the `no_grad` /
-`enable_grad` context managers (including nesting), and the factory methods.
+`enable_grad` context managers (including nesting), and the factory methods. A
+`TestBackwardTraversal` class exercises the iterative engine directly: multi-path/diamond
+accumulation, and deep chains of 2000+ ops that complete without `RecursionError`.
 
 ### Module tests
 
-`tests/test_modules.py` (44 tests) exercises every layer and loss: `Linear`, `Conv2d`,
+`tests/test_modules.py` (49 tests) exercises every layer and loss: `Linear`, `Conv2d`,
 `BatchNorm1d`, `LayerNorm`, `Dropout`, the activation modules, `Sequential`, `MSELoss`,
 `CrossEntropyLoss`, the `Module` base (parameter collection, train/eval, zero_grad), and a
 small multi-layer "deep network" that checks end-to-end forward and backward through stacked
-layers.
+layers. `Conv2d` in particular has finite-difference gradient checks for its input, weight,
+and bias gradients plus a short training loop that confirms the layer is trainable.
 
 ### Optimizer tests
 
@@ -793,7 +835,7 @@ operation's gradient or a module's behavior is expected to be.
 ### Running
 
 ```bash
-pytest tests/ -v          # full suite, 140 tests
+pytest tests/ -v          # full suite, 149 tests
 pytest tests/test_operations.py -v
 ```
 

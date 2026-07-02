@@ -99,6 +99,21 @@ class Tensor:
         """
         Compute gradients through backpropagation.
 
+        This is reverse-mode automatic differentiation implemented as an
+        *iterative* reverse-topological traversal rather than recursion:
+
+        1. Build a topological order of the subgraph reachable from ``self``
+           using an explicit-stack DFS (no Python recursion, so arbitrarily
+           deep graphs are supported without hitting the recursion limit).
+        2. Seed ``self`` with the upstream gradient, then walk the nodes in
+           reverse-topological order. Each node's incoming gradient is fully
+           accumulated (summed over every consumer) *before* the node is
+           processed, so every ``grad_fn`` is invoked exactly once with the
+           node's total gradient. This both eliminates redundant re-visits of
+           shared nodes and gives side-effecting closures (e.g. ``LayerNorm``
+           / ``BatchNorm1d`` accumulating parameter gradients) the correct
+           total gradient exactly once.
+
         Args:
             grad: Upstream gradient. If None, uses ones.
         """
@@ -108,21 +123,71 @@ class Tensor:
         if grad is None:
             grad = np.ones_like(self.data)
 
-        # Accumulate gradient
-        if self.grad is None:
-            self.grad = grad.copy()
-        else:
-            self.grad += grad
+        # Build topological order via iterative DFS. Nodes are appended in
+        # post-order, so iterating the list in reverse visits each node only
+        # after all of its consumers.
+        topo: List['Tensor'] = []
+        visited: Set[int] = set()
+        # Each stack frame: (node, child_index)
+        stack: List = [[self, 0]]
+        visited.add(id(self))
+        while stack:
+            frame = stack[-1]
+            node, child_idx = frame
+            if node._grad_fn is not None and child_idx < len(node._inputs):
+                frame[1] += 1
+                child = node._inputs[child_idx]
+                if (
+                    child.requires_grad
+                    and child._grad_fn is not None
+                    and id(child) not in visited
+                ):
+                    visited.add(id(child))
+                    stack.append([child, 0])
+            else:
+                topo.append(node)
+                stack.pop()
 
-        # Propagate through graph
-        if self._grad_fn is not None:
-            input_grads = self._grad_fn(grad)
+        # Accumulate the incoming (already-summed) gradient per node, keyed by
+        # identity, then process nodes in reverse-topological order.
+        incoming = {id(self): grad}
+
+        for node in reversed(topo):
+            g = incoming.get(id(node))
+            if g is None:
+                continue
+
+            # Accumulate into the tensor's own .grad (gradient accumulation
+            # semantics: a tensor reached by multiple consumers sums them).
+            if node.grad is None:
+                node.grad = g.copy()
+            else:
+                node.grad = node.grad + g
+
+            if node._grad_fn is None:
+                continue
+
+            input_grads = node._grad_fn(g)
             if not isinstance(input_grads, (list, tuple)):
                 input_grads = [input_grads]
 
-            for inp, g in zip(self._inputs, input_grads):
-                if inp.requires_grad and g is not None:
-                    inp.backward(g)
+            for inp, ig in zip(node._inputs, input_grads):
+                if not inp.requires_grad or ig is None:
+                    continue
+                if inp._grad_fn is None:
+                    # Leaf tensor: accumulate its gradient directly. Leaves are
+                    # not in the topo order (only nodes with a grad_fn are), so
+                    # their .grad must be updated here.
+                    if inp.grad is None:
+                        inp.grad = ig.copy()
+                    else:
+                        inp.grad = inp.grad + ig
+                else:
+                    key = id(inp)
+                    if key in incoming:
+                        incoming[key] = incoming[key] + ig
+                    else:
+                        incoming[key] = ig
 
     def _set_grad_fn(self, grad_fn: Callable, inputs: List['Tensor']):
         """Set gradient function and inputs."""

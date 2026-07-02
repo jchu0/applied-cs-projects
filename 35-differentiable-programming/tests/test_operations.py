@@ -829,5 +829,64 @@ class TestFactoryMethods:
         np.testing.assert_allclose(a.data, expected, rtol=1e-5)
 
 
+class TestBackwardTraversal:
+    """Test the iterative reverse-topological backward pass."""
+
+    def test_multiple_paths(self):
+        """A tensor reached along multiple paths sums its incoming gradients."""
+        x = Tensor([2.0], requires_grad=True)
+        # y = x**2 + 3*x + 1 ; dy/dx = 2x + 3 = 7 at x = 2
+        y = x ** 2 + 3 * x + 1
+        y.backward()
+        np.testing.assert_allclose(x.grad, [7.0], rtol=1e-6)
+
+    def test_diamond_graph_visited_once(self):
+        """Shared node in a diamond gets the summed gradient exactly once."""
+        x = Tensor([3.0], requires_grad=True)
+        a = x * 2.0          # da/dx = 2
+        b = x * 5.0          # db/dx = 5
+        y = a + b            # y = 7x ; dy/dx = 7
+        y.backward()
+        np.testing.assert_allclose(x.grad, [7.0], rtol=1e-6)
+
+    def test_deep_chain_no_recursion_error(self):
+        """A very deep chain (2000+ ops) completes without RecursionError.
+
+        The old recursive backward would raise RecursionError here; the
+        iterative traversal handles arbitrary depth. Chain: repeatedly
+        y = y + 1, whose gradient w.r.t. the leaf is exactly 1.
+        """
+        import sys
+
+        depth = 3000
+        assert depth > sys.getrecursionlimit(), (
+            "test depth should exceed the interpreter recursion limit to be "
+            "a meaningful regression check"
+        )
+
+        x = Tensor([1.0], requires_grad=True)
+        y = x
+        for _ in range(depth):
+            y = y + 1.0
+
+        # Forward value: 1 + depth
+        np.testing.assert_allclose(y.data, [1.0 + depth], rtol=1e-6)
+
+        y.backward()
+        # d(x + depth)/dx == 1
+        np.testing.assert_allclose(x.grad, [1.0], rtol=1e-6)
+
+    def test_deep_chain_multiplicative_grad(self):
+        """Deep chain with a non-trivial gradient stays numerically correct."""
+        depth = 2500
+        x = Tensor([1.0], requires_grad=True)
+        y = x
+        # Alternate +1 and *1.0 so the chain is long but gradient stays 1.
+        for _ in range(depth):
+            y = (y + 2.0) - 2.0
+        y.backward()
+        np.testing.assert_allclose(x.grad, [1.0], rtol=1e-6)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -8,8 +8,9 @@ only runtime dependency.
 ## Features
 
 - **Reverse-mode autodiff** — every operation records a closure-based backward function and
-  its inputs; `Tensor.backward()` walks the graph recursively, accumulating gradients into
-  leaf tensors (`Tensor` / `core/tensor.py`).
+  its inputs; `Tensor.backward()` walks the graph in reverse-topological order (iterative,
+  non-recursive) so arbitrarily deep graphs work and each node is processed exactly once,
+  accumulating gradients into leaf tensors (`Tensor` / `core/tensor.py`).
 - **Gradient-tracking tensor** — `requires_grad`, gradient accumulation, `detach()`,
   `zero_grad()`, `item()`, `numpy()`, and shape metadata (`shape`, `ndim`, `dtype`, `size`).
 - **Operator overloading** — `+`, `-`, `*`, `/`, unary `-`, `**`, `@`, and indexing all
@@ -19,8 +20,10 @@ only runtime dependency.
   (`reshape`, `transpose`, `concat`) with hand-written gradients (`ops/operations.py`).
 - **Broadcasting-aware gradients** — `add`/`sub`/`mul`/`div` reduce upstream gradients back
   to each operand's shape so broadcasting differentiates correctly.
-- **Neural-network modules** — `Linear`, `Conv2d`, `BatchNorm1d`, `LayerNorm`, `Dropout`,
-  activation modules, and a `Sequential` container, all subclassing `Module` (`nn/modules.py`).
+- **Neural-network modules** — `Linear`, `Conv2d` (trainable: full im2col forward and
+  col2im backward for input, weight, and bias gradients), `BatchNorm1d`, `LayerNorm`,
+  `Dropout`, activation modules, and a `Sequential` container, all subclassing `Module`
+  (`nn/modules.py`).
 - **Loss functions** — `MSELoss` and `CrossEntropyLoss` (fused softmax + cross-entropy) with
   analytic backward passes.
 - **Optimizers** — `SGD` (momentum, weight decay), `Adam`, `AdamW`, and `RMSprop`
@@ -40,7 +43,7 @@ flowchart TD
     Ops --> Tensor(Tensor: data plus grad_fn plus inputs)
     Tensor --> Graph(Dynamic computation graph)
     User -- backward parens --> Graph
-    Graph --> Accum(Recursive gradient accumulation into leaves)
+    Graph --> Accum(Iterative reverse-topological gradient accumulation into leaves)
     Accum --> Opt(Optimizer step: SGD, Adam, AdamW, RMSprop)
     Opt --> User
 ```
@@ -124,19 +127,18 @@ print(df(Tensor([2.0, 3.0])))   # [4. 6.]
 
 ## What's Real vs Simulated
 
-- **Real:** the `Tensor` autograd engine (recursive reverse-mode backward with gradient
-  accumulation); all operations in `ops/operations.py` with hand-derived, numerically
-  verified gradients; `Linear`, `BatchNorm1d`, `LayerNorm`, and `Dropout` forward and
-  backward passes; `MSELoss` and `CrossEntropyLoss`; the `SGD`, `Adam`, `AdamW`, and
-  `RMSprop` optimizers; `grad` / `value_and_grad`; and the `no_grad` / `enable_grad`
-  context managers. All of these are exercised by the 140-test suite, including numerical
-  gradient checks.
-- **Simulated / incomplete:** `Conv2d.forward` computes a real im2col convolution, but its
-  `backward` returns a zero gradient — it is a forward-only layer for inference, not
-  trainable. The autograd graph is traversed by recursion, so very deep graphs can hit
-  Python's recursion limit. There is no gradient checkpointing, mixed-precision, or
-  multi-threaded execution. `grad` computes first-order gradients only; higher-order
-  derivatives are not supported.
+- **Real:** the `Tensor` autograd engine (iterative reverse-topological backward with
+  gradient accumulation, so deep graphs are supported and each node is processed once);
+  all operations in `ops/operations.py` with hand-derived, numerically verified gradients;
+  `Linear`, `Conv2d`, `BatchNorm1d`, `LayerNorm`, and `Dropout` forward and backward passes
+  (`Conv2d` is fully trainable — its col2im backward computes input, weight, and bias
+  gradients, checked against finite differences); `MSELoss` and `CrossEntropyLoss`; the
+  `SGD`, `Adam`, `AdamW`, and `RMSprop` optimizers; `grad` / `value_and_grad`; and the
+  `no_grad` / `enable_grad` context managers. All of these are exercised by the 149-test
+  suite, including numerical gradient checks.
+- **Simulated / incomplete:** everything runs in float32 on CPU, single-threaded. There is
+  no operator fusion, no GPU backend, no gradient checkpointing, and no mixed-precision.
+  `grad` computes first-order gradients only; higher-order derivatives are not supported.
 
 ## Testing
 
@@ -144,7 +146,7 @@ print(df(Tensor([2.0, 3.0])))   # [4. 6.]
 pytest tests/ -v
 ```
 
-The suite contains 140 tests across operations, modules, and optimizers. Operation tests
+The suite contains 149 tests across operations, modules, and optimizers. Operation tests
 include central-difference numerical gradient checks (`tests/test_operations.py`); module
 tests cover layers, losses, and a small deep network; optimizer tests cover convergence and
 edge cases. No external services are required.
@@ -160,7 +162,7 @@ edge cases. No external services are required.
     ops/operations.py           # Differentiable operations and their gradients
     nn/modules.py               # Module base, layers, activations, losses
     nn/optim.py                 # SGD, Adam, AdamW, RMSprop
-  tests/                        # 140 tests: operations, modules, optimizers
+  tests/                        # 149 tests: operations, modules, optimizers
   docs/BLUEPRINT.md             # Full architecture and design
 ```
 
