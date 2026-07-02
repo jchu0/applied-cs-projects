@@ -7,6 +7,7 @@ from .graph import (
 )
 from .message_passing import (
     MessagePassingEngine,
+    MessagePassingNumpy,
     MessageFunction,
     AggregateFunction,
 )
@@ -24,6 +25,7 @@ from .layers import (
 )
 from .kernels import (
     SparseOps,
+    SparseOpsNumpy,
     scatter_add,
     scatter_mean,
     scatter_max,
@@ -43,6 +45,7 @@ __all__ = [
     "PartitionedGraph",
     # Message passing
     "MessagePassingEngine",
+    "MessagePassingNumpy",
     "MessageFunction",
     "AggregateFunction",
     # Sampling
@@ -57,6 +60,7 @@ __all__ = [
     "GNNModel",
     # Kernels
     "SparseOps",
+    "SparseOpsNumpy",
     "scatter_add",
     "scatter_mean",
     "scatter_max",
