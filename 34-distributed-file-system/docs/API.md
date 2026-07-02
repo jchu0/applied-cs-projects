@@ -318,8 +318,11 @@ def create_file(
 #### Get File Information
 
 ```python
-def get_file_info(path: str) -> FileInfo
+def get_file_info(path: str, raise_if_missing: bool = True) -> Optional[FileInfo]
 ```
+
+Returns the `FileInfo` for `path`. When `raise_if_missing` is `True` (default) a
+missing path raises `FileNotFoundError`; when `False` it returns `None`.
 
 #### Delete File
 
@@ -354,8 +357,16 @@ def allocate_blocks(
 #### Get Block Locations
 
 ```python
-def get_block_locations(block_id: BlockID) -> List[BlockLocation]
+# By path or block id (dispatches on the argument)
+def get_block_locations(path_or_block_id: str)
+
+# Locations for a specific block id
+def get_block_locations_by_id(block_id: BlockID) -> List[BlockLocation]
 ```
+
+`get_block_locations` accepts either a file path or a block id. Use
+`get_block_locations_by_id` when you already have a `BlockID` and want the list of
+`BlockLocation`s for that single block.
 
 ### DataNode Management
 
@@ -363,23 +374,30 @@ def get_block_locations(block_id: BlockID) -> List[BlockLocation]
 
 ```python
 def register_datanode(
-    node_id: str,
+    node_id: NodeID,
     host: str,
     port: int,
-    capacity: Optional[int] = None
-) -> None
+    capacity: int = 100 * 1024 * 1024 * 1024,  # 100GB default
+    used: int = 0,
+    remaining: Optional[int] = None,
+    rack: str = "/default-rack"
+) -> bool
 ```
 
 #### Handle Heartbeat
 
 ```python
 def handle_heartbeat(
-    node_id: str,
-    capacity: int,
-    used: int,
-    remaining: int
+    node_id: NodeID,
+    used: int = 0,
+    remaining: int = 0,
+    capacity: int = None
 ) -> HeartbeatResponse
 ```
+
+The lower-level `heartbeat(node_id, used, remaining) -> HeartbeatResponse` is also
+available; `handle_heartbeat` is the extended variant that can also update the
+node's reported capacity.
 
 #### Process Block Report
 
@@ -404,29 +422,12 @@ def get_statistics() -> Dict[str, Any]
     'total_files': 1234,
     'total_directories': 56,
     'total_blocks': 5678,
+    'total_datanodes': 10,
     'total_capacity': 1099511627776,  # bytes
     'total_used': 549755813888,       # bytes
-    'total_remaining': 549755813888,   # bytes
-    'total_datanodes': 10,
-    'live_datanodes': 9,
-    'dead_datanodes': 1,
-    'under_replicated_blocks': 5,
-    'corrupt_blocks': 0,
-    'missing_blocks': 0
+    'total_remaining': 549755813888,  # bytes
+    'safe_mode': False
 }
-```
-
-#### Safe Mode Operations
-
-```python
-# Check safe mode status
-def is_in_safe_mode() -> bool
-
-# Manually exit safe mode
-def exit_safe_mode() -> None
-
-# Enter safe mode
-def enter_safe_mode() -> None
 ```
 
 #### Checkpointing
@@ -459,19 +460,23 @@ datanode = DataNode(
 #### Store Block
 
 ```python
-def store_block(block_id: BlockID, data: bytes) -> None
+def store_block(block_id: BlockID, data: bytes) -> int
 ```
+
+Alias for `write_block`; returns the number of bytes stored.
 
 #### Retrieve Block
 
 ```python
-def retrieve_block(block_id: BlockID) -> bytes
+def retrieve_block(block_id: BlockID, offset: int = 0, length: int = -1) -> bytes
 ```
+
+Alias for `read_block`. `length == -1` reads to the end of the block.
 
 #### Delete Block
 
 ```python
-def delete_block(block_id: BlockID) -> None
+def delete_block(block_id: BlockID) -> bool
 ```
 
 #### Get Block Report
@@ -491,22 +496,27 @@ def get_storage_info() -> Dict[str, int]
 **Returns:**
 ```python
 {
+    'node_id': 'datanode-1',
     'capacity': 1099511627776,  # Total capacity in bytes
     'used': 549755813888,       # Used space in bytes
-    'remaining': 549755813888   # Available space in bytes
+    'remaining': 549755813888,  # Available space in bytes
+    'block_count': 128          # Number of stored blocks
 }
 ```
 
 #### Send Heartbeat
 
 ```python
-async def send_heartbeat() -> None
+async def send_heartbeat() -> List[Dict]
 ```
+
+Sends a heartbeat to the NameNode and returns any commands the NameNode issued in
+response.
 
 #### Send Block Report
 
 ```python
-async def send_block_report() -> None
+async def send_block_report() -> bool
 ```
 
 ## Error Handling
@@ -515,13 +525,13 @@ async def send_block_report() -> None
 
 ```python
 from hdfs.common.protocol import (
-    HDFSError,           # Base exception
-    FileNotFoundError,   # File/directory doesn't exist
-    FileExistsError,     # File/directory already exists
+    HDFSError,               # Base exception
+    FileNotFoundError,       # File/directory doesn't exist
+    FileExistsError,         # File/directory already exists
     DirectoryNotEmptyError,  # Directory contains items
-    NoDataNodeError,     # No DataNodes available
-    QuotaExceededException,  # Quota limit exceeded
-    SafeModeException    # Operation blocked in safe mode
+    NoDataNodeError,         # No DataNodes available
+    BlockNotFoundError,      # Requested block does not exist
+    ReplicationError         # Replication could not be satisfied
 )
 ```
 
@@ -559,9 +569,13 @@ Enable pipeline replication for writes:
 def store_block_pipeline(
     block_id: BlockID,
     data: bytes,
-    downstream_nodes: List[DataNode]
-) -> None
+    downstream_nodes: List = None
+) -> int
 ```
+
+Stores the block locally (returning the byte count) and, if `downstream_nodes` is
+provided, forwards the block to each downstream node to build the replication
+pipeline.
 
 ### Client-Side Caching
 
@@ -587,21 +601,18 @@ datanode = DataNode(
 )
 ```
 
-### Custom Replication Policy
+### Replication Policy
 
-Implement custom block placement:
+`ReplicationPolicy` is an enum of the supported block-placement strategies
+(see `hdfs.common.types`), not a subclassable interface:
 
 ```python
-class CustomReplicationPolicy(ReplicationPolicy):
-    def choose_targets(
-        self,
-        num_replicas: int,
-        datanodes: List[DataNodeInfo],
-        excluded: List[NodeID] = None
-    ) -> List[DataNodeInfo]:
-        # Custom logic for replica placement
-        pass
+from hdfs.common.types import ReplicationPolicy
 ```
+
+Block placement is performed inside the NameNode by
+`_select_datanodes_for_block(replication)`, which ranks live DataNodes by load and
+picks targets for each new block.
 
 ## Performance Tips
 
@@ -632,37 +643,36 @@ tasks = [client.read(f) for f in files]
 results = await asyncio.gather(*tasks)
 ```
 
-### Connection Pooling
+### Connection Timeout
 
 ```python
-# Reuse client connections
+# Configure how long the client waits when connecting to the NameNode
 client = HDFSClient(
     namenode_host="localhost",
-    connection_pool_size=10,
-    connection_timeout=30
+    connect_timeout=30.0  # seconds
 )
 ```
 
 ## Monitoring and Metrics
 
-### Client Metrics
+### Cluster Statistics
+
+Use the NameNode's `get_statistics()` for system-wide metrics (see
+[Administrative Operations](#get-statistics)):
 
 ```python
-# Get client statistics
-stats = client.get_stats()
-print(f"Total bytes read: {stats['bytes_read']}")
-print(f"Total bytes written: {stats['bytes_written']}")
-print(f"Read operations: {stats['read_ops']}")
-print(f"Write operations: {stats['write_ops']}")
+stats = namenode.get_statistics()
+print(f"Total capacity: {stats['total_capacity']}")
+print(f"Used capacity: {stats['total_used']}")
+print(f"Remaining: {stats['total_remaining']}")
+print(f"Total DataNodes: {stats['total_datanodes']}")
 ```
 
-### System Metrics
+### DataNode Storage Info
 
 ```python
-# Get system-wide metrics
-metrics = namenode.get_metrics()
-print(f"Total capacity: {metrics['capacity_total']}")
-print(f"Used capacity: {metrics['capacity_used']}")
-print(f"Remaining: {metrics['capacity_remaining']}")
-print(f"Live nodes: {metrics['nodes_live']}")
+info = datanode.get_storage_info()
+print(f"Capacity: {info['capacity']}")
+print(f"Used: {info['used']}")
+print(f"Remaining: {info['remaining']}")
 ```

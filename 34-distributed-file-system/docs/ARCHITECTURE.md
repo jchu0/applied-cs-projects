@@ -76,12 +76,23 @@ The client library provides the user-facing API:
 
 ### Write Operation
 
-1. **Client** requests file creation from **NameNode**
-2. **NameNode** creates file metadata and allocates blocks
-3. **NameNode** returns block IDs and DataNode locations
-4. **Client** writes data directly to **DataNodes**
-5. **DataNodes** replicate blocks in pipeline fashion
-6. **DataNodes** report block storage to **NameNode**
+The client drives replication directly: for each block it fans the block data out
+to every target DataNode itself. There is no client-driven DataNode-to-DataNode
+write pipeline (that is out of scope). DataNode-to-DataNode transfer only happens
+later during self-healing re-replication, when the NameNode issues a `replicate`
+command and a DataNode pulls the block from a peer via `COPY_BLOCK`.
+
+1. **Client** sends `CREATE_FILE` to the **NameNode**, which creates the file
+   metadata.
+2. For each block, the **Client** sends `ADD_BLOCK`; the **NameNode** allocates a
+   block id and selects target DataNodes, returning the block id and their
+   locations.
+3. **Client** sends `WRITE_BLOCK` to each target DataNode directly (one request
+   per replica), writing the same block data to all of them.
+4. Each **DataNode** stores the block and reports `BLOCK_RECEIVED` to the
+   **NameNode**.
+5. After all blocks are written, the **Client** sends `COMPLETE_FILE` to finalize
+   the file.
 
 ```mermaid
 sequenceDiagram
@@ -90,12 +101,17 @@ sequenceDiagram
     participant DataNode1
     participant DataNode2
     participant DataNode3
-    Client->>NameNode: 1. request file creation
-    NameNode-->>Client: 2. block allocation
-    Client->>DataNode1: 3. write data
-    DataNode1->>DataNode2: pipeline replicate
-    DataNode2->>DataNode3: pipeline replicate
-    DataNode3-->>Client: 4. acknowledgments
+    Client->>NameNode: 1. CREATE_FILE
+    NameNode-->>Client: file created
+    Client->>NameNode: 2. ADD_BLOCK
+    NameNode-->>Client: block id + DataNode locations
+    Client->>DataNode1: 3. WRITE_BLOCK (replica 1)
+    Client->>DataNode2: 3. WRITE_BLOCK (replica 2)
+    Client->>DataNode3: 3. WRITE_BLOCK (replica 3)
+    DataNode1-->>NameNode: 4. BLOCK_RECEIVED
+    DataNode2-->>NameNode: 4. BLOCK_RECEIVED
+    DataNode3-->>NameNode: 4. BLOCK_RECEIVED
+    Client->>NameNode: 5. COMPLETE_FILE
 ```
 
 ### Read Operation

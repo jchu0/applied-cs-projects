@@ -8,7 +8,7 @@
 - [Error Handling](#error-handling)
 - [Rate Limiting](#rate-limiting)
 - [Webhooks](#webhooks)
-- [SDK Examples](#sdk-examples)
+- [Client Examples](#client-examples)
 
 ## Overview
 
@@ -29,7 +29,7 @@ https://api.saas-platform.com/api/v1/
 
 ### JWT Authentication
 
-The API uses JWT (JSON Web Tokens) for authentication. To authenticate, you need to obtain an access token by logging in.
+The API uses JWT (JSON Web Tokens) for authentication. To authenticate, you need to obtain an access token by registering or logging in.
 
 #### Login
 ```http
@@ -45,18 +45,23 @@ Content-Type: application/json
 **Response:**
 ```json
 {
-  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "user": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "email": "user@example.com",
-    "username": "johndoe",
+    "email_verified": false,
     "first_name": "John",
-    "last_name": "Doe"
+    "last_name": "Doe",
+    "full_name": "John Doe",
+    "avatar_url": null,
+    "created_at": "2024-01-15T10:30:00Z",
+    "last_login_at": "2024-01-15T09:00:00Z"
   },
-  "expires_in": 900
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 }
 ```
+
+The access token is valid for 1 hour; the refresh token for 7 days.
 
 #### Using the Token
 Include the access token in the Authorization header for authenticated requests:
@@ -66,7 +71,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 
 #### Refresh Token
 ```http
-POST /api/v1/auth/refresh/
+POST /api/v1/auth/token/refresh/
 Content-Type: application/json
 
 {
@@ -74,46 +79,91 @@ Content-Type: application/json
 }
 ```
 
-### API Key Authentication
-
-For server-to-server communication, you can use API keys.
-
-#### Generate API Key
-```http
-POST /api/v1/keys/generate/
-Authorization: Bearer {access_token}
-Content-Type: application/json
-
+**Response:**
+```json
 {
-  "name": "Production Server",
-  "permissions": ["read", "write"],
-  "expires_at": "2025-12-31T23:59:59Z"
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "Bearer"
 }
+```
+
+## API Endpoints
+
+All endpoints are mounted under `/api/v1/`. The route groups are:
+
+| Prefix | App | Purpose |
+|--------|-----|---------|
+| `/api/v1/` | core | Health/readiness probes |
+| `/api/v1/auth/` | users | Registration, login, profile, password |
+| `/api/v1/tenants/` | tenants | Workspaces and membership |
+| `/api/v1/billing/` | billing | Plans, subscriptions, invoices, Stripe |
+| `/api/v1/admin/` | admin_dashboard | Platform admin (staff only) |
+| `/api/v1/scheduler/` | scheduler | Scheduled tasks, queues, cron schedules |
+| `/api/v1/resources/` | resources | Compute nodes, GPUs, allocations, quotas |
+| `/api/v1/training/` | training | Training jobs, runs, experiments, sweeps |
+
+### Core / Health
+
+#### Health Check
+```http
+GET /api/v1/health/
 ```
 
 **Response:**
 ```json
 {
-  "id": "key_550e8400e29b41d4a716446655440000",
-  "key": "sk_live_EXAMPLEONLYnotARealKey00",
-  "name": "Production Server",
-  "created_at": "2024-01-15T10:30:00Z",
-  "expires_at": "2025-12-31T23:59:59Z"
+  "status": "ok",
+  "database": "healthy"
 }
 ```
 
-#### Using API Key
+#### Readiness Check
 ```http
-X-API-Key: sk_live_EXAMPLEONLYnotARealKey00
+GET /api/v1/ready/
 ```
 
-## API Endpoints
+**Response:**
+```json
+{
+  "status": "ready"
+}
+```
 
-### User Management
+### Authentication & User Management
 
-#### Get Current User
+All auth endpoints are mounted under `/api/v1/auth/`.
+
+#### Register
 ```http
-GET /api/v1/users/me/
+POST /api/v1/auth/register/
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "password": "YourPassword123!",
+  "first_name": "John",
+  "last_name": "Doe"
+}
+```
+Returns `201 Created` with the same `{ user, access_token, refresh_token }` shape as login.
+
+#### Login
+```http
+POST /api/v1/auth/login/
+```
+See [Authentication](#authentication).
+
+#### Logout
+```http
+POST /api/v1/auth/logout/
+Authorization: Bearer {access_token}
+```
+JWTs are stateless; the client should discard the token. Returns `{"message": "Logged out successfully"}`.
+
+#### Get / Update Current User
+```http
+GET   /api/v1/auth/me/
+PATCH /api/v1/auth/me/
 Authorization: Bearer {access_token}
 ```
 
@@ -122,424 +172,256 @@ Authorization: Bearer {access_token}
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "email": "user@example.com",
-  "username": "johndoe",
+  "email_verified": false,
   "first_name": "John",
   "last_name": "Doe",
-  "avatar_url": "https://cdn.saas-platform.com/avatars/johndoe.jpg",
-  "organization": {
-    "id": "org_123",
-    "name": "Acme Corp",
-    "role": "admin"
-  },
-  "created_at": "2023-01-15T10:30:00Z",
-  "last_login": "2024-01-15T09:00:00Z"
+  "full_name": "John Doe",
+  "avatar_url": null,
+  "created_at": "2024-01-15T10:30:00Z",
+  "last_login_at": "2024-01-15T09:00:00Z"
 }
 ```
+`PATCH` accepts writable fields (`first_name`, `last_name`, `avatar_url`); `id`, `email`, `email_verified`, `created_at`, and `last_login_at` are read-only.
 
-#### Update User Profile
+#### Profile (alias)
 ```http
-PATCH /api/v1/users/me/
+GET   /api/v1/auth/profile/
+PATCH /api/v1/auth/profile/
+Authorization: Bearer {access_token}
+```
+Same behavior and payload as `/auth/me/`.
+
+#### Change Password
+```http
+POST /api/v1/auth/password/change/
 Authorization: Bearer {access_token}
 Content-Type: application/json
 
 {
-  "first_name": "Jane",
-  "last_name": "Smith",
-  "bio": "Software Engineer",
-  "timezone": "America/New_York"
+  "current_password": "OldPassword123!",
+  "new_password": "NewPassword123!"
 }
 ```
 
-#### List Users (Admin Only)
+#### Refresh Token
 ```http
-GET /api/v1/users/
-Authorization: Bearer {access_token}
-
-Query Parameters:
-- page: integer (default: 1)
-- page_size: integer (default: 20, max: 100)
-- search: string (search by name or email)
-- organization_id: string (filter by organization)
-- role: string (filter by role)
+POST /api/v1/auth/token/refresh/
 ```
+See [Authentication](#authentication).
 
-### Organization Management
-
-#### Create Organization
+#### Request Password Reset
 ```http
-POST /api/v1/organizations/
-Authorization: Bearer {access_token}
+POST /api/v1/auth/password/reset/
 Content-Type: application/json
 
-{
-  "name": "Acme Corp",
-  "slug": "acme-corp",
-  "description": "Leading software company",
-  "website": "https://acme-corp.com",
-  "size": "50-100",
-  "industry": "technology"
-}
+{ "email": "user@example.com" }
 ```
+Always returns a generic success message so account existence is not revealed.
 
-#### Get Organization
+#### Confirm Password Reset
 ```http
-GET /api/v1/organizations/{org_id}/
-Authorization: Bearer {access_token}
-```
-
-#### Update Organization
-```http
-PATCH /api/v1/organizations/{org_id}/
-Authorization: Bearer {access_token}
+POST /api/v1/auth/password/reset/confirm/
 Content-Type: application/json
 
-{
-  "name": "Acme Corporation",
-  "description": "Updated description"
-}
+{ "token": "<reset-token>", "new_password": "NewPassword123!" }
 ```
 
-#### Invite Members
+### Tenant Management
+
+Mounted under `/api/v1/tenants/`. Tenants are the workspace/organization concept for the platform.
+
+#### List / Create Tenants
 ```http
-POST /api/v1/organizations/{org_id}/invitations/
+GET  /api/v1/tenants/
+POST /api/v1/tenants/
 Authorization: Bearer {access_token}
-Content-Type: application/json
-
-{
-  "email": "newmember@example.com",
-  "role": "editor",
-  "message": "Welcome to our team!"
-}
 ```
-
-### Project Management
-
-#### List Projects
-```http
-GET /api/v1/projects/
-Authorization: Bearer {access_token}
-
-Query Parameters:
-- organization_id: string
-- status: string (active, archived, deleted)
-- created_after: datetime
-- created_before: datetime
-- tags: array of strings
-- sort_by: string (created_at, updated_at, name)
-- order: string (asc, desc)
-```
-
-**Response:**
+`GET` lists the tenants the current user belongs to. `POST` creates a tenant (creator becomes `owner`):
 ```json
-{
-  "count": 42,
-  "next": "https://api.saas-platform.com/api/v1/projects/?page=2",
-  "previous": null,
-  "results": [
-    {
-      "id": "proj_550e8400e29b41d4a716446655440000",
-      "name": "Website Redesign",
-      "slug": "website-redesign",
-      "description": "Complete redesign of company website",
-      "status": "active",
-      "visibility": "private",
-      "organization": {
-        "id": "org_123",
-        "name": "Acme Corp"
-      },
-      "owner": {
-        "id": "user_456",
-        "username": "johndoe",
-        "email": "john@example.com"
-      },
-      "members_count": 5,
-      "tags": ["design", "frontend"],
-      "settings": {
-        "allow_comments": true,
-        "require_approval": false
-      },
-      "created_at": "2024-01-01T10:00:00Z",
-      "updated_at": "2024-01-15T14:30:00Z"
-    }
-  ]
-}
+{ "name": "Acme Corp", "slug": "acme-corp" }
 ```
 
-#### Create Project
+#### Get / Update / Delete Tenant
 ```http
-POST /api/v1/projects/
-Authorization: Bearer {access_token}
-Content-Type: application/json
-
-{
-  "name": "New Project",
-  "description": "Project description",
-  "organization_id": "org_123",
-  "visibility": "private",
-  "tags": ["backend", "api"],
-  "settings": {
-    "allow_comments": true,
-    "require_approval": true,
-    "default_branch": "main"
-  }
-}
-```
-
-#### Get Project Details
-```http
-GET /api/v1/projects/{project_id}/
+GET    /api/v1/tenants/{tenant_id}/
+PATCH  /api/v1/tenants/{tenant_id}/
+DELETE /api/v1/tenants/{tenant_id}/
 Authorization: Bearer {access_token}
 ```
+`tenant_id` is a UUID. `PATCH` requires `owner` or `admin`; `DELETE` requires `owner`.
 
-#### Update Project
+#### List Members / Invite Member
 ```http
-PATCH /api/v1/projects/{project_id}/
-Authorization: Bearer {access_token}
-Content-Type: application/json
-
-{
-  "name": "Updated Project Name",
-  "status": "archived"
-}
-```
-
-#### Delete Project
-```http
-DELETE /api/v1/projects/{project_id}/
+GET  /api/v1/tenants/{tenant_id}/members/
+POST /api/v1/tenants/{tenant_id}/members/
 Authorization: Bearer {access_token}
 ```
-
-### File Management
-
-#### Upload File
-```http
-POST /api/v1/files/upload/
-Authorization: Bearer {access_token}
-Content-Type: multipart/form-data
-
-file: (binary)
-project_id: proj_123
-folder_path: /documents
-description: "Project documentation"
-```
-
-**Response:**
+`POST` (owner/admin only) creates an invitation:
 ```json
-{
-  "id": "file_789",
-  "name": "document.pdf",
-  "size": 2048576,
-  "mime_type": "application/pdf",
-  "url": "https://cdn.saas-platform.com/files/document.pdf",
-  "thumbnail_url": "https://cdn.saas-platform.com/thumbnails/document.jpg",
-  "project_id": "proj_123",
-  "folder_path": "/documents",
-  "uploaded_by": {
-    "id": "user_456",
-    "username": "johndoe"
-  },
-  "created_at": "2024-01-15T10:00:00Z"
-}
+{ "email": "newmember@example.com", "role": "member" }
 ```
 
-#### List Files
+#### Accept Invitation
 ```http
-GET /api/v1/files/
-Authorization: Bearer {access_token}
-
-Query Parameters:
-- project_id: string
-- folder_path: string
-- mime_type: string
-- search: string
-```
-
-#### Download File
-```http
-GET /api/v1/files/{file_id}/download/
+POST /api/v1/tenants/invitations/{token}/accept/
 Authorization: Bearer {access_token}
 ```
-
-#### Delete File
-```http
-DELETE /api/v1/files/{file_id}/
-Authorization: Bearer {access_token}
-```
+Consumes an invitation token and adds the current user to the tenant.
 
 ### Subscription & Billing
 
-#### Get Current Subscription
-```http
-GET /api/v1/subscriptions/current/
-Authorization: Bearer {access_token}
-```
-
-**Response:**
-```json
-{
-  "id": "sub_123",
-  "plan": {
-    "id": "plan_pro",
-    "name": "Professional",
-    "price": 29.99,
-    "currency": "USD",
-    "interval": "month",
-    "features": {
-      "users": 5,
-      "storage": 10240,
-      "api_calls": 10000,
-      "custom_domain": true
-    }
-  },
-  "status": "active",
-  "current_period_start": "2024-01-01T00:00:00Z",
-  "current_period_end": "2024-02-01T00:00:00Z",
-  "cancel_at_period_end": false,
-  "usage": {
-    "users": {
-      "used": 3,
-      "limit": 5
-    },
-    "storage": {
-      "used": 2048,
-      "limit": 10240
-    },
-    "api_calls": {
-      "used": 5423,
-      "limit": 10000
-    }
-  }
-}
-```
+Mounted under `/api/v1/billing/`.
 
 #### List Available Plans
 ```http
-GET /api/v1/plans/
+GET /api/v1/billing/plans/
 ```
+Returns the list of active plans (serialized `Plan` objects).
 
-**Response:**
-```json
-{
-  "plans": [
-    {
-      "id": "plan_free",
-      "name": "Free",
-      "price": 0,
-      "currency": "USD",
-      "interval": "month",
-      "features": {
-        "users": 1,
-        "storage": 1024,
-        "api_calls": 1000,
-        "projects": 3
-      }
-    },
-    {
-      "id": "plan_pro",
-      "name": "Professional",
-      "price": 29.99,
-      "currency": "USD",
-      "interval": "month",
-      "features": {
-        "users": 5,
-        "storage": 10240,
-        "api_calls": 10000,
-        "projects": 20,
-        "custom_domain": true
-      }
-    },
-    {
-      "id": "plan_enterprise",
-      "name": "Enterprise",
-      "price": 99.99,
-      "currency": "USD",
-      "interval": "month",
-      "features": {
-        "users": -1,
-        "storage": 102400,
-        "api_calls": -1,
-        "projects": -1,
-        "custom_domain": true,
-        "sso": true,
-        "priority_support": true
-      }
-    }
-  ]
-}
-```
-
-#### Subscribe to Plan
+#### Get / Create / Cancel Subscription
 ```http
-POST /api/v1/subscriptions/subscribe/
+GET    /api/v1/billing/tenants/{tenant_id}/subscription/
+POST   /api/v1/billing/tenants/{tenant_id}/subscription/
+DELETE /api/v1/billing/tenants/{tenant_id}/subscription/
+Authorization: Bearer {access_token}
+```
+`POST` creates or updates the subscription (owner/admin only):
+```json
+{ "plan_id": "<plan-uuid>", "billing_interval": "monthly", "payment_method_id": "pm_card_visa" }
+```
+`DELETE` cancels the subscription (owner only).
+
+#### List Invoices
+```http
+GET /api/v1/billing/tenants/{tenant_id}/invoices/
+Authorization: Bearer {access_token}
+```
+
+#### Payment Methods
+```http
+GET    /api/v1/billing/tenants/{tenant_id}/payment-methods/
+POST   /api/v1/billing/tenants/{tenant_id}/payment-methods/
+Authorization: Bearer {access_token}
+```
+`POST` (owner/admin) returns a Stripe SetupIntent for attaching a new card.
+
+#### Checkout Session
+```http
+POST /api/v1/billing/tenants/{tenant_id}/checkout/
 Authorization: Bearer {access_token}
 Content-Type: application/json
 
-{
-  "plan_id": "plan_pro",
-  "payment_method": "pm_card_visa"
-}
+{ "plan_id": "<plan-uuid>", "billing_interval": "monthly" }
 ```
+Returns `{ "checkout_url": "https://checkout.stripe.com/..." }`.
 
-#### Cancel Subscription
+#### Billing Portal
 ```http
-POST /api/v1/subscriptions/{subscription_id}/cancel/
-Authorization: Bearer {access_token}
-Content-Type: application/json
-
-{
-  "reason": "too_expensive",
-  "feedback": "Optional feedback message",
-  "cancel_immediately": false
-}
-```
-
-### Analytics
-
-#### Get Usage Analytics
-```http
-GET /api/v1/analytics/usage/
-Authorization: Bearer {access_token}
-
-Query Parameters:
-- start_date: date (YYYY-MM-DD)
-- end_date: date (YYYY-MM-DD)
-- metric: string (api_calls, storage, users, projects)
-- granularity: string (hour, day, week, month)
-```
-
-**Response:**
-```json
-{
-  "metric": "api_calls",
-  "period": {
-    "start": "2024-01-01",
-    "end": "2024-01-31"
-  },
-  "granularity": "day",
-  "data": [
-    {
-      "date": "2024-01-01",
-      "value": 1234
-    },
-    {
-      "date": "2024-01-02",
-      "value": 1456
-    }
-  ],
-  "summary": {
-    "total": 45678,
-    "average": 1473,
-    "peak": 2345,
-    "peak_date": "2024-01-15"
-  }
-}
-```
-
-#### Get Project Analytics
-```http
-GET /api/v1/analytics/projects/{project_id}/
+POST /api/v1/billing/tenants/{tenant_id}/portal/
 Authorization: Bearer {access_token}
 ```
+Returns `{ "portal_url": "https://billing.stripe.com/..." }`.
+
+#### Stripe Webhook
+```http
+POST /api/v1/billing/webhooks/stripe/
+Stripe-Signature: {signature}
+```
+Public endpoint that verifies the Stripe signature and processes billing events.
+
+### Admin Dashboard (staff only)
+
+Mounted under `/api/v1/admin/`. All endpoints require an admin (staff) user.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/admin/` | Dashboard summary (user/tenant/subscription counts, recent activity) |
+| GET | `/api/v1/admin/stats/` | Aggregate stats (users, tenants, subscriptions, revenue/MRR) |
+| GET | `/api/v1/admin/users/` | Paginated user list (filters: `email`, `is_active`, `page`, `per_page`) |
+| GET | `/api/v1/admin/tenants/` | Paginated tenant list (filters: `name`, `is_active`, `page`, `per_page`) |
+| GET | `/api/v1/admin/audit-logs/` | Paginated audit log (filters: `action`, `resource_type`, `user_id`, `tenant_id`) |
+| GET | `/api/v1/admin/charts/growth/` | Daily user signups and tenant creations (`days` query param) |
+
+### Scheduler
+
+Mounted under `/api/v1/scheduler/` via DRF routers. Each resource supports the standard list/retrieve/create/update/delete verbs plus the custom actions below.
+
+**Scheduled Tasks** — `/api/v1/scheduler/tasks/`
+- `POST /tasks/{id}/run/` — trigger a task immediately
+- `POST /tasks/{id}/cancel/` — cancel a task
+- `POST /tasks/{id}/retry/` — retry a failed task
+- `GET  /tasks/{id}/executions/` — execution history for a task
+- `GET  /tasks/{id}/status/` — current status
+- `GET  /tasks/stats/` — task statistics
+- `GET  /tasks/upcoming/` — upcoming scheduled tasks
+
+**Task Executions** (read-only) — `/api/v1/scheduler/executions/`
+
+**Task Queues** — `/api/v1/scheduler/queues/`
+- `GET  /queues/stats/` — queue statistics
+- `GET  /queues/workers/` — worker status
+- `POST /queues/{id}/purge/` — purge a queue
+
+**Cron Schedules** — `/api/v1/scheduler/cron-schedules/`
+- `GET /cron-schedules/presets/` — common cron presets
+
+### Resources
+
+Mounted under `/api/v1/resources/` via DRF routers.
+
+**Compute Nodes** (read-only) — `/api/v1/resources/nodes/`
+- `GET /nodes/regions/` — available regions
+- `GET /nodes/gpu_types/` — available GPU types
+- `GET /nodes/{id}/gpus/` — GPUs on a node
+
+**GPUs** (read-only) — `/api/v1/resources/gpus/`
+- `GET /gpus/available/` — currently available GPUs
+- `GET /gpus/availability/` — availability summary
+
+**Allocations** — `/api/v1/resources/allocations/`
+- `POST /allocations/{id}/release/` — release an allocation
+- `POST /allocations/{id}/extend/` — extend an allocation
+- `GET  /allocations/active/` — active allocations
+- `GET  /allocations/stats/` — allocation statistics
+
+**Quotas** — `/api/v1/resources/quotas/`
+- `GET  /quotas/current/` — current quota usage
+- `POST /quotas/{id}/reset_usage/` — reset usage counters
+
+**Reservations** — `/api/v1/resources/reservations/`
+- `POST /reservations/{id}/cancel/` — cancel a reservation
+- `POST /reservations/{id}/activate/` — activate a reservation
+- `GET  /reservations/upcoming/` — upcoming reservations
+
+### Training
+
+Mounted under `/api/v1/training/` via DRF routers.
+
+**Training Jobs** — `/api/v1/training/jobs/`
+- `POST /jobs/{id}/submit/` — submit a job to the queue
+- `POST /jobs/{id}/cancel/` — cancel a job
+- `POST /jobs/{id}/retry/` — retry a job
+- `POST /jobs/{id}/update_progress/` — report progress
+- `POST /jobs/{id}/checkpoint/` — record a checkpoint
+- `GET  /jobs/{id}/runs/` — runs for a job
+- `GET  /jobs/{id}/artifacts/` — artifacts for a job
+- `GET  /jobs/{id}/logs/` — job logs
+- `GET  /jobs/running/`, `/jobs/queued/`, `/jobs/stats/` — collection views
+
+**Training Runs** (read-only) — `/api/v1/training/runs/`
+
+**Experiments** — `/api/v1/training/experiments/`
+- `GET /experiments/{id}/jobs/` — jobs in an experiment
+- `GET /experiments/{id}/sweeps/` — sweeps in an experiment
+
+**Hyperparameter Sweeps** — `/api/v1/training/sweeps/`
+- `POST /sweeps/{id}/start/` — start a sweep
+- `POST /sweeps/{id}/stop/` — stop a sweep
+- `GET  /sweeps/{id}/next_params/` — next hyperparameters to try
+- `POST /sweeps/{id}/report_trial/` — report a trial result
+
+**Model Artifacts** (read-only) — `/api/v1/training/artifacts/`
+- `GET /artifacts/best/` — best artifact by metric
 
 ## Request/Response Format
 
@@ -630,7 +512,7 @@ import requests
 
 try:
     response = requests.get(
-        'https://api.saas-platform.com/api/v1/projects/',
+        'https://api.saas-platform.com/api/v1/tenants/',
         headers={'Authorization': f'Bearer {token}'}
     )
     response.raise_for_status()
@@ -651,7 +533,7 @@ except requests.exceptions.HTTPError as e:
 #### JavaScript
 ```javascript
 try {
-  const response = await fetch('https://api.saas-platform.com/api/v1/projects/', {
+  const response = await fetch('https://api.saas-platform.com/api/v1/tenants/', {
     headers: {
       'Authorization': `Bearer ${token}`
     }
@@ -689,13 +571,15 @@ Retry-After: 60
 
 ### Rate Limits by Endpoint
 
-| Endpoint Pattern | Limit | Window |
-|-----------------|-------|---------|
-| /api/v1/auth/* | 5 | 1 minute |
-| /api/v1/projects/* | 100 | 1 hour |
-| /api/v1/files/upload/ | 10 | 1 minute |
-| /api/v1/analytics/* | 50 | 1 hour |
-| Default | 1000 | 1 hour |
+Auth endpoints use DRF's `ScopedRateThrottle`. The scopes below are applied per view; other authenticated endpoints fall back to the default throttle.
+
+| Endpoint Pattern | Throttle Scope | Notes |
+|-----------------|----------------|-------|
+| POST /api/v1/auth/register/ | `auth_register` | Registration |
+| POST /api/v1/auth/login/ | `auth_login` | Login |
+| POST /api/v1/auth/token/refresh/ | `auth_token_refresh` | Token refresh |
+| POST /api/v1/auth/password/reset/ | `auth_password_reset` | Password reset request/confirm |
+| Default | (DRF default) | All other authenticated endpoints |
 
 ### Handling Rate Limits
 ```python
@@ -716,238 +600,91 @@ def api_request_with_retry(url, headers, max_retries=3):
 
 ## Webhooks
 
-### Webhook Events
+The platform exposes a single inbound webhook: the Stripe billing webhook. It is
+consumed by the platform (not registered by API clients) and is used to keep
+subscription, invoice, and payment state in sync with Stripe.
 
-| Event | Description | Payload |
-|-------|-------------|---------|
-| project.created | New project created | Project object |
-| project.updated | Project updated | Project object with changes |
-| project.deleted | Project deleted | Project ID |
-| user.created | New user registered | User object |
-| subscription.created | New subscription | Subscription object |
-| subscription.updated | Subscription changed | Subscription object |
-| subscription.canceled | Subscription canceled | Subscription object |
-| payment.succeeded | Payment successful | Payment object |
-| payment.failed | Payment failed | Payment object with error |
-
-### Registering Webhooks
+### Stripe Webhook Endpoint
 ```http
-POST /api/v1/webhooks/
-Authorization: Bearer {access_token}
+POST /api/v1/billing/webhooks/stripe/
+Stripe-Signature: {signature}
 Content-Type: application/json
 
-{
-  "url": "https://your-app.com/webhook",
-  "events": ["project.created", "project.updated"],
-  "secret": "your-webhook-secret"
-}
+{ ...standard Stripe event payload... }
 ```
+The endpoint is public (no bearer token) but verifies the `Stripe-Signature`
+header against the configured webhook signing secret before processing. Relevant
+Stripe events (e.g. `checkout.session.completed`, `customer.subscription.updated`,
+`invoice.paid`, `invoice.payment_failed`) update the corresponding
+`Subscription`, `Invoice`, and `PaymentMethod` records.
 
-### Webhook Payload
-```json
-{
-  "id": "evt_550e8400e29b41d4a716446655440000",
-  "type": "project.created",
-  "created": "2024-01-15T10:30:00Z",
-  "data": {
-    "object": {
-      "id": "proj_123",
-      "name": "New Project",
-      "created_at": "2024-01-15T10:30:00Z"
-    }
-  }
-}
-```
+Configure this URL as a webhook destination in the Stripe Dashboard and set the
+signing secret via the `STRIPE_WEBHOOK_SECRET` setting.
 
-### Webhook Security
+## Client Examples
+
+The API is a plain JSON REST API authenticated with a JWT bearer token; any HTTP
+client works. The examples below use real endpoints.
+
+### Python (requests)
 ```python
-import hmac
-import hashlib
+import requests
 
-def verify_webhook(payload, signature, secret):
-    expected_sig = hmac.new(
-        secret.encode(),
-        payload.encode(),
-        hashlib.sha256
-    ).hexdigest()
+BASE = 'http://localhost:8000/api/v1'
 
-    return hmac.compare_digest(expected_sig, signature)
+# Login to obtain tokens
+resp = requests.post(f'{BASE}/auth/login/', json={
+    'email': 'user@example.com',
+    'password': 'YourPassword123!',
+})
+tokens = resp.json()
+headers = {'Authorization': f"Bearer {tokens['access_token']}"}
 
-# In your webhook handler
-@app.route('/webhook', methods=['POST'])
-def handle_webhook():
-    signature = request.headers.get('X-Webhook-Signature')
+# Current user
+me = requests.get(f'{BASE}/auth/me/', headers=headers).json()
 
-    if not verify_webhook(request.data, signature, WEBHOOK_SECRET):
-        return {'error': 'Invalid signature'}, 401
+# List the tenants I belong to
+tenants = requests.get(f'{BASE}/tenants/', headers=headers).json()
 
-    event = request.json
-    # Process webhook event
-    return {'status': 'success'}, 200
-```
+# Create a tenant
+tenant = requests.post(f'{BASE}/tenants/', headers=headers, json={
+    'name': 'Acme Corp', 'slug': 'acme-corp',
+}).json()
 
-## SDK Examples
+# List available plans
+plans = requests.get(f'{BASE}/billing/plans/', headers=headers).json()
 
-### Python SDK
-```python
-from saas_platform import Client
-
-# Initialize client
-client = Client(api_key='sk_live_...')
-
-# Get current user
-user = client.users.me()
-
-# List projects
-projects = client.projects.list(
-    organization_id='org_123',
-    status='active'
-)
-
-# Create project
-new_project = client.projects.create(
-    name='New Project',
-    description='Description',
-    organization_id='org_123'
-)
-
-# Upload file
-with open('document.pdf', 'rb') as f:
-    file = client.files.upload(
-        file=f,
-        project_id='proj_123',
-        folder_path='/documents'
-    )
-
-# Subscribe to plan
-subscription = client.subscriptions.create(
-    plan_id='plan_pro',
-    payment_method='pm_card_visa'
-)
-```
-
-### JavaScript/TypeScript SDK
-```typescript
-import { SaaSPlatformClient } from '@saas-platform/sdk';
-
-// Initialize client
-const client = new SaaSPlatformClient({
-  apiKey: 'sk_live_...',
-});
-
-// Get current user
-const user = await client.users.me();
-
-// List projects
-const projects = await client.projects.list({
-  organizationId: 'org_123',
-  status: 'active',
-});
-
-// Create project
-const newProject = await client.projects.create({
-  name: 'New Project',
-  description: 'Description',
-  organizationId: 'org_123',
-});
-
-// Upload file
-const file = await client.files.upload({
-  file: fileInput.files[0],
-  projectId: 'proj_123',
-  folderPath: '/documents',
-});
-
-// Subscribe to plan
-const subscription = await client.subscriptions.create({
-  planId: 'plan_pro',
-  paymentMethod: 'pm_card_visa',
-});
+# List training jobs
+jobs = requests.get(f'{BASE}/training/jobs/', headers=headers).json()
 ```
 
 ### cURL Examples
 ```bash
-# Get current user
-curl -X GET https://api.saas-platform.com/api/v1/users/me/ \
+BASE=http://localhost:8000/api/v1
+
+# Login
+curl -X POST $BASE/auth/login/ \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","password":"YourPassword123!"}'
+
+# Current user
+curl -X GET $BASE/auth/me/ \
   -H "Authorization: Bearer ${ACCESS_TOKEN}"
 
-# Create project
-curl -X POST https://api.saas-platform.com/api/v1/projects/ \
+# Create a tenant
+curl -X POST $BASE/tenants/ \
   -H "Authorization: Bearer ${ACCESS_TOKEN}" \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "New Project",
-    "description": "Project description",
-    "organization_id": "org_123"
-  }'
+  -d '{"name":"Acme Corp","slug":"acme-corp"}'
 
-# Upload file
-curl -X POST https://api.saas-platform.com/api/v1/files/upload/ \
-  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-  -F "file=@document.pdf" \
-  -F "project_id=proj_123" \
-  -F "folder_path=/documents"
+# Get a tenant's subscription
+curl -X GET $BASE/billing/tenants/${TENANT_ID}/subscription/ \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}"
+
+# Submit a training job
+curl -X POST $BASE/training/jobs/${JOB_ID}/submit/ \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}"
 ```
-
-## GraphQL Alternative (Beta)
-
-```graphql
-# Query example
-query GetProjectsAndUser {
-  me {
-    id
-    username
-    email
-    organization {
-      id
-      name
-      projects(status: ACTIVE, first: 10) {
-        edges {
-          node {
-            id
-            name
-            description
-            membersCount
-            createdAt
-          }
-        }
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-      }
-    }
-  }
-}
-
-# Mutation example
-mutation CreateProject($input: CreateProjectInput!) {
-  createProject(input: $input) {
-    project {
-      id
-      name
-      slug
-    }
-    errors {
-      field
-      message
-    }
-  }
-}
-```
-
-## API Testing
-
-### Postman Collection
-Download our Postman collection: [SaaS Platform API.postman_collection.json](https://api.saas-platform.com/postman)
-
-### API Playground
-Interactive API documentation: https://api.saas-platform.com/playground
-
-### Test Environment
-- Base URL: https://sandbox-api.saas-platform.com
-- Test API Key: `sk_test_EXAMPLEONLYnotARealKey00`
-- Rate Limits: 10x higher than production
 
 ## Support
 
