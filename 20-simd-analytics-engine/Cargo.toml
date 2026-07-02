@@ -20,4 +20,8 @@ harness = false
 
 [features]
 default = []
+# Scaffolded hint flag: the kernels in `simd.rs` rely on LLVM auto-vectorization,
+# not hand-written `std::arch` intrinsics. This feature carries no intrinsic code;
+# real AVX2 instruction selection is driven by the target CPU and the optimizer
+# (e.g. `RUSTFLAGS="-C target-cpu=native"`). See docs/BLUEPRINT.md.
 avx2 = []

@@ -28,15 +28,32 @@ impl<T: Copy + Default> AlignedVec<T> {
             });
         }
 
-        let layout = Layout::from_size_align(
-            capacity * std::mem::size_of::<T>(),
-            alignment,
-        ).map_err(|_| Error::AlignmentError(format!(
-            "Invalid alignment {} for size {}",
-            alignment,
-            capacity * std::mem::size_of::<T>()
-        )))?;
+        // Compute the byte size with an overflow check. Without this, a large
+        // `capacity` could wrap `usize` and produce a layout smaller than the
+        // caller asked for, leading to out-of-bounds writes in `push`/`set`.
+        let size = capacity
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| {
+                Error::AlignmentError(format!(
+                    "Capacity {} overflows when multiplied by element size {}",
+                    capacity,
+                    std::mem::size_of::<T>()
+                ))
+            })?;
 
+        let layout = Layout::from_size_align(size, alignment).map_err(|_| {
+            Error::AlignmentError(format!(
+                "Invalid alignment {} for size {}",
+                alignment, size
+            ))
+        })?;
+
+        // SAFETY: `layout` has non-zero size (capacity != 0 checked above and
+        // `size_of::<T>()` > 0 for the concrete instantiations used here) and a
+        // valid alignment. The returned pointer, if non-null, points to
+        // `capacity` uninitialized, properly aligned `T` slots that this
+        // `AlignedVec` owns exclusively and frees with the identical layout in
+        // `Drop`. `len` stays 0 so no uninitialized slot is ever read.
         let ptr = unsafe {
             let ptr = alloc(layout) as *mut T;
             if ptr.is_null() {
@@ -437,6 +454,23 @@ mod tests {
 
         assert_eq!(vec.len(), 100);
         assert_eq!(vec.get(50).unwrap(), 50.0);
+    }
+
+    #[test]
+    fn test_aligned_vec_capacity_overflow_is_rejected() {
+        // capacity * size_of::<i64>() overflows usize; must return an error
+        // instead of wrapping to a small allocation (which would let `push`
+        // write out of bounds).
+        let huge = usize::MAX / 4;
+        let result = AlignedVec::<i64>::with_capacity(huge);
+        assert!(result.is_err(), "expected capacity overflow to be rejected");
+    }
+
+    #[test]
+    fn test_aligned_vec_zero_capacity_is_ok() {
+        let vec: AlignedVec<f64> = AlignedVec::with_capacity(0).unwrap();
+        assert_eq!(vec.len(), 0);
+        assert!(vec.is_empty());
     }
 
     #[test]

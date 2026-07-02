@@ -135,6 +135,15 @@ impl<K: Clone + Eq + Hash, V: Clone> HashTable<K, V> {
         Self::new(64)
     }
 
+    /// Override the maximum load factor before an automatic resize.
+    ///
+    /// Values are clamped to `(0.0, 1.0]`. A value at or near `1.0` disables
+    /// eager load-factor-driven resizing, in which case the table still grows
+    /// on demand if a probe sequence exhausts the current capacity.
+    pub fn set_max_load_factor(&mut self, factor: f64) {
+        self.max_load_factor = factor.clamp(f64::MIN_POSITIVE, 1.0);
+    }
+
     /// Get the number of entries.
     pub fn len(&self) -> usize {
         self.len
@@ -163,35 +172,47 @@ impl<K: Clone + Eq + Hash, V: Clone> HashTable<K, V> {
     }
 
     /// Insert a key-value pair.
+    ///
+    /// The table grows automatically to keep the load factor under
+    /// `max_load_factor`. If a probe sequence ever exhausts the current
+    /// capacity (a pathological clustering case), the table is grown and the
+    /// probe retried, so this never panics or fails to insert.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         if self.load_factor() > self.max_load_factor {
             self.resize();
         }
 
-        let mut idx = self.hash_to_index(&key);
-        let mut distance = 0;
-
         loop {
-            match &self.keys[idx] {
-                None => {
-                    self.keys[idx] = Some(key);
-                    self.values[idx] = Some(value);
-                    self.len += 1;
-                    return None;
-                }
-                Some(existing) if existing == &key => {
-                    let old = self.values[idx].take();
-                    self.values[idx] = Some(value);
-                    return old;
-                }
-                Some(_) => {
-                    idx = (idx + 1) & self.mask;
-                    distance += 1;
-                    if distance >= self.capacity {
-                        panic!("Hash table is full");
+            let mut idx = self.hash_to_index(&key);
+            let mut distance = 0;
+
+            loop {
+                match &self.keys[idx] {
+                    None => {
+                        self.keys[idx] = Some(key);
+                        self.values[idx] = Some(value);
+                        self.len += 1;
+                        return None;
+                    }
+                    Some(existing) if existing == &key => {
+                        let old = self.values[idx].take();
+                        self.values[idx] = Some(value);
+                        return old;
+                    }
+                    Some(_) => {
+                        idx = (idx + 1) & self.mask;
+                        distance += 1;
+                        if distance >= self.capacity {
+                            // Probe sequence exhausted: grow and retry the
+                            // whole probe against the larger table instead of
+                            // panicking.
+                            break;
+                        }
                     }
                 }
             }
+
+            self.resize();
         }
     }
 
@@ -245,6 +266,9 @@ impl<K: Clone + Eq + Hash, V: Clone> HashTable<K, V> {
     }
 
     /// Get or insert with default.
+    ///
+    /// Like [`insert`](Self::insert), the table grows automatically rather than
+    /// panicking if a probe sequence exhausts the current capacity.
     pub fn get_or_insert_with<F>(&mut self, key: K, f: F) -> &mut V
     where
         F: FnOnce() -> V,
@@ -253,29 +277,47 @@ impl<K: Clone + Eq + Hash, V: Clone> HashTable<K, V> {
             self.resize();
         }
 
-        let mut idx = self.hash_to_index(&key);
-        let mut distance = 0;
+        // Locate the slot index first (growing/retrying if the probe sequence
+        // is exhausted), then borrow it mutably. Splitting the search from the
+        // borrow keeps the borrow checker happy across the retry loop. `f` is
+        // wrapped in an `Option` so the `FnOnce` is only consumed on the single
+        // insertion path (retries never reach the `None` branch before growing).
+        let mut f = Some(f);
+        let slot = loop {
+            let mut idx = self.hash_to_index(&key);
+            let mut distance = 0;
 
-        loop {
-            match &self.keys[idx] {
-                None => {
-                    self.keys[idx] = Some(key);
-                    self.values[idx] = Some(f());
-                    self.len += 1;
-                    return self.values[idx].as_mut().unwrap();
-                }
-                Some(existing) if existing == &key => {
-                    return self.values[idx].as_mut().unwrap();
-                }
-                Some(_) => {
-                    idx = (idx + 1) & self.mask;
-                    distance += 1;
-                    if distance >= self.capacity {
-                        panic!("Hash table is full");
+            let found = loop {
+                match &self.keys[idx] {
+                    None => {
+                        self.keys[idx] = Some(key.clone());
+                        self.values[idx] = Some((f.take().unwrap())());
+                        self.len += 1;
+                        break Some(idx);
+                    }
+                    Some(existing) if existing == &key => {
+                        break Some(idx);
+                    }
+                    Some(_) => {
+                        idx = (idx + 1) & self.mask;
+                        distance += 1;
+                        if distance >= self.capacity {
+                            break None;
+                        }
                     }
                 }
+            };
+
+            match found {
+                Some(idx) => break idx,
+                None => {
+                    // Probe exhausted: grow and retry against the larger table.
+                    self.resize();
+                }
             }
-        }
+        };
+
+        self.values[slot].as_mut().unwrap()
     }
 
     /// Resize the hash table.
@@ -844,6 +886,48 @@ mod tests {
         for i in 0..100 {
             assert_eq!(table.get(&i), Some(&(i as i32 * 10)));
         }
+    }
+
+    #[test]
+    fn test_hash_table_grows_instead_of_panicking_when_full() {
+        // Disable eager load-factor resizing so inserts push the table right up
+        // to (and past) full occupancy, exercising the probe-exhaustion path
+        // that previously called `panic!("Hash table is full")`.
+        let mut table: HashTable<i64, i64> = HashTable::new(8);
+        table.set_max_load_factor(1.0);
+
+        // Insert more distinct keys than the initial capacity. Each key that
+        // exhausts the probe sequence must trigger a graceful grow-and-retry.
+        for i in 0..64 {
+            table.insert(i, i * 100);
+        }
+
+        assert_eq!(table.len(), 64);
+        assert!(table.capacity() >= 64);
+        for i in 0..64 {
+            assert_eq!(table.get(&i), Some(&(i * 100)));
+        }
+    }
+
+    #[test]
+    fn test_get_or_insert_with_grows_instead_of_panicking_when_full() {
+        let mut table: HashTable<i64, i64> = HashTable::new(8);
+        table.set_max_load_factor(1.0);
+
+        for i in 0..64 {
+            let v = table.get_or_insert_with(i, || i * 7);
+            assert_eq!(*v, i * 7);
+        }
+
+        assert_eq!(table.len(), 64);
+        for i in 0..64 {
+            assert_eq!(table.get(&i), Some(&(i * 7)));
+        }
+
+        // Existing keys must be returned without inserting duplicates.
+        let existing = table.get_or_insert_with(10, || -1);
+        assert_eq!(*existing, 70);
+        assert_eq!(table.len(), 64);
     }
 
     #[test]
