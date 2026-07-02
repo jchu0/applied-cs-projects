@@ -1,8 +1,13 @@
 //! Python Subset Compiler/Interpreter.
 //!
-//! A complete compilation pipeline from source code to execution,
-//! including lexical analysis, parsing, semantic analysis, bytecode
-//! generation, and a virtual machine with garbage collection.
+//! A compilation pipeline from source code to execution: lexical analysis,
+//! recursive-descent/Pratt parsing, direct bytecode generation from the AST,
+//! and a stack-based virtual machine. There is no separate semantic-analysis
+//! pass and no garbage collector — runtime objects use `Rc`/`RefCell`
+//! reference counting, so reference cycles are not reclaimed. The [`run`]
+//! function ties the stages together to take a source string to a [`Value`].
+//!
+//! [`Value`]: value::Value
 
 pub mod token;
 pub mod lexer;
