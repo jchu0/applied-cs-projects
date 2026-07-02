@@ -684,3 +684,116 @@ class TestTimestepSensitivity:
 
         # Both should reach approximately same time
         np.testing.assert_allclose(state_large.time, state_small.time, atol=0.001)
+
+
+class TestFreeBodyIntegration:
+    """Tests that a body with a FREE (or BALL) joint integrates correctly.
+
+    A FREE joint has 7 qpos (3 position + 4 quaternion) but only 6 qvel
+    (3 linear + 3 angular), so a flat  qpos + qvel * dt  is dimensionally
+    invalid. The integrator must advance position linearly and the quaternion
+    through the angular velocity. These tests exercise the most basic case a
+    physics engine must handle: an unconstrained rigid body.
+    """
+
+    @staticmethod
+    def _make_free_model(joint_type, timestep=0.01):
+        model = Model()
+        model.timestep = timestep
+        model.integrator = "semi_implicit"
+        model.gravity = np.zeros(3)  # isolate the integration from dynamics
+
+        body = Body(
+            name="floater",
+            inertia=Inertia.from_sphere(mass=1.0, radius=0.5),
+            parent=-1,
+            geoms=[Geom(GeomType.SPHERE, np.array([0.5]))],
+            pos=np.zeros(3),
+            quat=np.array([1.0, 0.0, 0.0, 0.0]),
+        )
+        model.add_body(body)
+        model.add_joint(Joint(joint_type=joint_type, parent_body=-1, child_body=0))
+        return model
+
+    def test_free_joint_steps_without_crash(self):
+        """Stepping a FREE-joint body must not raise (regression for the
+        qpos(7)/qvel(6) broadcast bug)."""
+        model = self._make_free_model(JointType.FREE)
+        integrator = Integrator(model)
+        state = State.create(model)
+        state.qvel[:3] = np.array([1.0, 2.0, -0.5])   # linear
+        state.qvel[3:6] = np.array([0.3, -0.2, 1.0])  # angular
+
+        for _ in range(20):
+            state = integrator.step(state, np.zeros(model.nu))
+
+        assert state.qpos.shape == (7,)
+        assert np.all(np.isfinite(state.qpos))
+
+    def test_free_body_quaternion_stays_normalized(self):
+        """The orientation quaternion must remain a unit quaternion."""
+        model = self._make_free_model(JointType.FREE)
+        integrator = Integrator(model)
+        state = State.create(model)
+        state.qvel[3:6] = np.array([0.5, -1.0, 2.0])
+
+        for _ in range(50):
+            state = integrator.step(state, np.zeros(model.nu))
+            q = state.qpos[3:7]
+            assert abs(np.linalg.norm(q) - 1.0) < 1e-6
+
+    def test_free_body_translates_by_velocity(self):
+        """Under zero force/gravity a free body translates by lin_vel * dt."""
+        model = self._make_free_model(JointType.FREE)
+        integrator = Integrator(model)
+        state = State.create(model)
+        lin = np.array([1.0, 2.0, -0.5])
+        state.qvel[:3] = lin
+
+        n_steps = 50
+        for _ in range(n_steps):
+            state = integrator.step(state, np.zeros(model.nu))
+
+        expected = lin * (n_steps * model.timestep)
+        np.testing.assert_allclose(state.qpos[:3], expected, atol=1e-9)
+
+    def test_free_body_rotation_matches_omega(self):
+        """A constant angular velocity about z produces the expected rotation.
+
+        For omega = [0, 0, w], after time t the quaternion should be
+        approximately [cos(wt/2), 0, 0, sin(wt/2)].
+        """
+        w = 1.0
+        model = self._make_free_model(JointType.FREE, timestep=0.001)
+        integrator = Integrator(model)
+        state = State.create(model)
+        state.qvel[3:6] = np.array([0.0, 0.0, w])
+
+        n_steps = 500
+        for _ in range(n_steps):
+            state = integrator.step(state, np.zeros(model.nu))
+
+        t = n_steps * model.timestep
+        q = state.qpos[3:7]
+        # Rotation is purely about z: x and y components stay ~0.
+        assert abs(q[1]) < 1e-6
+        assert abs(q[2]) < 1e-6
+        np.testing.assert_allclose(q[0], np.cos(w * t / 2), atol=1e-3)
+        np.testing.assert_allclose(q[3], np.sin(w * t / 2), atol=1e-3)
+
+    def test_ball_joint_orientation_integration(self):
+        """A BALL joint (4 qpos over 3 qvel) integrates its quaternion and
+        stays normalized."""
+        model = self._make_free_model(JointType.BALL)
+        integrator = Integrator(model)
+        state = State.create(model)
+        # State.create should seed identity quaternion for the ball joint.
+        np.testing.assert_allclose(state.qpos[:4], [1.0, 0.0, 0.0, 0.0])
+        state.qvel[:3] = np.array([0.0, 0.0, 2.0])
+
+        for _ in range(50):
+            state = integrator.step(state, np.zeros(model.nu))
+            assert abs(np.linalg.norm(state.qpos[:4]) - 1.0) < 1e-6
+
+        t = 50 * model.timestep
+        np.testing.assert_allclose(state.qpos[0], np.cos(2.0 * t / 2), atol=1e-3)

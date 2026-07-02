@@ -464,7 +464,12 @@ def constraint_solver(falling_sphere_model):
 
 @pytest.fixture
 def simple_hinge_model():
-    """Simple hinge joint model for integration testing (avoids qpos/qvel dimension mismatch)."""
+    """Simple hinge joint model for 1-DOF integration testing.
+
+    (Free-joint stepping, where qpos has 7 components and qvel has 6, is now
+    integrated correctly and is exercised directly in
+    tests/test_integration.py::TestFreeBodyIntegration.)
+    """
     model = Model()
     model.timestep = 0.002
     model.integrator = "euler"

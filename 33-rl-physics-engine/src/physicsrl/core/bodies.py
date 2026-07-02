@@ -333,6 +333,15 @@ class State:
         state.qacc = np.zeros(model.nv)
         state.ctrl = np.zeros(model.nu)
 
+        # Initialize orientation quaternions to identity so joints that carry an
+        # orientation DOF (FREE, BALL) start on the unit sphere. A zeroed
+        # quaternion is not a valid rotation and blows up on normalization.
+        for joint in model.joints:
+            if joint.joint_type == JointType.FREE:
+                state.qpos[joint.qpos_idx + 3] = 1.0  # w of [pos, quat]
+            elif joint.joint_type == JointType.BALL:
+                state.qpos[joint.qpos_idx] = 1.0       # w of quat
+
         state.xpos = np.zeros((model.nbody, 3))
         state.xquat = np.zeros((model.nbody, 4))
         state.xquat[:, 0] = 1  # Identity quaternion
