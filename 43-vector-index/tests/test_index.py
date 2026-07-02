@@ -525,3 +525,57 @@ class TestIndexComparison:
         # For approximate indexes, the query should be in top results
         assert 0 in ivf_result.ids
         assert 0 in hnsw_result.ids
+
+
+class TestInputValidation:
+    """Tests for clear errors on malformed public-API inputs."""
+
+    def test_flat_wrong_dim_query_raises(self, medium_dim, medium_vectors):
+        """Querying a FlatIndex with a wrong-dimension vector raises ValueError."""
+        index = FlatIndex(medium_dim, MetricType.L2)
+        index.add(medium_vectors)
+        bad_query = np.random.randn(medium_dim + 3).astype(np.float32)
+        with pytest.raises(ValueError, match="dimension"):
+            index.search(bad_query, k=5)
+
+    def test_ivf_wrong_dim_query_raises(self, ivf_index, medium_dim):
+        """Querying an IVFIndex with a wrong-dimension vector raises ValueError."""
+        index, _ = ivf_index
+        bad_query = np.random.randn(medium_dim - 1).astype(np.float32)
+        with pytest.raises(ValueError, match="dimension"):
+            index.search(bad_query, k=5)
+
+    def test_hnsw_wrong_dim_query_raises(self, hnsw_index, small_dim):
+        """Querying an HNSWIndex with a wrong-dimension vector raises ValueError."""
+        index, _ = hnsw_index
+        bad_query = np.random.randn(small_dim + 2).astype(np.float32)
+        with pytest.raises(ValueError, match="dimension"):
+            index.search(bad_query, k=5)
+
+    def test_ivfpq_wrong_dim_query_raises(self, ivfpq_index, medium_dim):
+        """Querying an IVFPQIndex with a wrong-dimension vector raises ValueError."""
+        index, _ = ivfpq_index
+        bad_query = np.random.randn(medium_dim + 8).astype(np.float32)
+        with pytest.raises(ValueError, match="dimension"):
+            index.search(bad_query, k=5)
+
+    def test_correct_dim_query_still_works(self, medium_dim, medium_vectors):
+        """A correctly-shaped query is unaffected by dimension validation."""
+        index = FlatIndex(medium_dim, MetricType.L2)
+        index.add(medium_vectors)
+        result = index.search(medium_vectors[0], k=5)
+        assert result.ids[0] == 0
+
+    def test_ivf_train_too_few_vectors_raises(self, medium_dim):
+        """Training IVF with fewer vectors than clusters raises a clear ValueError."""
+        index = IVFIndex(medium_dim, nlist=50, nprobe=1)
+        too_few = np.random.randn(10, medium_dim).astype(np.float32)
+        with pytest.raises(ValueError, match="cluster"):
+            index.train(too_few)
+
+    def test_ivfpq_train_too_few_vectors_raises(self, medium_dim):
+        """Training IVF-PQ with fewer vectors than coarse clusters raises ValueError."""
+        index = IVFPQIndex(medium_dim, nlist=50, M=8)
+        too_few = np.random.randn(10, medium_dim).astype(np.float32)
+        with pytest.raises(ValueError, match="cluster"):
+            index.train(too_few)

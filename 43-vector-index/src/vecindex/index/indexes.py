@@ -46,6 +46,22 @@ class Index(ABC):
     def __len__(self) -> int:
         return self.ntotal
 
+    def _check_query_dim(self, query: np.ndarray) -> np.ndarray:
+        """
+        Validate and normalize a query vector's dimensionality.
+
+        Returns the query as a NumPy array, raising a clear ``ValueError`` when
+        its last-axis dimension does not match the index dimension instead of
+        letting NumPy raise a cryptic shape-mismatch error deep in the search.
+        """
+        query = np.asarray(query)
+        qdim = query.shape[-1] if query.ndim >= 1 else 0
+        if qdim != self.dim:
+            raise ValueError(
+                f"Query dimension {qdim} does not match index dimension {self.dim}"
+            )
+        return query
+
 
 class FlatIndex(Index):
     """
@@ -78,7 +94,7 @@ class FlatIndex(Index):
         Returns:
             SearchResult with IDs and distances
         """
-        query = np.asarray(query)
+        query = self._check_query_dim(query)
         if query.ndim == 1:
             query = query.reshape(1, -1)
 
@@ -176,7 +192,7 @@ class IVFIndex(Index):
         Returns:
             SearchResult
         """
-        query = np.asarray(query)
+        query = self._check_query_dim(query)
         if query.ndim == 1:
             query = query.reshape(1, -1)
 
@@ -437,7 +453,7 @@ class HNSWIndex(Index):
         if self.entry_point == -1:
             return SearchResult(np.array([]), np.array([]))
 
-        query = np.asarray(query)
+        query = self._check_query_dim(query)
         if query.ndim == 2:
             query = query[0]
 
@@ -575,7 +591,7 @@ class IVFPQIndex(Index):
 
     def search(self, query: np.ndarray, k: int) -> SearchResult:
         """Search with asymmetric distance computation."""
-        query = np.asarray(query)
+        query = self._check_query_dim(query)
         if query.ndim == 1:
             query = query.reshape(1, -1)
 

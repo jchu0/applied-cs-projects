@@ -254,6 +254,12 @@ def kmeans(
     """
     n, d = vectors.shape
 
+    if k > n:
+        raise ValueError(
+            f"Cannot form {k} clusters from only {n} training vectors "
+            f"(need at least k={k} vectors)"
+        )
+
     # Initialize centroids randomly
     idx = np.random.choice(n, k, replace=False)
     centroids = vectors[idx].copy()
