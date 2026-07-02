@@ -2,6 +2,10 @@
 
 from .autograd import (
     Function,
+    FunctionContext,
+    Add,
+    Mul,
+    MatMul,
     ReLU,
     Sigmoid,
     Tanh,
@@ -20,6 +24,10 @@ from .autograd import (
 
 __all__ = [
     "Function",
+    "FunctionContext",
+    "Add",
+    "Mul",
+    "MatMul",
     "ReLU",
     "Sigmoid",
     "Tanh",

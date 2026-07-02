@@ -297,6 +297,26 @@ class TestONNXBackend:
         assert 'nodes' in onnx_dict
         assert len(onnx_dict['nodes']) == 1
 
+    def test_execute_not_implemented(self):
+        """execute() is a disclosed no-op that always raises NotImplementedError.
+
+        This backend only exports ONNX; in-process inference is out of scope,
+        so execute() must raise NotImplementedError regardless of whether
+        onnxruntime is installed (see README 'What's Real vs Simulated').
+        """
+        backend = ONNXBackend()
+
+        lowered = LoweredGraph(name="test")
+        lowered.add_input(TensorSpec(name="x", shape=(4,), dtype=DataType.FLOAT32))
+        lowered.add_node(LoweredNode(
+            name="relu_0", op_type="relu", inputs=["x"], outputs=["y"],
+        ))
+        lowered.add_output(TensorSpec(name="y", shape=(4,), dtype=DataType.FLOAT32))
+
+        compiled = backend.compile(lowered)
+        with pytest.raises(NotImplementedError):
+            backend.execute(compiled, {"x": np.zeros(4, dtype=np.float32)})
+
 
 class TestLoweringPasses:
     """Tests for lowering passes."""

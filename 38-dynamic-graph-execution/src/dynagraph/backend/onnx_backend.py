@@ -307,17 +307,17 @@ class ONNXBackend(BackendLowering):
     def execute(
         self, compiled: ONNXGraph, inputs: Dict[str, np.ndarray]
     ) -> Dict[str, np.ndarray]:
-        """Execute ONNX graph (requires onnxruntime)."""
-        try:
-            import onnxruntime as ort
-        except ImportError:
-            raise RuntimeError("onnxruntime is required for ONNX execution")
+        """Execute an ONNX graph in-process.
 
-        # This would require actually building the ONNX proto
-        # For now, raise an informative error
+        Not implemented: this backend only exports ONNX (see ``export_onnx``
+        and ``to_onnx_dict``); it does not run an in-process ONNX inference
+        session. This raises ``NotImplementedError`` unconditionally regardless
+        of whether ``onnxruntime`` is installed.
+        """
         raise NotImplementedError(
-            "Full ONNX execution requires building ONNX proto. "
-            "Use export_onnx() to save and run with onnxruntime separately."
+            "ONNXBackend.execute() is not implemented: this backend only "
+            "exports ONNX graphs. Use export_onnx() to save a model and run it "
+            "with onnxruntime (or another ONNX runtime) separately."
         )
 
     def export_onnx(self, graph: LoweredGraph, filepath: str) -> None:

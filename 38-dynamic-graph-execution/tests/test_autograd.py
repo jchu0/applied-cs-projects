@@ -633,3 +633,31 @@ class TestHessian:
         y = (x * x).sum()
         with pytest.raises(NotImplementedError):
             hessian(y, x)
+
+
+class TestPublicAPIExports:
+    """The autograd package must re-export the public built-in ops the README
+    documents alongside the activations (Add, Mul, MatMul), plus FunctionContext,
+    so `from dynagraph.autograd import ...` matches the docs."""
+
+    def test_builtin_ops_reexported(self):
+        from dynagraph import autograd as ag
+
+        for name in ("Add", "Mul", "MatMul", "ReLU", "Sigmoid", "Tanh",
+                     "Softmax", "FunctionContext"):
+            assert name in ag.__all__, f"{name} missing from dynagraph.autograd.__all__"
+            assert hasattr(ag, name), f"{name} not importable from dynagraph.autograd"
+
+    def test_reexported_ops_are_functions(self):
+        from dynagraph.autograd import Add, Mul, MatMul, Function
+
+        for op in (Add, Mul, MatMul):
+            assert issubclass(op, Function)
+
+    def test_reexported_matmul_apply_matches_operator(self):
+        from dynagraph.autograd import MatMul
+
+        a = Tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        b = Tensor([[5.0, 6.0], [7.0, 8.0]], requires_grad=True)
+        out = MatMul.apply(a, b)
+        np.testing.assert_allclose(out.data, (a @ b).data, rtol=1e-6)
