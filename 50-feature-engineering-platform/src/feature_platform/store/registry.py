@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Set
 import hashlib
 
 from feature_platform.core.models import Feature, FeatureView, Entity, FeatureSource
+from feature_platform.store.offline import validate_feature_view_name
 
 
 @dataclass
@@ -261,7 +262,12 @@ class FeatureRegistry:
         Register a feature view.
 
         If the feature view already exists, creates a new version.
+
+        The view name is validated (letters, digits, underscores only)
+        because offline stores interpolate it into SQL table names.
         """
+        validate_feature_view_name(feature_view.name)
+
         # Register entities first
         for entity in feature_view.entities:
             if entity.name not in self._entities:

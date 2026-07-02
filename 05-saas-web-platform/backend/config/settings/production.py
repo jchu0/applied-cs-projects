@@ -3,12 +3,21 @@ Production settings for SaaS platform.
 """
 import os
 import dj_database_url
+from django.core.exceptions import ImproperlyConfigured
 from .base import *
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.environ['DJANGO_SECRET_KEY']
 
 DEBUG = False
+
+# JWT secret must be provided explicitly in production; there is no fallback.
+JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
+if not JWT_SECRET_KEY:
+    raise ImproperlyConfigured(
+        'The JWT_SECRET_KEY environment variable must be set when running '
+        'with production settings.'
+    )
 
 ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '').split(',')
 

@@ -11,9 +11,9 @@ from fixtures import (
     temp_directory, generate_test_data, create_mock_block
 )
 
-from hdfs.datanode.datanode import DataNode
+from hdfs.datanode.datanode import DataNode, DataNodeServer, InvalidBlockIDError
 from hdfs.common.types import BlockID, Block, generate_block_id
-from hdfs.common.protocol import HDFSError
+from hdfs.common.protocol import HDFSError, Message, MessageType
 
 
 class TestDataNode:
@@ -76,6 +76,44 @@ class TestDataNode:
             # Try to retrieve non-existent block
             with pytest.raises(HDFSError):
                 dn.retrieve_block(generate_block_id())
+
+    def test_malicious_block_id_rejected(self):
+        """Path-traversal block IDs must be rejected before touching disk."""
+        with temp_directory() as data_dir:
+            dn = DataNode("test-dn", data_dir)
+
+            malicious_ids = [
+                "../../etc/passwd",
+                "..",
+                "blk_../secret",
+                "/etc/passwd",
+                "blk_abc/../../escape",
+                "",
+            ]
+            for block_id in malicious_ids:
+                with pytest.raises(InvalidBlockIDError):
+                    dn.write_block(block_id, b"payload")
+                assert block_id not in dn._blocks
+
+            # No file escaped the blocks directory
+            assert not os.path.exists(os.path.join(data_dir, "..", "escape"))
+
+    @pytest.mark.asyncio
+    async def test_malicious_block_id_rejected_over_wire(self):
+        """Server returns an ERROR response for a traversal block_id."""
+        with temp_directory() as data_dir:
+            dn = DataNode("test-dn", data_dir)
+            server = DataNodeServer(dn)
+
+            message = Message(MessageType.WRITE_BLOCK, {
+                "block_id": "../../etc/passwd",
+                "data": b"payload".hex()
+            })
+
+            response = await server._process_message(message, None, None)
+
+            assert response.msg_type == MessageType.ERROR
+            assert "../../etc/passwd" not in dn._blocks
 
     def test_delete_block(self):
         """Test block deletion."""

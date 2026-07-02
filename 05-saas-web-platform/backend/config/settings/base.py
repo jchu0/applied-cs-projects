@@ -137,7 +137,10 @@ EMAIL_BACKEND = os.environ.get(
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@saas-platform.com')
 
 # JWT Settings
-JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'your-secret-key')
+# SECURITY: no insecure default here. The development settings module supplies
+# a dev-only fallback, and production.py raises ImproperlyConfigured when the
+# environment variable is missing.
+JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
 JWT_ALGORITHM = 'HS256'
 JWT_EXPIRATION_HOURS = 24
 

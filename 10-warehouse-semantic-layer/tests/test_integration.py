@@ -168,8 +168,8 @@ class TestEndToEndIntegration:
             metrics=["unique_customers"],
             dimensions=["customer_segment", "region"],
             filters=[
-                {"field": "region", "operator": "IN", "value": "('NA', 'EU')"},
-                {"field": "customer_segment", "operator": "!=", "value": "'unknown'"}
+                {"field": "region", "operator": "IN", "value": ["NA", "EU"]},
+                {"field": "customer_segment", "operator": "!=", "value": "unknown"}
             ],
             time_grain="month",
             start_date="2024-01-01",
@@ -420,7 +420,7 @@ class TestPerformanceAndScale:
             metrics=["complex_metric"],
             dimensions=[f"dim_{i}" for i in range(10)],  # Query 10 dimensions
             filters=[
-                {"field": f"user_filter_{i}", "operator": "IN", "value": f"({i},{i+1},{i+2})"}
+                {"field": f"user_filter_{i}", "operator": "IN", "value": [i, i + 1, i + 2]}
                 for i in range(5)  # Add 5 more filters
             ],
             time_grain="day",
@@ -436,10 +436,10 @@ class TestPerformanceAndScale:
         assert "SUM(amount)" in sql
         for i in range(10):
             assert f"dim_{i}" in sql  # Dimensions in SELECT and GROUP BY
-            assert f"filter_{i} = value_{i}" in sql  # Metric filters
+            assert f"filter_{i} = 'value_{i}'" in sql  # Metric filters (escaped literals)
 
         for i in range(5):
-            assert f"user_filter_{i} IN ({i},{i+1},{i+2})" in sql  # Query filters
+            assert f"user_filter_{i} IN ({i}, {i+1}, {i+2})" in sql  # Query filters
 
         assert "LIMIT 1000" in sql
         assert "OFFSET 0" in sql

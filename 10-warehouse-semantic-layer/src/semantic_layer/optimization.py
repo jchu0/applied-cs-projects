@@ -19,6 +19,12 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from semantic_layer.models import MetricQuery, TimeGrain
+from semantic_layer.query_engine import (
+    VALID_TIME_GRAINS,
+    render_filter_condition,
+    validate_identifier,
+    validate_iso_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -463,7 +469,16 @@ class QueryPlanner:
         table_name: str,
         warehouse_type: str,
     ) -> str:
-        """Generate SQL for the query."""
+        """Generate SQL for the query.
+
+        All identifiers are validated and all literal values are escaped
+        before interpolation to prevent SQL injection (the warehouse
+        adapters only accept fully rendered SQL strings).
+        """
+        if query.time_grain not in VALID_TIME_GRAINS:
+            raise ValueError(f"Invalid time grain: {query.time_grain}")
+        validate_identifier(table_name, "table name")
+
         # Time truncation based on warehouse
         if warehouse_type == "bigquery":
             time_trunc = f"DATE_TRUNC({query.time_grain.upper()}, created_at)"
@@ -471,18 +486,23 @@ class QueryPlanner:
             time_trunc = f"DATE_TRUNC('{query.time_grain}', created_at)"
 
         select_parts = [f"{time_trunc} as period"]
-        select_parts.extend(query.dimensions)
+        select_parts.extend(
+            validate_identifier(dim, "dimension") for dim in query.dimensions
+        )
 
         for metric in query.metrics:
+            validate_identifier(metric, "metric name")
             select_parts.append(f"SUM({metric}) as {metric}")
 
+        start_date = validate_iso_date(query.start_date, "start_date")
+        end_date = validate_iso_date(query.end_date, "end_date")
         where_parts = [
-            f"created_at >= '{query.start_date}'",
-            f"created_at < '{query.end_date}'",
+            f"created_at >= '{start_date}'",
+            f"created_at < '{end_date}'",
         ]
 
         for f in query.filters:
-            where_parts.append(f"{f['field']} {f['operator']} {f['value']}")
+            where_parts.append(render_filter_condition(f))
 
         group_by = ["period"] + query.dimensions
 
@@ -494,7 +514,10 @@ GROUP BY {', '.join(group_by)}
 ORDER BY period"""
 
         if query.limit:
-            sql += f"\nLIMIT {query.limit}"
+            limit = int(query.limit)
+            if limit < 0:
+                raise ValueError(f"Invalid limit: {query.limit!r}")
+            sql += f"\nLIMIT {limit}"
 
         return sql
 

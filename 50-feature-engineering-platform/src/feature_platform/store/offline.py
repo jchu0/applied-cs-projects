@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -17,6 +18,35 @@ try:
     PYARROW_AVAILABLE = True
 except ImportError:
     PYARROW_AVAILABLE = False
+
+# Feature view names (and derived column names) are interpolated into SQL
+# statements by DuckDBOfflineStore, so they must be restricted to a safe
+# character set to prevent SQL injection.
+FEATURE_VIEW_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def validate_feature_view_name(name: Any) -> str:
+    """Validate a feature view name against ``^[A-Za-z0-9_]+$``.
+
+    Raises ValueError for anything else, preventing SQL injection through
+    view names that get interpolated into table names.
+    """
+    if not isinstance(name, str) or not FEATURE_VIEW_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid feature view name: {name!r} "
+            "(must contain only letters, digits, and underscores)"
+        )
+    return name
+
+
+def _validate_sql_column(name: Any) -> str:
+    """Validate an entity/feature column name interpolated into SQL."""
+    if not isinstance(name, str) or not FEATURE_VIEW_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid column name: {name!r} "
+            "(must contain only letters, digits, and underscores)"
+        )
+    return name
 
 
 @dataclass
@@ -505,8 +535,8 @@ class DuckDBOfflineStore(OfflineStore):
         """)
 
     def _get_table_name(self, feature_view: str) -> str:
-        """Get table name for a feature view."""
-        return f"features_{feature_view}"
+        """Get table name for a feature view (validated to prevent SQL injection)."""
+        return f"features_{validate_feature_view_name(feature_view)}"
 
     def _create_table(self, feature_view: str, data: FeatureData) -> None:
         """Create table for a feature view."""
@@ -516,10 +546,11 @@ class DuckDBOfflineStore(OfflineStore):
 
         # Entity columns
         for key in data.entity_ids.keys():
-            columns.append(f"{key} VARCHAR")
+            columns.append(f"{_validate_sql_column(key)} VARCHAR")
 
         # Feature columns
         for name, values in data.features.items():
+            _validate_sql_column(name)
             if isinstance(values, np.ndarray):
                 if np.issubdtype(values.dtype, np.integer):
                     columns.append(f"{name} BIGINT")
@@ -575,8 +606,11 @@ class DuckDBOfflineStore(OfflineStore):
 
             rows.append(row)
 
-        # Build column names
-        columns = list(data.entity_ids.keys()) + list(data.features.keys()) + ["_timestamp"]
+        # Build column names (validated: they are interpolated into SQL)
+        columns = [
+            _validate_sql_column(c)
+            for c in list(data.entity_ids.keys()) + list(data.features.keys())
+        ] + ["_timestamp"]
         placeholders = ", ".join(["?" for _ in columns])
 
         insert_sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
@@ -603,7 +637,11 @@ class DuckDBOfflineStore(OfflineStore):
             # Get entity columns
             result = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
             entity_cols = [r[1] for r in result if r[1].endswith("_id") or r[1] == "id"]
-            select_cols = ", ".join(entity_cols + feature_names + ["_timestamp"])
+            select_cols = ", ".join(
+                entity_cols
+                + [_validate_sql_column(f) for f in feature_names]
+                + ["_timestamp"]
+            )
 
         where_clauses = []
         params = []
@@ -611,7 +649,7 @@ class DuckDBOfflineStore(OfflineStore):
         if entity_ids:
             for key, values in entity_ids.items():
                 placeholders = ", ".join(["?" for _ in values])
-                where_clauses.append(f"{key} IN ({placeholders})")
+                where_clauses.append(f"{_validate_sql_column(key)} IN ({placeholders})")
                 params.extend(values)
 
         if start_time:
@@ -685,11 +723,11 @@ class DuckDBOfflineStore(OfflineStore):
                 params = [ts]
 
                 for key, values in entity_values.items():
-                    where_clauses.append(f"{key} = ?")
+                    where_clauses.append(f"{_validate_sql_column(key)} = ?")
                     params.extend(values)
 
                 sql = f"""
-                    SELECT {', '.join(feature_names)}
+                    SELECT {', '.join(_validate_sql_column(f) for f in feature_names)}
                     FROM {table_name}
                     WHERE {' AND '.join(where_clauses)}
                     ORDER BY _timestamp DESC
@@ -741,7 +779,7 @@ class DuckDBOfflineStore(OfflineStore):
         if entity_ids:
             for key, values in entity_ids.items():
                 placeholders = ", ".join(["?" for _ in values])
-                where_clauses.append(f"{key} IN ({placeholders})")
+                where_clauses.append(f"{_validate_sql_column(key)} IN ({placeholders})")
                 params.extend(values)
 
         if before_time:

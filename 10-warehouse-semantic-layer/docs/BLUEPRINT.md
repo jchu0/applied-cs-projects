@@ -81,6 +81,8 @@ The engine is the heart of the translation layer. `generate_sql(query)` performs
 4. **Build the WHERE clause** — a half-open time-range predicate on the first metric's timestamp (`>= start_date`, `< end_date`), followed by query-level filters and then each metric's own `filters`.
 5. **Build GROUP BY / ORDER BY** — group by `period` plus dimensions, order by `period`. Optional `LIMIT`/`OFFSET` are appended when present.
 
+Because the warehouse adapters accept only fully rendered SQL strings (no bind parameters), `generate_sql` defends against SQL injection at the rendering boundary: identifiers (dimensions, filter fields, timestamp/table names) are validated against an identifier pattern and the registered metric/catalog dimensions, dates must parse as strict ISO-8601, filter operators come from an allow-list, filter values are escaped as typed SQL literals (single-quote doubling for strings, numeric casts, `NULL`/booleans), and `LIMIT`/`OFFSET` are coerced to non-negative integers — anything else raises `ValueError` before SQL is assembled.
+
 Two helpers carry the dialect and aggregation logic:
 
 - `_get_time_column(metric, grain)` emits the warehouse-appropriate `DATE_TRUNC`. Snowflake, Postgres, and Redshift use `DATE_TRUNC('<grain>', <ts>)`; BigQuery uses `DATE_TRUNC(<ts>, <GRAIN>)`. An unknown warehouse falls back to the Snowflake form.

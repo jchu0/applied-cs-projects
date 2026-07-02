@@ -182,7 +182,7 @@ class TestSemanticQueryEngine:
             timestamp="created_at",
             time_grains=[TimeGrain.DAY, TimeGrain.MONTH],
             dimensions=["country", "segment"],
-            filters=[{"field": "status", "operator": "=", "value": "'completed'"}]
+            filters=[{"field": "status", "operator": "=", "value": "completed"}]
         )
         catalog.add_metric(revenue_metric)
 
@@ -249,7 +249,7 @@ class TestSemanticQueryEngine:
             metrics=["total_revenue"],
             dimensions=["segment"],
             filters=[
-                {"field": "country", "operator": "IN", "value": "('US', 'CA')"}
+                {"field": "country", "operator": "IN", "value": ["US", "CA"]}
             ],
             time_grain="week",
             start_date="2024-01-01",
@@ -477,6 +477,120 @@ class TestQueryExecutor:
 
         with pytest.raises(ValueError, match="Query validation failed"):
             await executor.execute_metric_query(engine, query)
+
+
+class TestSqlInjectionHardening:
+    """Regression tests: untrusted query input must not reach SQL unescaped."""
+
+    @pytest.fixture
+    def engine(self):
+        catalog = MetricCatalog()
+        catalog.add_metric(MetricDefinition(
+            name="total_revenue",
+            label="Total Revenue",
+            description="Sum of all revenue",
+            model="orders",
+            calculation_method=CalculationMethod.SUM,
+            expression="amount",
+            timestamp="created_at",
+            time_grains=[TimeGrain.DAY, TimeGrain.MONTH],
+            dimensions=["country", "segment"],
+        ))
+        return SemanticQueryEngine(catalog, warehouse_type="snowflake")
+
+    def _query(self, **overrides):
+        base = dict(
+            metrics=["total_revenue"],
+            dimensions=[],
+            filters=[],
+            time_grain="month",
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+        )
+        base.update(overrides)
+        return MetricQuery(**base)
+
+    def test_hostile_filter_value_is_escaped(self, engine):
+        """A classic injection payload in a filter value is rendered as a quoted literal."""
+        hostile = "'; DROP TABLE x;--"
+        query = self._query(
+            filters=[{"field": "country", "operator": "=", "value": hostile}]
+        )
+
+        sql = engine.generate_sql(query)
+
+        # The payload must appear only as an escaped, quoted string literal.
+        assert "country = '''; DROP TABLE x;--'" in sql
+        # The raw (unescaped) payload must never appear in the SQL.
+        assert "= '; DROP TABLE x;--" not in sql
+        # No statement terminator sneaks in outside a string literal.
+        assert not sql.rstrip().rstrip(";").split("'")[-1].strip().startswith("DROP")
+
+    def test_hostile_filter_field_rejected(self, engine):
+        query = self._query(
+            filters=[{"field": "1=1; DROP TABLE x;--", "operator": "=", "value": "US"}]
+        )
+        with pytest.raises(ValueError, match="filter field"):
+            engine.generate_sql(query)
+
+    def test_hostile_filter_operator_rejected(self, engine):
+        query = self._query(
+            filters=[{"field": "country", "operator": "= 'US' OR 1=1 --", "value": "US"}]
+        )
+        with pytest.raises(ValueError, match="operator"):
+            engine.generate_sql(query)
+
+    def test_hostile_dates_rejected(self, engine):
+        query = self._query(start_date="2024-01-01' OR '1'='1")
+        with pytest.raises(ValueError, match="start_date"):
+            engine.generate_sql(query)
+
+        query = self._query(end_date="2024-12-31'; DROP TABLE orders;--")
+        with pytest.raises(ValueError, match="end_date"):
+            engine.generate_sql(query)
+
+    def test_hostile_dimension_rejected(self, engine):
+        # Not a valid identifier
+        query = self._query(dimensions=["country; DROP TABLE x"])
+        with pytest.raises(ValueError, match="dimension"):
+            engine.generate_sql(query)
+
+        # Valid identifier but not registered for the metric
+        query = self._query(dimensions=["password_hash"])
+        with pytest.raises(ValueError, match="Unknown dimension"):
+            engine.generate_sql(query)
+
+    def test_hostile_time_grain_rejected(self, engine):
+        query = self._query(time_grain="day', created_at); DROP TABLE x;--")
+        with pytest.raises(ValueError, match="time grain"):
+            engine.generate_sql(query)
+
+    def test_hostile_limit_rejected(self, engine):
+        query = self._query(limit="10; DROP TABLE x")
+        with pytest.raises(ValueError):
+            engine.generate_sql(query)
+
+    def test_in_filter_values_are_escaped(self, engine):
+        query = self._query(
+            filters=[{
+                "field": "country",
+                "operator": "IN",
+                "value": ["US", "CA'); DROP TABLE x;--"],
+            }]
+        )
+        sql = engine.generate_sql(query)
+        assert "country IN ('US', 'CA''); DROP TABLE x;--')" in sql
+
+    def test_numeric_and_null_literals(self, engine):
+        query = self._query(
+            filters=[
+                {"field": "amount", "operator": ">=", "value": 100},
+                {"field": "discount", "operator": "IS", "value": None},
+            ]
+        )
+        sql = engine.generate_sql(query)
+        assert "amount >= 100" in sql
+        assert "discount IS NULL" in sql
 
 
 class TestMetricFactories:

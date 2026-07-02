@@ -45,7 +45,8 @@ class HDFSClient:
         replication: int = 3,
         enable_cache: bool = False,
         cache_ttl: int = 60,
-        verify_checksum: bool = False
+        verify_checksum: bool = False,
+        connect_timeout: float = 10.0
     ):
         self.namenode_host = namenode_host
         self.namenode_port = namenode_port
@@ -54,6 +55,7 @@ class HDFSClient:
         self.enable_cache = enable_cache
         self.cache_ttl = cache_ttl
         self.verify_checksum = verify_checksum
+        self.connect_timeout = connect_timeout
         self._cache: Dict[str, Dict] = {}
 
     def _normalize_response(self, response) -> MockResponse:
@@ -78,8 +80,9 @@ class HDFSClient:
 
     async def _send_to_namenode(self, message: Message) -> Message:
         """Send message to NameNode and get response."""
-        reader, writer = await asyncio.open_connection(
-            self.namenode_host, self.namenode_port
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self.namenode_host, self.namenode_port),
+            timeout=self.connect_timeout
         )
 
         try:
@@ -106,7 +109,10 @@ class HDFSClient:
         message: Message
     ) -> Message:
         """Send message to DataNode and get response."""
-        reader, writer = await asyncio.open_connection(host, port)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=self.connect_timeout
+        )
 
         try:
             data = serialize_message(message)

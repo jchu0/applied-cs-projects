@@ -6,6 +6,12 @@ from .base import *
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = 'django-insecure-dev-key-change-in-production'
 
+# Dev-only JWT secret fallback; base.py intentionally provides no default.
+JWT_SECRET_KEY = os.environ.get(
+    'JWT_SECRET_KEY',
+    'django-insecure-dev-jwt-key-change-in-production',
+)
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 

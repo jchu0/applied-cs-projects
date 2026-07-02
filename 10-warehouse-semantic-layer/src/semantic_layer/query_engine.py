@@ -1,8 +1,10 @@
 """Semantic Query Engine for translating metric queries to SQL."""
 
+import datetime as _dt
 import logging
+import math
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from semantic_layer.models import (
     CalculationMethod,
@@ -12,6 +14,120 @@ from semantic_layer.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# --- SQL injection hardening helpers -------------------------------------
+#
+# The warehouse adapters only accept a fully rendered SQL string (no bind
+# parameters), so every identifier and literal that reaches generate_sql()
+# must be validated or escaped before interpolation.
+
+#: Valid time grains accepted in generated SQL.
+VALID_TIME_GRAINS = ("day", "week", "month", "quarter", "year")
+
+#: Operators allowed in filter specifications.
+ALLOWED_FILTER_OPERATORS = frozenset({
+    "=", "!=", "<>", "<", "<=", ">", ">=",
+    "IN", "NOT IN", "LIKE", "NOT LIKE", "IS", "IS NOT",
+})
+
+# Simple (optionally dot-qualified) SQL identifier: column, table.column, etc.
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+def validate_identifier(name: Any, context: str = "identifier") -> str:
+    """Validate that *name* is a safe SQL identifier and return it.
+
+    Raises ValueError for anything that is not a plain (optionally
+    dot-qualified) identifier, preventing SQL injection through field,
+    dimension, or column names.
+    """
+    if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
+        raise ValueError(f"Invalid SQL {context}: {name!r}")
+    return name
+
+
+def validate_iso_date(value: Any, context: str = "date") -> str:
+    """Strictly validate an ISO-8601 date/datetime and return a canonical string.
+
+    The returned string is guaranteed to contain only characters produced by
+    ``datetime.isoformat()`` and is therefore safe to embed in single quotes.
+    """
+    if isinstance(value, _dt.datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, _dt.date):
+        return value.isoformat()
+    if isinstance(value, str):
+        try:
+            return _dt.date.fromisoformat(value).isoformat()
+        except ValueError:
+            pass
+        try:
+            return _dt.datetime.fromisoformat(value).isoformat(sep=" ")
+        except ValueError:
+            pass
+    raise ValueError(f"Invalid ISO-8601 {context}: {value!r}")
+
+
+def _render_scalar_literal(value: Any) -> str:
+    """Render a single scalar Python value as a safely escaped SQL literal."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"Non-finite numeric literal not allowed: {value!r}")
+        return repr(value)
+    if isinstance(value, _dt.datetime):
+        return f"'{value.isoformat(sep=' ')}'"
+    if isinstance(value, _dt.date):
+        return f"'{value.isoformat()}'"
+    if isinstance(value, str):
+        # Standard SQL string escaping: double any embedded single quotes.
+        escaped = value.replace("'", "''")
+        return f"'{escaped}'"
+    raise ValueError(f"Unsupported SQL literal type: {type(value).__name__}")
+
+
+def render_sql_literal(value: Any) -> str:
+    """Render a Python value (scalar or flat sequence) as a safe SQL literal."""
+    if isinstance(value, (list, tuple, set, frozenset)):
+        if not value:
+            raise ValueError("Empty value list is not a valid SQL literal")
+        return "(" + ", ".join(_render_scalar_literal(v) for v in value) + ")"
+    return _render_scalar_literal(value)
+
+
+def render_filter_condition(filter_spec: Mapping[str, Any]) -> str:
+    """Render a filter spec as a safe SQL condition.
+
+    The field is validated as an identifier, the operator is checked against
+    an allow-list, and the value is escaped as a SQL literal (never
+    interpolated raw).
+    """
+    field = validate_identifier(filter_spec.get("field"), "filter field")
+
+    operator = str(filter_spec.get("operator", "")).strip().upper()
+    if operator not in ALLOWED_FILTER_OPERATORS:
+        raise ValueError(f"Unsupported filter operator: {filter_spec.get('operator')!r}")
+
+    value = filter_spec.get("value")
+    if operator in ("IN", "NOT IN"):
+        if not isinstance(value, (list, tuple, set, frozenset)) or not value:
+            raise ValueError(
+                f"{operator} filter on {field!r} requires a non-empty list of values"
+            )
+        rendered = render_sql_literal(value)
+    elif operator in ("IS", "IS NOT"):
+        if value is not None and not isinstance(value, bool):
+            raise ValueError(f"{operator} filter on {field!r} only supports NULL/TRUE/FALSE")
+        rendered = _render_scalar_literal(value)
+    else:
+        rendered = _render_scalar_literal(value)
+
+    return f"{field} {operator} {rendered}"
 
 
 class MetricCatalog:
@@ -62,6 +178,10 @@ class MetricCatalog:
         """Get a dimension by name."""
         return self._dimensions.get(name)
 
+    def list_dimensions(self) -> List[str]:
+        """List names of all registered dimensions."""
+        return list(self._dimensions.keys())
+
 
 class SemanticQueryEngine:
     """Engine to translate semantic queries to SQL."""
@@ -83,6 +203,12 @@ class SemanticQueryEngine:
         if not metric_specs:
             raise ValueError("No metrics specified")
 
+        # Validate untrusted inputs before any SQL interpolation
+        if query.time_grain not in VALID_TIME_GRAINS:
+            raise ValueError(f"Invalid time grain: {query.time_grain}")
+
+        dimensions = self._validate_dimensions(query.dimensions, metric_specs)
+
         # Build SELECT clause
         select_parts = []
 
@@ -91,7 +217,7 @@ class SemanticQueryEngine:
         select_parts.append(f"{time_col} as period")
 
         # Regular dimensions
-        for dim in query.dimensions:
+        for dim in dimensions:
             select_parts.append(dim)
 
         # Metrics
@@ -100,26 +226,28 @@ class SemanticQueryEngine:
             select_parts.append(f"{agg_expr} as {metric.name}")
 
         # Build FROM clause
-        from_clause = self._build_from_clause(metric_specs, query.dimensions)
+        from_clause = self._build_from_clause(metric_specs, dimensions)
 
         # Build WHERE clause
         where_parts = []
-        timestamp_col = metric_specs[0].timestamp
-        where_parts.append(f"{timestamp_col} >= '{query.start_date}'")
-        where_parts.append(f"{timestamp_col} < '{query.end_date}'")
+        timestamp_col = validate_identifier(
+            metric_specs[0].timestamp, "timestamp column"
+        )
+        start_date = validate_iso_date(query.start_date, "start_date")
+        end_date = validate_iso_date(query.end_date, "end_date")
+        where_parts.append(f"{timestamp_col} >= '{start_date}'")
+        where_parts.append(f"{timestamp_col} < '{end_date}'")
 
         for filter_spec in query.filters:
-            where_parts.append(
-                f"{filter_spec['field']} {filter_spec['operator']} {filter_spec['value']}"
-            )
+            where_parts.append(render_filter_condition(filter_spec))
 
         # Add metric-level filters
         for metric in metric_specs:
             for f in metric.filters:
-                where_parts.append(f"{f['field']} {f['operator']} {f['value']}")
+                where_parts.append(render_filter_condition(f))
 
         # Build GROUP BY clause
-        group_parts = ["period"] + query.dimensions
+        group_parts = ["period"] + dimensions
 
         # Build ORDER BY clause
         order_by = "period"
@@ -133,15 +261,42 @@ GROUP BY {', '.join(group_parts)}
 ORDER BY {order_by}"""
 
         if query.limit:
-            sql += f"\nLIMIT {query.limit}"
+            limit = int(query.limit)
+            if limit < 0:
+                raise ValueError(f"Invalid limit: {query.limit!r}")
+            sql += f"\nLIMIT {limit}"
             if query.offset is not None:
-                sql += f" OFFSET {query.offset}"
+                offset = int(query.offset)
+                if offset < 0:
+                    raise ValueError(f"Invalid offset: {query.offset!r}")
+                sql += f" OFFSET {offset}"
 
         return sql
 
+    def _validate_dimensions(
+        self, dimensions: List[str], metric_specs: List[MetricDefinition]
+    ) -> List[str]:
+        """Validate query dimensions against the registered schema."""
+        allowed = set()
+        for metric in metric_specs:
+            allowed.update(metric.dimensions)
+        allowed.update(self.catalog.list_dimensions())
+
+        validated = []
+        for dim in dimensions:
+            validate_identifier(dim, "dimension")
+            if allowed and dim not in allowed:
+                raise ValueError(
+                    f"Unknown dimension: {dim!r} (not registered for the queried metrics)"
+                )
+            validated.append(dim)
+        return validated
+
     def _get_time_column(self, metric: MetricDefinition, grain: str) -> str:
         """Get time column with appropriate truncation."""
-        timestamp = metric.timestamp
+        if grain not in VALID_TIME_GRAINS:
+            raise ValueError(f"Invalid time grain: {grain}")
+        timestamp = validate_identifier(metric.timestamp, "timestamp column")
 
         if self.warehouse_type == "snowflake":
             return f"DATE_TRUNC('{grain}', {timestamp})"
@@ -200,7 +355,7 @@ ORDER BY {order_by}"""
 
         # For now, assume single table
         # In production, would need to handle joins
-        return list(tables)[0]
+        return validate_identifier(list(tables)[0], "table name")
 
     def validate_query(self, query: MetricQuery) -> List[str]:
         """Validate a metric query and return errors."""
@@ -221,9 +376,15 @@ ORDER BY {order_by}"""
         if query.time_grain not in valid_grains:
             errors.append(f"Invalid time grain: {query.time_grain}")
 
-        # Check dates
-        if query.start_date >= query.end_date:
-            errors.append("start_date must be before end_date")
+        # Check dates (strict ISO-8601)
+        try:
+            start = validate_iso_date(query.start_date, "start_date")
+            end = validate_iso_date(query.end_date, "end_date")
+        except ValueError as e:
+            errors.append(str(e))
+        else:
+            if start >= end:
+                errors.append("start_date must be before end_date")
 
         return errors
 
