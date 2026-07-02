@@ -89,6 +89,8 @@ ANTHROPIC_API_KEY=sk-... BIND_ADDR=127.0.0.1:8080 cargo run
 
 The server listens on `BIND_ADDR` (default `0.0.0.0:8080`) and exposes `GET /health`,
 `GET /tools`, `POST /agent/run`, `GET /agent/{task_id}`, and `POST /agent/{task_id}/cancel`.
+Auth, rate limiting, and request timeouts are opt-in via env — see
+[Security & limits](#security--limits).
 
 ```bash
 curl -s localhost:8080/agent/run \
@@ -96,6 +98,23 @@ curl -s localhost:8080/agent/run \
   -d '{"task":"summarize the plan","max_steps":10}'
 # {"task_id":"...","status":"running"}
 ```
+
+## Security & limits
+
+The HTTP server ships with an opt-in hardening baseline (all off by default so
+tests and local runs work unchanged). `/health` is always exempt — it needs no
+key and is never rate-limited or timed out.
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `API_KEYS` | _(unset)_ | Comma-separated valid keys. Unset/empty ⇒ auth **disabled** (a startup warning is logged). When set, all routes except `/health` require `Authorization: Bearer <key>` or `x-api-key: <key>`; missing/invalid ⇒ `401` with `WWW-Authenticate`. Keys are compared in constant time. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | In-process sliding-window limit per caller (keyed by API key, else peer IP). `0` disables. Over limit ⇒ `429` with `Retry-After`. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout. `0` disables. On expiry ⇒ `504`. |
+
+The agent flow is async/polled — `POST /agent/run` returns immediately and the
+run executes on a background task, so the timeout applies to every protected
+route with no exemptions. No handler holds the connection open; a streaming/SSE
+route, if added, would go on a separate un-timed sub-router.
 
 ## Usage
 

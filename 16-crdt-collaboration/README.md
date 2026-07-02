@@ -138,6 +138,19 @@ assert!(loaded.is_some());
 - **Real:** The CRDT engine (insert/delete/format, tombstones, total-order convergence), vector-clock causality, G/PN counters and LWW register, per-document sessions with broadcast and acks, the axum HTTP API handlers, presence tracking, the offline pending-operation queue (queueing, retry, TTL cleanup, serialize/restore), the in-memory `StorageManager`, and the SQLite `StorageBackend` (schema, snapshots, operations, ACLs, audit). All are exercised by the test suites.
 - **Simulated / partial:** There is no shipped server binary or live WebSocket route — `server::handle_client` accepts generic stream/sink types and must be wired to a transport by the embedder. The HTTP API uses the in-memory `StorageManager`, not `SqliteBackend`. `offline::OfflineManager::sync_with_server` returns an empty response (no live transport). Share-link tokens are generated but not stored. Audit logging and version history are implemented and tested as components but are not yet invoked from the request handlers. The benchmark numbers in `docs/BLUEPRINT.md` are illustrative design targets, not measured results.
 
+## Security & limits
+
+The HTTP API (`api::create_router`) ships an opt-in hardening baseline configured via
+environment variables. All three layers are applied to the `/api/*` routes; the
+`/health` route is always left open, and the WebSocket collaboration surface lives in the
+`server` module (not this Router) and is therefore not subject to the request timeout.
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `API_KEYS` | *(unset → auth disabled)* | Comma-separated valid keys. When set, requests must send `Authorization: Bearer <key>` or `x-api-key: <key>`; otherwise `401` with `WWW-Authenticate`. Keys are compared in constant time. When unset, a startup warning is logged and auth is disabled. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | In-process sliding-window limit per caller (keyed by API key, else peer IP). Over the limit returns `429` with `Retry-After`. `0` disables. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout on `/api/*` (returns `408`). `0` disables. |
+
 ## Testing
 
 ```bash

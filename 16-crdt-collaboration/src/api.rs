@@ -10,15 +10,20 @@ use crate::storage::{DocumentAcl, Permission, StorageManager};
 use crate::{ClientId, DocumentId, Error};
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, State},
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 /// API state shared across handlers.
@@ -42,6 +47,175 @@ impl ApiState {
     }
 }
 
+// === Security & limits (hardening baseline) ===
+
+/// Sliding-window rate-limit tracker keyed by API key or peer IP.
+#[derive(Default)]
+struct RateLimiter {
+    /// Per-key request timestamps within the current window.
+    windows: parking_lot::Mutex<HashMap<String, Vec<Instant>>>,
+}
+
+/// Security configuration derived from environment variables.
+///
+/// - `API_KEYS`: comma-separated valid keys; empty disables auth.
+/// - `RATE_LIMIT_PER_MINUTE`: requests/minute per caller (default 120, 0 disables).
+/// - `REQUEST_TIMEOUT_SECONDS`: per-request timeout (default 30, 0 disables).
+struct SecurityConfig {
+    /// Valid API keys; empty means auth disabled.
+    api_keys: Vec<String>,
+    /// Max requests per minute per caller; 0 disables.
+    rate_limit_per_minute: u32,
+    /// In-process sliding-window limiter state.
+    limiter: RateLimiter,
+}
+
+impl SecurityConfig {
+    /// Build config from the environment, logging when auth is disabled.
+    fn from_env() -> Arc<Self> {
+        let api_keys: Vec<String> = std::env::var("API_KEYS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if api_keys.is_empty() {
+            tracing::warn!("API auth disabled (set API_KEYS to enable)");
+        }
+
+        let rate_limit_per_minute = std::env::var("RATE_LIMIT_PER_MINUTE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(120);
+
+        Arc::new(Self {
+            api_keys,
+            rate_limit_per_minute,
+            limiter: RateLimiter::default(),
+        })
+    }
+
+    /// Whether API-key auth is active.
+    fn auth_enabled(&self) -> bool {
+        !self.api_keys.is_empty()
+    }
+
+    /// Constant-time check that `candidate` matches a configured key.
+    fn is_valid_key(&self, candidate: &str) -> bool {
+        let mut matched = false;
+        for key in &self.api_keys {
+            matched |= constant_time_eq(key.as_bytes(), candidate.as_bytes());
+        }
+        matched
+    }
+}
+
+/// Timeout in seconds from the environment (default 30, 0 disables).
+fn request_timeout_seconds() -> u64 {
+    std::env::var("REQUEST_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
+/// Constant-time byte comparison to avoid leaking key length/content via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Extract the presented API key from `Authorization: Bearer` or `x-api-key`.
+fn extract_api_key<B>(req: &Request<B>) -> Option<String> {
+    if let Some(v) = req.headers().get(header::AUTHORIZATION) {
+        if let Ok(s) = v.to_str() {
+            if let Some(token) = s.strip_prefix("Bearer ") {
+                return Some(token.trim().to_string());
+            }
+        }
+    }
+    req.headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+}
+
+/// API-key auth middleware. Rejects missing/invalid keys with 401 when enabled.
+async fn auth_middleware(
+    State(sec): State<Arc<SecurityConfig>>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if !sec.auth_enabled() {
+        return next.run(req).await;
+    }
+
+    match extract_api_key(&req) {
+        Some(key) if sec.is_valid_key(&key) => next.run(req).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(ErrorResponse {
+                error: "missing or invalid API key".to_string(),
+                code: StatusCode::UNAUTHORIZED.as_u16(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// In-process sliding-window rate-limit middleware. Returns 429 with Retry-After.
+async fn rate_limit_middleware(
+    State(sec): State<Arc<SecurityConfig>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let limit = sec.rate_limit_per_minute;
+    if limit == 0 {
+        return next.run(req).await;
+    }
+
+    // Key by API key if present, else by peer IP.
+    let caller = extract_api_key(&req)
+        .or_else(|| connect_info.map(|ci| ci.0.ip().to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let window = Duration::from_secs(60);
+    let now = Instant::now();
+    let over_limit = {
+        let mut windows = sec.limiter.windows.lock();
+        let hits = windows.entry(caller).or_default();
+        hits.retain(|t| now.duration_since(*t) < window);
+        if hits.len() as u32 >= limit {
+            true
+        } else {
+            hits.push(now);
+            false
+        }
+    };
+
+    if over_limit {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "60")],
+            Json(ErrorResponse {
+                error: "rate limit exceeded".to_string(),
+                code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            }),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}
+
 /// Create the API router.
 pub fn create_router(state: Arc<ApiState>) -> Router {
     let cors = CorsLayer::new()
@@ -49,7 +223,13 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
+    let sec = SecurityConfig::from_env();
+
+    // Health/readiness stays open: no auth, no rate limit, no timeout.
+    let open = Router::new().route("/health", get(health_check));
+
+    // Protected API surface gets all three hardening layers.
+    let mut protected = Router::new()
         // Document management
         .route("/api/documents", post(create_document))
         .route("/api/documents", get(list_documents))
@@ -63,9 +243,27 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         // Access control
         .route("/api/documents/:id/acl", get(get_acl))
         .route("/api/documents/:id/acl", put(update_acl))
-        .route("/api/documents/:id/share", post(create_share_link))
-        // Health check
-        .route("/health", get(health_check))
+        .route("/api/documents/:id/share", post(create_share_link));
+
+    // 3) Request timeout. Applied to the protected surface only; any streaming/
+    // SSE/WebSocket route would be exempted here (the collaboration WebSocket
+    // lives in the `server` module and is not part of this Router).
+    let timeout_secs = request_timeout_seconds();
+    if timeout_secs > 0 {
+        protected = protected.layer(TimeoutLayer::new(Duration::from_secs(timeout_secs)));
+    }
+
+    let protected = protected
+        // 2) Rate limiting (runs before the handler, after auth).
+        .layer(middleware::from_fn_with_state(
+            sec.clone(),
+            rate_limit_middleware,
+        ))
+        // 1) API-key auth (outermost of the two, so unauthenticated requests
+        // are rejected before consuming a rate-limit slot).
+        .layer(middleware::from_fn_with_state(sec.clone(), auth_middleware));
+
+    open.merge(protected)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -655,6 +853,10 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    /// Serializes tests that mutate process-global auth env vars so they do not
+    /// race with the auth-off tests.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn create_test_state() -> Arc<ApiState> {
         let storage = Arc::new(StorageManager::new());
         let server = Arc::new(CollaborationServer::new(
@@ -684,6 +886,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_document() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("API_KEYS");
         let state = create_test_state();
         let app = create_router(state);
 
@@ -704,6 +908,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_documents() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("API_KEYS");
         let state = create_test_state();
         let app = create_router(state);
 
@@ -721,7 +927,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_auth_required_returns_401_without_key() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::set_var("API_KEYS", "secret-key");
+        let state = create_test_state();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/documents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        std::env::remove_var("API_KEYS");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key("www-authenticate"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_rejects_bad_key() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::set_var("API_KEYS", "secret-key");
+        let state = create_test_state();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/documents")
+                    .header("x-api-key", "wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        std::env::remove_var("API_KEYS");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_accepts_valid_key() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::set_var("API_KEYS", "secret-key");
+        let state = create_test_state();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/documents")
+                    .header("Authorization", "Bearer secret-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        std::env::remove_var("API_KEYS");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_health_open_without_key_when_auth_on() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::set_var("API_KEYS", "secret-key");
+        let state = create_test_state();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        std::env::remove_var("API_KEYS");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn test_get_nonexistent_document() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("API_KEYS");
         let state = create_test_state();
         let app = create_router(state);
 
