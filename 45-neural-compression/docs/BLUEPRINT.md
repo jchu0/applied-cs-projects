@@ -750,7 +750,7 @@ multi-rate codec) over the Kodak set and plot bpp against PSNR or MS-SSIM.
 
 Tests verify mechanics that are easy to get subtly wrong: invertible transforms, valid
 probability masses, exact coder round trips, and gradient flow through the noise-based
-quantizer. The suite is 143 tests across 7 files:
+quantizer. The suite is 147 tests across 7 files:
 
 - `test_transforms.py` — GDN forward/inverse behavior, analysis/synthesis output shapes and the
   16x down/upsampling relationship, residual and enhanced variants.

@@ -736,7 +736,7 @@ not measure; the codec ratio bounds above are the only asserted numeric guarante
 
 ## Testing Strategy
 
-Correctness is verified by 217 unit tests colocated with the modules and 80 integration tests in
+Correctness is verified by 219 unit tests colocated with the modules and 80 integration tests in
 `tests/integration_tests.rs`, all runnable with `cargo test` and requiring no external services
 (tests use `tempfile` scratch directories that are cleaned up automatically).
 

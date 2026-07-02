@@ -748,10 +748,10 @@ lock, so read-heavy graphs parallelize well.
 
 ## Testing Strategy
 
-Tests live in `tests/` and total **264 test functions across 7 files** (45 + 28 + 38 + 29 +
-34 + 50 + 40). They rely on NumPy and pandas plus the core dependencies; the API tests
-additionally need `httpx` for Starlette's test client. Run the whole suite with
-`pytest tests/ -v`.
+Tests live in `tests/` and total **283 passing test functions across 9 files** (38 + 34 + 29 +
+40 + 45 + 50 + 28 + 8 + 11). They rely on NumPy and pandas plus the core dependencies; the API
+tests additionally need `httpx` for Starlette's test client, and the store-security tests skip
+gracefully when `duckdb` is absent. Run the whole suite with `pytest tests/ -v`.
 
 - **`test_numeric_transformers.py`** (38 tests) — fit/transform/inverse-transform correctness
   for the numeric scalers, NaN handling, the zero-variance and zero-range guards, and
@@ -770,6 +770,10 @@ additionally need `httpx` for Starlette's test client. Run the whole suite with
 - **`test_api.py`** (28 tests) — the FastAPI surface end to end via the test client:
   feature-view CRUD, online and historical serving, materialization, statistics, search,
   writes, and view validation.
+- **`test_api_hardening.py`** (8 tests) — input validation, error handling, and abuse-resistance
+  on the API surface.
+- **`test_store_security.py`** (11 tests, 6 skipped without `duckdb`) — access-control and
+  injection-safety checks on the offline/online stores.
 
 Edge cases exercised across the suite include empty inputs, single-row and single-column
 data, the division-by-zero guards in scaling and percentage math, cycle rejection in the DAG

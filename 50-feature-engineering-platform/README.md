@@ -162,10 +162,10 @@ print(result.is_drifted, result.score)
 pytest tests/ -v
 ```
 
-The suite has 264 tests across 7 files covering numeric, categorical, temporal, and text
-transformers, advanced drift detectors, feature discovery, and the REST API. The API tests
-need `httpx` (Starlette's test client); transformer and drift tests need only the core
-dependencies.
+The suite has 283 tests across 9 files covering numeric, categorical, temporal, and text
+transformers, advanced drift detectors, feature discovery, the REST API, API hardening, and
+store security. The API tests need `httpx` (Starlette's test client); transformer and drift
+tests need only the core dependencies.
 
 ## Project Structure
 
@@ -180,7 +180,7 @@ dependencies.
     store/        # registry, offline/online stores, facade
     transformers/ # numeric, categorical, temporal, text, composite
     validation/   # schema, statistical, drift, advanced drift
-  tests/          # 264 tests across 7 files
+  tests/          # 283 tests across 9 files
   docs/BLUEPRINT.md   # Full architecture and design
 ```
 

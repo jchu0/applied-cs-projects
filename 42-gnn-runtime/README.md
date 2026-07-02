@@ -2,9 +2,9 @@
 
 A from-scratch graph neural network runtime built around sparse graph storage, message
 passing, neighbor sampling, and the GCN/GAT/GraphSAGE layers. The graph storage and the sparse
-kernels are pure NumPy; the trainable layers and fused kernels use PyTorch when it is installed,
-with NumPy fallbacks for the core message-passing and sparse operations so the runtime is usable
-without a deep-learning framework.
+kernels are pure NumPy; the trainable layers, fused kernels, and samplers use PyTorch, with
+NumPy fallbacks for the core message-passing and sparse operations so the graph storage and
+kernel paths remain usable without a deep-learning framework.
 
 ## Features
 
@@ -59,10 +59,12 @@ flowchart TD
 ### Prerequisites
 
 - Python 3.9+
-- NumPy 1.21+ (the only required dependency). The graph storage, samplers, and NumPy kernel
+- NumPy 1.21+ (the only required dependency). The graph storage and NumPy kernel
   fallbacks run without PyTorch.
 - PyTorch 2.0+ (optional, `pip install -e ".[torch]"`) is required for the trainable layers,
-  the `MessagePassingEngine`, and the distributed trainer.
+  the `MessagePassingEngine`, the samplers (`NeighborSampler`, `PPRSampler`, `LayerSampler`,
+  `ClusterSampler`), and the distributed trainer. Each sampler raises `ImportError` if PyTorch
+  is not installed.
 
 ### Installation
 

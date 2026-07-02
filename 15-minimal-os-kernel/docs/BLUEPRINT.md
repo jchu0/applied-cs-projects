@@ -33,10 +33,10 @@ The concepts this project is meant to teach:
 
 > **Honesty caveat.** The kernel logic is implemented and host-testable, but the
 > **QEMU boot path has not been verified end-to-end**. `kernel_main` calls
-> `scheduler::run()`, which is not defined in `scheduler.rs`; several
-> already-written pieces (`init::init_main`, `usermode::init`,
-> `usermode::jump_to_usermode`, `context::switch_context`) are not yet wired
-> into the boot path; and the `isa-debug-exit` integration harness is configured
+> `scheduler::run()`, which is defined in `scheduler.rs` and enters
+> `init::init_main`, so that seam is wired. Some already-written pieces
+> (`usermode::init`, `usermode::jump_to_usermode`, `context::switch_context`)
+> are not yet exercised by the boot path; and the `isa-debug-exit` integration harness is configured
 > but not exercised. Code blocks below that show a *design target* rather than
 > the current source are explicitly labeled **(illustrative)**.
 
@@ -175,7 +175,7 @@ pub fn kernel_main(boot_info: &'static BootInfo) -> ! {
     vfs::init();
 
     init::start();        // create PID 1
-    scheduler::run();     // <-- not yet defined; boot path unverified
+    scheduler::run();     // <-- defined; enters init::init_main (QEMU boot unverified)
     hlt_loop();
 }
 ```
@@ -340,9 +340,10 @@ pub fn schedule(&mut self) {
 ```
 
 `schedule` is pure bookkeeping over the queues; it does not itself perform the
-register-level switch. Wiring `schedule` to `switch_context` (and defining the
-top-level `scheduler::run` loop that `kernel_main` calls) is the missing seam
-between the implemented pieces and a live multitasking boot.
+register-level switch. The top-level `scheduler::run` that `kernel_main` calls is
+defined and enters `init::init_main`; wiring `schedule` to `switch_context` for
+preemptive register-level switching is the remaining seam between the implemented
+pieces and a live multitasking boot.
 
 ### System calls
 
@@ -796,8 +797,9 @@ modules. Current coverage:
 no display), which is the standard way to run kernel tests that boot under QEMU
 and signal pass/fail by writing an exit code to an I/O port. That harness is
 **not yet exercised** — there are no boot-level integration tests, and the live
-`init -> scheduler -> shell` path is unverified. Closing that gap means defining
-`scheduler::run`, wiring `init::init_main` into the boot path, and adding a
+`init -> scheduler -> shell` path is unverified under QEMU. `scheduler::run` is
+defined and wired into the boot path (it enters `init::init_main`); closing the
+gap means booting it under the `isa-debug-exit` harness with a
 `#[test_case]`-style runner.
 
 ### Edge cases worth covering as the kernel grows

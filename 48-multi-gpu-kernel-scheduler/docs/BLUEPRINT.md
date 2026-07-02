@@ -734,7 +734,7 @@ parallelism, is the lever for a deep sequential model.
 
 ## Testing Strategy
 
-The suite comprises 281 pytest tests across eight files, all running on CPU with no external
+The suite comprises 285 pytest tests across seven files, all running on CPU with no external
 services (kernel execution is simulated). Shared fixtures in `tests/conftest.py` provide single
 GPUs, dual- and quad-GPU clusters, and sample graphs.
 
@@ -744,7 +744,7 @@ GPUs, dual- and quad-GPU clusters, and sample graphs.
 - **`test_scheduler.py`** (42) — FIFO, critical-path, and load-balance schedulers; that
   dependencies are respected (a kernel never starts before its predecessors finish); stream
   assignment for overlap; cross-device transfer scheduling; and `Schedule` summaries/utilization.
-- **`test_optimizer.py`** (38) — GEMM+bias+activation fusion, elementwise-chain fusion (length
+- **`test_optimizer.py`** (42) — GEMM+bias+activation fusion, elementwise-chain fusion (length
   threshold), dead-code elimination, memory-planning offsets, the pipeline runner, and
   `OptimizationResult` bookkeeping (counts, patterns, estimated speedup).
 - **`test_memory.py`** (31) — `DeviceMemoryManager` allocation/free/peak tracking, out-of-memory

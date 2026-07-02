@@ -68,52 +68,41 @@ python -m venv venv
 # Activate it
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Install development dependencies
-pip install -r requirements-dev.txt
+# Install the package with development dependencies
+pip install -e ".[dev]"
 ```
 
-### 3. Install Pre-commit Hooks
+The `dev` extra (declared in `pyproject.toml`) pulls in `pytest`, `pytest-cov`,
+`black`, `ruff`, and `mypy`.
+
+### 3. Lint and Format
+
+This is a pure-Python project (setuptools build backend); there are no C/C++
+extensions to compile, so `pip install -e .` is the entire build step. Before
+sending a change, run the linters and formatter:
 
 ```bash
-# Install pre-commit
-pip install pre-commit
+# Format
+black src tests
 
-# Install hooks
-pre-commit install
+# Lint
+ruff check src tests
 
-# Run hooks manually
-pre-commit run --all-files
+# Type-check
+mypy src
 ```
 
-### 4. Build the Project
-
-```bash
-# Build in development mode
-python setup.py develop
-
-# Or using pip
-pip install -e .
-
-# Build C++ extensions
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j$(nproc)
-```
-
-### 5. Run Tests
+### 4. Run Tests
 
 ```bash
 # Run all tests
-pytest
+pytest tests/ -v
 
-# Run specific test file
-pytest tests/test_optimization.py
+# Run a specific test file
+pytest tests/test_optimization_passes_actual.py
 
 # Run with coverage
-pytest --cov=mlcompiler --cov-report=html
-
-# Run benchmarks
-pytest benchmarks/ --benchmark-only
+pytest tests/ --cov=mlcompiler --cov-report=html
 ```
 
 ## Contributing Process

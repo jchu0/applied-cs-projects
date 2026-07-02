@@ -135,7 +135,7 @@ recon = codec.decompress(result.bitstream)
 pytest tests/ -v
 ```
 
-143 tests across 7 files cover transforms, entropy models, codecs and coders, losses,
+147 tests across 7 files cover transforms, entropy models, codecs and coders, losses,
 multi-rate codecs, training, and data loading. No external services are needed (the Kodak
 download is exercised only when explicitly requested).
 
@@ -152,7 +152,7 @@ download is exercised only when explicitly requested).
     losses.py        # distortion, perceptual, rate-distortion losses
     training.py      # training loop and checkpointing
     data.py          # datasets and transforms
-  tests/             # 143 tests across 7 files
+  tests/             # 147 tests across 7 files
   docs/BLUEPRINT.md  # full architecture and design
 ```
 

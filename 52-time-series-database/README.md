@@ -133,7 +133,7 @@ provides convenient constants.
 ## Testing
 
 ```bash
-cargo test              # 217 unit tests + 80 integration tests
+cargo test              # 219 unit tests + 80 integration tests
 cargo test -- --nocapture   # show println! output
 ```
 

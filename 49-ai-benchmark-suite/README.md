@@ -127,7 +127,7 @@ results = runner.run_from_registry(["matmul", "softmax"], BenchmarkConfig(name="
 pytest tests/ -v
 ```
 
-The suite has 218 tests across benchmarks, the runner/CLI, reporting, and the experiment
+The suite has 224 tests across benchmarks, the runner/CLI, reporting, and the experiment
 layer (workloads, experiment manager, regression detection, multi-node aggregation). No
 external services or GPUs are required.
 
@@ -141,7 +141,7 @@ external services or GPUs are required.
     runner/runner.py        # Runner, CLI, scheduler
     report/report.py        # HTML/Markdown/JSON reports, comparison, analysis
     experiment/experiment.py# Workloads, experiments, regression, multi-node
-  tests/                    # 218 tests across all modules
+  tests/                    # 224 tests across all modules
   docs/BLUEPRINT.md         # Full architecture and design
 ```
 

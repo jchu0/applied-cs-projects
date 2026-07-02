@@ -12,6 +12,7 @@ from .experiment import (
     ExperimentResult,
     ExperimentManager,
     RegressionDetector,
+    NodeConfig,
     MultiNodeHarness,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "ExperimentResult",
     "ExperimentManager",
     "RegressionDetector",
+    "NodeConfig",
     "MultiNodeHarness",
 ]

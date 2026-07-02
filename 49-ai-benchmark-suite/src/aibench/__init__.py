@@ -20,7 +20,7 @@ from .experiment import (
     WorkloadCategory, WorkloadConfig, Workload,
     LLMInferenceWorkload, RAGWorkload, ANNSearchWorkload, GPUKernelWorkload,
     ExperimentConfig, ExperimentResult, ExperimentManager,
-    RegressionDetector, MultiNodeHarness,
+    RegressionDetector, NodeConfig, MultiNodeHarness,
 )
 
 __all__ = [
@@ -40,5 +40,5 @@ __all__ = [
     "WorkloadCategory", "WorkloadConfig", "Workload",
     "LLMInferenceWorkload", "RAGWorkload", "ANNSearchWorkload", "GPUKernelWorkload",
     "ExperimentConfig", "ExperimentResult", "ExperimentManager",
-    "RegressionDetector", "MultiNodeHarness",
+    "RegressionDetector", "NodeConfig", "MultiNodeHarness",
 ]

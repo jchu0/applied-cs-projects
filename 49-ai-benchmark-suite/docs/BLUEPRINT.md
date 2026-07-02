@@ -13,7 +13,7 @@ multi-node orchestration on top of the same statistical vocabulary.
 The design goal is to teach the mechanics that production benchmarking tools (MLPerf, perf
 harnesses, service load generators) are built from, without pulling in a deep-learning
 runtime. Everything runs in-process with only NumPy as a runtime dependency, so the whole
-suite — including its 218 tests — executes on a laptop with no GPU and no network.
+suite — including its 224 tests — executes on a laptop with no GPU and no network.
 
 The concepts the suite teaches:
 
@@ -746,7 +746,7 @@ severity bands. All reported numbers are whatever the host produces at run time.
 
 ## Testing Strategy
 
-Tests live in `tests/` and total 218 test functions across four files plus shared fixtures
+Tests live in `tests/` and total 224 test functions across four files plus shared fixtures
 in `conftest.py`. They require only NumPy and pytest — no GPU, no network, no external
 services — so the whole suite runs anywhere. Run it with:
 

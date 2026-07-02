@@ -146,7 +146,7 @@ print(f"pipeline efficiency: {pipe.efficiency:.2%}, bubble {pipe.bubble_ratio:.2
 ## Testing
 
 ```bash
-pytest tests/ -v   # 281 tests
+pytest tests/ -v   # 285 tests
 ```
 
 The suite covers the graph structure, all three schedulers, optimizer passes, memory managers,
@@ -164,7 +164,7 @@ required — everything runs on CPU against the simulated executor.
     scheduler/scheduler.py        # Schedulers, stream/memory scheduling, pipeline scheduler
     optimizer/optimizer.py        # Fusion, memory planning, DCE, optimization pipeline
     executor/executor.py          # Execution engine, memory, profiling, cost models, speculation
-  tests/                          # Pytest suite (281 tests)
+  tests/                          # Pytest suite (285 tests)
   docs/BLUEPRINT.md               # Full architecture and design
 ```
 

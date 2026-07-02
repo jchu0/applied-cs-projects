@@ -159,11 +159,11 @@ bump heap, and assembly context switch are all implemented.
 
 **Simulated / unverified:**
 - **QEMU boot is not verified.** The `init -> scheduler -> shell` path has not
-  been confirmed to run end-to-end. Notably, `kernel_main` calls
-  `scheduler::run()`, which is not defined in `scheduler.rs`, so the bootable
-  binary is not known to link as-is. `init::init_main` (which spawns the shell),
-  `usermode::init`, `usermode::jump_to_usermode`, and `context::switch_context`
-  are implemented but not wired into the boot path.
+  been confirmed to run end-to-end under QEMU. `kernel_main` calls
+  `scheduler::run()`, which is defined in `scheduler.rs` and performs the initial
+  schedule before entering `init::init_main` (which spawns the shell), so the
+  boot path is wired. `usermode::init`, `usermode::jump_to_usermode`, and
+  `context::switch_context` are implemented but not yet exercised by that path.
 - **No automated integration tests.** The `isa-debug-exit` QEMU harness is
   configured in `Cargo.toml` (`test-args`) but is not exercised.
 - **Stubbed syscall paths.** `sys_read`/`sys_write` to non-standard descriptors,
