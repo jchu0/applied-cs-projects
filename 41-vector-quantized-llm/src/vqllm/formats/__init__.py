@@ -7,6 +7,8 @@ from .gguf import (
     GGUFQuantType,
     GGUF_MAGIC,
     GGUF_VERSION,
+    convert_to_gguf,
+    load_from_gguf,
 )
 
 __all__ = [
@@ -16,4 +18,6 @@ __all__ = [
     "GGUFQuantType",
     "GGUF_MAGIC",
     "GGUF_VERSION",
+    "convert_to_gguf",
+    "load_from_gguf",
 ]

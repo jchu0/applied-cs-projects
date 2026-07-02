@@ -37,6 +37,33 @@ class Quantizer(ABC):
         """Quantize a weight tensor."""
         pass
 
+    def _validate_weight(self, weight: np.ndarray) -> np.ndarray:
+        """Validate a weight tensor for quantization.
+
+        All quantization paths (per-tensor, per-channel, per-group) operate on
+        a 2-D ``[out_features, in_features]`` matrix. This surfaces a clear
+        error at the public API boundary instead of letting NumPy raise an
+        opaque axis/reshape error deep inside a kernel.
+        """
+        if not isinstance(weight, np.ndarray):
+            weight = np.asarray(weight)
+        if weight.ndim != 2:
+            raise ValueError(
+                f"quantize_weight expects a 2-D weight matrix "
+                f"[out_features, in_features], got shape {weight.shape} "
+                f"({weight.ndim}-D)."
+            )
+        if self.config.scale_type == ScaleType.PER_GROUP:
+            in_features = weight.shape[1]
+            group_size = self.config.group_size
+            if in_features < group_size:
+                raise ValueError(
+                    f"PER_GROUP quantization needs in_features "
+                    f"({in_features}) >= group_size ({group_size}). "
+                    f"Reduce group_size or use PER_CHANNEL/PER_TENSOR."
+                )
+        return weight
+
     def set_calibration_stats(self, stats: Dict[str, Any]) -> None:
         """Set calibration statistics for quantization.
 
@@ -75,6 +102,7 @@ class INT8Quantizer(Quantizer):
         name: str = ""
     ) -> QuantizedTensor:
         """Quantize weight to INT8."""
+        weight = self._validate_weight(weight)
         qdata, scales, zeros = quantize_int8(
             weight,
             self.config.scale_type,
@@ -107,6 +135,7 @@ class INT4Quantizer(Quantizer):
         name: str = ""
     ) -> QuantizedTensor:
         """Quantize weight to INT4."""
+        weight = self._validate_weight(weight)
         qdata, scales, zeros = quantize_int4(
             weight,
             self.config.scale_type,
@@ -171,6 +200,7 @@ class FP8Quantizer(Quantizer):
         Returns:
             FP8QuantizedTensor with quantized data and scales
         """
+        weight = self._validate_weight(weight)
         if self.format == "e4m3":
             qdata, scales = quantize_fp8_e4m3(weight, self.config.scale_type)
         else:
@@ -229,6 +259,7 @@ class GPTQQuantizer(Quantizer):
         hessian: np.ndarray = None
     ) -> QuantizedTensor:
         """Quantize using GPTQ algorithm."""
+        weight = self._validate_weight(weight)
         W = weight.copy()
         out_features, in_features = W.shape
 
@@ -363,6 +394,7 @@ class AWQQuantizer(Quantizer):
             act_scales: Activation scales (per-channel)
             activation_scale: Alias for act_scales (for compatibility)
         """
+        weight = self._validate_weight(weight)
         out_features, in_features = weight.shape
 
         # Support both parameter names
@@ -498,6 +530,7 @@ class SmoothQuantQuantizer(Quantizer):
         act_scales: np.ndarray = None
     ) -> QuantizedTensor:
         """Quantize with smoothing."""
+        weight = self._validate_weight(weight)
         if act_scales is None:
             # Default to per-channel max
             act_scales = np.ones(weight.shape[1])

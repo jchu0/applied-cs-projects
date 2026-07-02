@@ -5,7 +5,12 @@ from .calibrate import (
     MinMaxCalibrator,
     PercentileCalibrator,
     MSECalibrator,
+    HessianCalibrator,
+    ActivationCalibrator,
     CalibrationData,
+    CalibrationDataset,
+    compute_hessian,
+    collect_activations,
 )
 
 __all__ = [
@@ -13,5 +18,10 @@ __all__ = [
     "MinMaxCalibrator",
     "PercentileCalibrator",
     "MSECalibrator",
+    "HessianCalibrator",
+    "ActivationCalibrator",
     "CalibrationData",
+    "CalibrationDataset",
+    "compute_hessian",
+    "collect_activations",
 ]

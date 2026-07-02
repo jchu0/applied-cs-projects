@@ -647,5 +647,73 @@ class TestFP8TensorOperations(unittest.TestCase):
         self.assertGreater(qtensor.nbytes, 0)
 
 
+class TestWeightValidation(unittest.TestCase):
+    """Public-API input validation for quantize_weight."""
+
+    def test_int8_rejects_1d_weight(self):
+        with self.assertRaises(ValueError):
+            INT8Quantizer().quantize_weight(np.arange(10, dtype=np.float32))
+
+    def test_int4_rejects_3d_weight(self):
+        with self.assertRaises(ValueError):
+            INT4Quantizer().quantize_weight(np.zeros((2, 3, 4), dtype=np.float32))
+
+    def test_gptq_rejects_1d_weight(self):
+        with self.assertRaises(ValueError):
+            GPTQQuantizer().quantize_weight(np.arange(8, dtype=np.float32))
+
+    def test_awq_rejects_1d_weight(self):
+        with self.assertRaises(ValueError):
+            AWQQuantizer().quantize_weight(np.arange(8, dtype=np.float32))
+
+    def test_fp8_rejects_1d_weight(self):
+        with self.assertRaises(ValueError):
+            FP8Quantizer().quantize_weight(np.arange(8, dtype=np.float32))
+
+    def test_per_group_requires_enough_columns(self):
+        config = QuantConfig(
+            bits=8, scale_type=ScaleType.PER_GROUP, group_size=128
+        )
+        with self.assertRaises(ValueError):
+            INT8Quantizer(config).quantize_weight(
+                np.random.randn(4, 100).astype(np.float32)
+            )
+
+    def test_valid_2d_weight_still_works(self):
+        w = np.random.randn(4, 32).astype(np.float32)
+        qt = INT8Quantizer().quantize_weight(w)
+        self.assertEqual(qt.shape, (4, 32))
+
+
+class TestPublicExports(unittest.TestCase):
+    """Documented public API must be importable where the docs claim."""
+
+    def test_core_free_functions_exported(self):
+        from vqllm.core import (
+            quantize_int8, quantize_int4,
+            float_to_fp8_e4m3, fp8_e4m3_to_float,
+            float_to_fp8_e5m2, fp8_e5m2_to_float,
+        )
+        self.assertTrue(callable(quantize_int8))
+        self.assertTrue(callable(float_to_fp8_e4m3))
+
+    def test_calibration_free_functions_exported(self):
+        from vqllm.calibration import (
+            compute_hessian, HessianCalibrator, ActivationCalibrator,
+            CalibrationDataset,
+        )
+        self.assertTrue(callable(compute_hessian))
+
+    def test_formats_helpers_exported(self):
+        from vqllm.formats import convert_to_gguf, load_from_gguf
+        self.assertTrue(callable(convert_to_gguf))
+        self.assertTrue(callable(load_from_gguf))
+
+    def test_package_root_all_resolves(self):
+        import vqllm
+        for name in vqllm.__all__:
+            self.assertTrue(hasattr(vqllm, name), f"vqllm missing {name}")
+
+
 if __name__ == '__main__':
     unittest.main()
