@@ -165,8 +165,10 @@ impl HardNegativeMiner {
                 .map(|(idx, emb)| (idx, cosine_similarity(anchor, emb)))
                 .collect();
 
-            // Sort by similarity descending
-            similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            // Sort by similarity descending. `total_cmp` gives a total order
+            // even if a similarity is NaN (e.g. from a zero-norm embedding),
+            // so this never panics on malformed input.
+            similarities.sort_by(|a, b| b.1.total_cmp(&a.1));
 
             // Get positive index to exclude
             let pos_idx = self.id_to_idx.get(pos_id);
@@ -333,7 +335,8 @@ impl CurriculumSampler {
             .enumerate()
             .map(|(i, d)| (i, d))
             .collect();
-        examples.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        // `total_cmp` tolerates NaN difficulties without panicking.
+        examples.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         Self {
             examples,
@@ -1012,5 +1015,38 @@ mod tests {
         let neg2 = sampler2.sample(1000, &exclude, 10);
 
         assert_eq!(neg1, neg2);
+    }
+
+    // =============================================================================
+    // Robustness Tests (NaN inputs must not panic)
+    // =============================================================================
+
+    #[test]
+    fn test_mine_tolerates_nan_embeddings() {
+        // A zero-norm embedding yields NaN cosine similarities; the sort must
+        // not panic (previously used partial_cmp().unwrap()).
+        let mut miner = HardNegativeMiner::new();
+        miner
+            .build_index(
+                vec![vec![0.0, 0.0, 0.0], vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+                vec!["a".into(), "b".into(), "c".into()],
+            )
+            .unwrap();
+
+        let anchors = vec![vec![f32::NAN, 0.0, 0.0]];
+        let positives = vec!["a".to_string()];
+        let results = miner.mine(&anchors, &positives, 2);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].len() <= 2);
+    }
+
+    #[test]
+    fn test_curriculum_sampler_tolerates_nan_difficulty() {
+        // Difficulties containing NaN previously panicked in the constructor sort.
+        let sampler = CurriculumSampler::new(vec![0.5, f32::NAN, 0.1, 0.9], 0.1);
+        let indices = sampler.get_epoch_indices();
+        // Should return without panicking; low-difficulty items are selected.
+        assert!(indices.len() <= 4);
     }
 }

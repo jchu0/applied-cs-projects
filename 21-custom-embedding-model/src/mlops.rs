@@ -516,7 +516,7 @@ impl HyperparameterSearch {
 
     /// Record a trial result.
     pub fn record_trial(&mut self, params: HashMap<String, serde_json::Value>, score: f64) {
-        if self.best_score.is_none() || score > self.best_score.unwrap() {
+        if self.best_score.map_or(true, |best| score > best) {
             self.best_score = Some(score);
             self.best_params = Some(params);
         }
@@ -710,5 +710,15 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
         assert!(point.timestamp <= chrono::Utc::now());
+    }
+
+    #[test]
+    fn test_record_trial_tolerates_nan_score() {
+        // record_trial must not panic on a NaN score (previously relied on an
+        // is_none()/unwrap() pattern). A NaN never beats an existing best.
+        let mut search = HyperparameterSearch::new(vec![], 3);
+        search.record_trial(HashMap::new(), 0.8);
+        search.record_trial(HashMap::new(), f64::NAN);
+        assert_eq!(search.best_score(), Some(0.8));
     }
 }

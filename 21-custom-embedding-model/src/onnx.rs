@@ -250,7 +250,13 @@ pub struct SessionStats {
 
 impl SessionStats {
     /// Update with new latency sample.
+    ///
+    /// Non-finite or negative latencies are ignored: they cannot represent a
+    /// real measurement and would otherwise panic `Duration::from_secs_f64`.
     pub fn add_sample(&mut self, latency_ms: f64) {
+        if !latency_ms.is_finite() || latency_ms < 0.0 {
+            return;
+        }
         self.num_runs += 1;
         self.total_inference_time += Duration::from_secs_f64(latency_ms / 1000.0);
         self.latency_samples.push(latency_ms);
@@ -258,8 +264,9 @@ impl SessionStats {
         // Update average
         self.avg_latency_ms = self.latency_samples.iter().sum::<f64>() / self.num_runs as f64;
 
-        // Update percentiles (keep sorted)
-        self.latency_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Update percentiles (keep sorted). `total_cmp` never panics, even if a
+        // caller records a NaN latency sample.
+        self.latency_samples.sort_by(|a, b| a.total_cmp(b));
         let n = self.latency_samples.len();
         self.p50_latency_ms = self.latency_samples[n / 2];
         self.p99_latency_ms = self.latency_samples[(n * 99) / 100];
@@ -986,5 +993,18 @@ mod tests {
         assert_eq!(GraphOptimizationLevel::Disabled.as_ort_level(), 0);
         assert_eq!(GraphOptimizationLevel::Basic.as_ort_level(), 1);
         assert_eq!(GraphOptimizationLevel::All.as_ort_level(), 99);
+    }
+
+    #[test]
+    fn test_session_stats_tolerates_nan_latency() {
+        // A NaN latency sample must not panic (Duration::from_secs_f64 panics on
+        // NaN) nor the percentile sort. Invalid samples are ignored.
+        let mut stats = SessionStats::default();
+        stats.add_sample(1.0);
+        stats.add_sample(f64::NAN);
+        stats.add_sample(-5.0);
+        stats.add_sample(3.0);
+        assert_eq!(stats.num_runs, 2);
+        assert!(stats.p50_latency_ms.is_finite());
     }
 }

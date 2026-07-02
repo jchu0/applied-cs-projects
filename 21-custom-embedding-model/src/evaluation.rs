@@ -102,8 +102,9 @@ impl EmbeddingEvaluator {
                 .map(|(idx, doc_emb)| (idx, cosine_similarity(query_emb, doc_emb)))
                 .collect();
 
-            // Sort by similarity descending
-            scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            // Sort by similarity descending. `total_cmp` provides a total order
+            // even for NaN scores, so malformed embeddings cannot panic here.
+            scores.sort_by(|a, b| b.1.total_cmp(&a.1));
 
             // Get retrieved document indices
             let retrieved: Vec<usize> = scores.iter().map(|(idx, _)| *idx).collect();
@@ -112,18 +113,20 @@ impl EmbeddingEvaluator {
             for &k in &self.k_values {
                 let top_k: HashSet<usize> = retrieved.iter().take(k).copied().collect();
 
-                // Recall@K
+                // Recall@K. `entry().or_insert()` is used instead of
+                // `get_mut().unwrap()` so the accumulation is panic-free even if
+                // `k_values` were somehow not pre-seeded.
                 let hits = top_k.intersection(&rel_docs).count();
                 let recall = hits as f32 / rel_docs.len() as f32;
-                *recall_sums.get_mut(&k).unwrap() += recall;
+                *recall_sums.entry(k).or_insert(0.0) += recall;
 
                 // Precision@K
                 let precision = hits as f32 / k as f32;
-                *precision_sums.get_mut(&k).unwrap() += precision;
+                *precision_sums.entry(k).or_insert(0.0) += precision;
 
                 // NDCG@K
                 let ndcg = self.compute_ndcg(&retrieved, &rel_docs, k);
-                *ndcg_sums.get_mut(&k).unwrap() += ndcg;
+                *ndcg_sums.entry(k).or_insert(0.0) += ndcg;
             }
 
             // MRR (Mean Reciprocal Rank)
@@ -355,7 +358,8 @@ fn spearman_correlation(x: &[f32], y: &[f32]) -> f32 {
 /// Convert values to ranks.
 fn to_ranks(values: &[f32]) -> Vec<f32> {
     let mut indexed: Vec<(usize, f32)> = values.iter().cloned().enumerate().collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    // `total_cmp` avoids panicking on NaN values.
+    indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
 
     let mut ranks = vec![0.0; values.len()];
     for (rank, (idx, _)) in indexed.into_iter().enumerate() {
@@ -1098,5 +1102,28 @@ mod tests {
         }
         assert!(metrics.mrr >= 0.0 && metrics.mrr <= 1.0);
         assert!(metrics.map >= 0.0 && metrics.map <= 1.0);
+    }
+
+    // =============================================================================
+    // Robustness Tests (NaN inputs must not panic)
+    // =============================================================================
+
+    #[test]
+    fn test_evaluate_retrieval_tolerates_nan_scores() {
+        // A zero-norm corpus embedding produces NaN cosine similarities; sorting
+        // must not panic (previously partial_cmp().unwrap()).
+        let evaluator = EmbeddingEvaluator::new(vec![1, 5]);
+        let queries = vec![vec![1.0, 0.0, 0.0]];
+        let corpus = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0], // zero norm -> NaN similarity
+            vec![0.0, 1.0, 0.0],
+        ];
+        let mut relevance = HashMap::new();
+        relevance.insert(0usize, vec![0usize]);
+
+        let metrics = evaluator.evaluate_retrieval(&queries, &corpus, &relevance);
+        // Completes without panicking and produces finite aggregate metrics.
+        assert!(metrics.mrr.is_finite());
     }
 }

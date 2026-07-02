@@ -165,8 +165,12 @@ impl ProcessGroup {
             return Ok(());
         }
 
-        // Real implementation would wait for all processes
-        let mut counter = self.barrier_counter.lock().unwrap();
+        // Real implementation would wait for all processes. Surface a poisoned
+        // lock as a DistributedError rather than panicking.
+        let mut counter = self
+            .barrier_counter
+            .lock()
+            .map_err(|_| Error::DistributedError("barrier lock poisoned".into()))?;
         *counter += 1;
         Ok(())
     }
