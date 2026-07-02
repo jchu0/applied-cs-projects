@@ -18,8 +18,8 @@ Python process.
   primitives.
 - **JIT tracing** — `jit` decorator with a shape/dtype + static-arg cache key and
   `cache_info` statistics (`JittedFunction`, `jit/compiler.py`).
-- **Function transforms** — `pmap`, `vmap`, `scan`, and `checkpoint` over a logical device
-  axis (`parallel/primitives.py`).
+- **Function transforms** — `pmap`, `vmap`, `scan`, and `checkpoint` (a no-op pass-through; see
+  "What's Real vs Simulated") over a logical device axis (`parallel/primitives.py`).
 - **Collectives** — `psum`, `pmean`, `pmax`, `all_gather`, `broadcast` with a named-axis
   context for cross-shard reductions.
 - **Device mesh + sharding** — N-dimensional `Mesh`, `PartitionSpec` (`P`), `ShardingSpec`,
@@ -128,8 +128,10 @@ print(unshard_tensor(sharded).numpy().shape)       # (4, 4)
   The device mesh is logical and shards live in an in-process dict keyed by `Device`.
   Collectives `psum`, `pmax`, `all_gather`, and `broadcast` are identity placeholders (only
   `pmean` performs a real division by the axis size). `JittedFunction._compile` builds tracers
-  but returns the original Python function — there is no IR lowering or fusion. Forward-mode
-  `jvp` raises `NotImplementedError`; `jacobian` / `hessian` fall back to finite differences.
+  but returns the original Python function — there is no IR lowering or fusion. `checkpoint` is
+  an identity/no-op wrapper: it simply calls the wrapped function and does **not** save/restore
+  activations or trade compute for memory (no rematerialization happens). Forward-mode `jvp`
+  raises `NotImplementedError`; `jacobian` / `hessian` fall back to finite differences.
 
 ## Testing
 
@@ -137,7 +139,7 @@ print(unshard_tensor(sharded).numpy().shape)       # (4, 4)
 pytest tests/ -v
 ```
 
-The suite has 178 tests (4 Jacobian/Hessian cases are skipped) covering lazy tensors and
+The suite has 178 tests (3 Jacobian/Hessian cases are skipped) covering lazy tensors and
 factory functions, arithmetic/transcendental/reduction/shape ops, autodiff correctness
 against numerical gradients, JIT caching behavior, and mesh/sharding validation. No external
 services are needed.

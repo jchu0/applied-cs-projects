@@ -74,6 +74,9 @@ from .sharding import (
     ShardedTensor,
     shard_tensor,
     unshard_tensor,
+    replicate,
+    SPMDPartitioner,
+    DeviceFailover,
 )
 
 __version__ = "0.1.0"
@@ -154,4 +157,7 @@ __all__ = [
     "ShardedTensor",
     "shard_tensor",
     "unshard_tensor",
+    "replicate",
+    "SPMDPartitioner",
+    "DeviceFailover",
 ]

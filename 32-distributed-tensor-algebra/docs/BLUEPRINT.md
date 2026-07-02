@@ -759,7 +759,7 @@ are claimed. The relevant performance characteristics follow from the design:
 
 ## Testing Strategy
 
-The suite (178 tests across four files, 4 skipped) validates the array-programming model end to
+The suite (178 tests across four files, 3 skipped) validates the array-programming model end to
 end. `pytest tests/ -v`.
 
 - **`test_lazy_tensor.py` (72).** Factory functions and dtypes; lazy-vs-materialized state and
@@ -768,7 +768,7 @@ end. `pytest tests/ -v`.
   shape ops; `relu` / `sigmoid` / `softmax` (including numerical-stability with large inputs);
   broadcasting; operation chaining; and a full MLP forward pass whose softmax rows sum to 1.
 
-- **`test_autodiff.py` (42, 4 skipped).** Tape creation/watch/record and nested
+- **`test_autodiff.py` (42, 3 skipped).** Tape creation/watch/record and nested
   `AutoDiffContext`; `grad` on polynomials and compositions; `value_and_grad` with single and
   multiple args; `vjp` with unit and weighted cotangents; per-op gradient checks for arithmetic,
   transcendental, matmul (shape), reductions, reshape/transpose, and broadcasting; composite
