@@ -97,12 +97,14 @@ class CircuitBreaker:
                     f"Circuit '{self.name}' is open, request rejected"
                 )
 
+            entered_half_open = False
             if self._state == CircuitState.HALF_OPEN:
                 if self._half_open_calls >= self.half_open_max_calls:
                     raise CircuitOpenError(
                         f"Circuit '{self.name}' is half-open and at capacity"
                     )
                 self._half_open_calls += 1
+                entered_half_open = True
 
         try:
             result = await func(*args, **kwargs)
@@ -111,6 +113,14 @@ class CircuitBreaker:
         except Exception as e:
             await self._on_failure()
             raise
+        finally:
+            # Release the half-open probe slot so it caps *concurrent* probes,
+            # not the lifetime total (otherwise success_threshold can never be
+            # reached when it exceeds half_open_max_calls).
+            if entered_half_open:
+                async with self._lock:
+                    if self._half_open_calls > 0:
+                        self._half_open_calls -= 1
 
     async def _check_state(self) -> None:
         """Check if state should transition based on timeouts."""

@@ -1734,49 +1734,68 @@ class DistributedTensorManager:
             DistributedTensor on success
         """
         with self._lock:
-            if name in self._tensors:
-                logger.warning(f"Tensor {name} already exists")
-                return None
-
-            if devices is None:
-                devices = list(range(self._allocator._num_gpus))
-
-            # Calculate shard sizes
-            dtype_size = {'float32': 4, 'float16': 2, 'float64': 8, 'int32': 4, 'int64': 8}.get(dtype, 4)
-            total_elements = 1
-            for dim in shape:
-                total_elements *= dim
-            total_size = total_elements * dtype_size
-
-            # Calculate per-shard size
-            shard_count = len(devices)
-            elements_per_shard = total_elements // shard_count
-            shard_size = elements_per_shard * dtype_size
-
-            # Allocate shards
-            shards = {}
-            for device_id in devices:
-                block = self._allocator.allocate(shard_size, device_id)
-                if block is None:
-                    # Cleanup on failure
-                    for allocated_block in shards.values():
-                        self._allocator.free(allocated_block)
-                    return None
-                shards[device_id] = block
-
-            tensor = DistributedTensor(
-                name=name,
-                shape=shape,
-                dtype=dtype,
-                shards=shards,
-                total_size=total_size,
-                shard_dim=shard_dim
+            return self._create_distributed_locked(
+                name, shape, dtype, devices, shard_dim
             )
 
-            self._tensors[name] = tensor
-            self._stats['tensors_created'] += 1
+    def _create_distributed_locked(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        dtype: str = 'float32',
+        devices: Optional[List[int]] = None,
+        shard_dim: int = 0
+    ) -> Optional[DistributedTensor]:
+        """
+        Create a distributed tensor. Assumes ``self._lock`` is already held.
 
-            return tensor
+        This no-lock helper exists so that other public methods which already
+        hold ``self._lock`` (e.g. ``scatter``) can create tensors without
+        re-acquiring the non-reentrant lock, which would deadlock.
+        """
+        if name in self._tensors:
+            logger.warning(f"Tensor {name} already exists")
+            return None
+
+        if devices is None:
+            devices = list(range(self._allocator._num_gpus))
+
+        # Calculate shard sizes
+        dtype_size = {'float32': 4, 'float16': 2, 'float64': 8, 'int32': 4, 'int64': 8}.get(dtype, 4)
+        total_elements = 1
+        for dim in shape:
+            total_elements *= dim
+        total_size = total_elements * dtype_size
+
+        # Calculate per-shard size
+        shard_count = len(devices)
+        elements_per_shard = total_elements // shard_count
+        shard_size = elements_per_shard * dtype_size
+
+        # Allocate shards
+        shards = {}
+        for device_id in devices:
+            block = self._allocator.allocate(shard_size, device_id)
+            if block is None:
+                # Cleanup on failure
+                for allocated_block in shards.values():
+                    self._allocator.free(allocated_block)
+                return None
+            shards[device_id] = block
+
+        tensor = DistributedTensor(
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            shards=shards,
+            total_size=total_size,
+            shard_dim=shard_dim
+        )
+
+        self._tensors[name] = tensor
+        self._stats['tensors_created'] += 1
+
+        return tensor
 
     def delete_tensor(self, name: str) -> bool:
         """Delete a distributed tensor."""
@@ -1851,7 +1870,9 @@ class DistributedTensorManager:
             DistributedTensor with scattered data
         """
         with self._lock:
-            tensor = self.create_distributed(name, shape, dtype, target_devices)
+            # Use the no-lock helper: we already hold self._lock, and the
+            # non-reentrant threading.Lock would deadlock on re-acquisition.
+            tensor = self._create_distributed_locked(name, shape, dtype, target_devices)
             if tensor is None:
                 return None
 

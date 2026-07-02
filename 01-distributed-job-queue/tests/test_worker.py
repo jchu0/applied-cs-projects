@@ -1,19 +1,33 @@
-"""Comprehensive tests for the Worker class."""
+"""Tests for the Worker class (jobqueue.worker).
+
+These exercise the real worker behaviour against a mock broker that matches
+the :class:`~jobqueue.broker.Broker` interface: ``dequeue`` to fetch work,
+``acknowledge`` to record results, ``requeue`` for retries, and the optional
+``move_to_dlq`` for permanently failed tasks.
+"""
 
 import asyncio
-import json
-import time
-import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
 
 from jobqueue.broker import Broker
-from jobqueue.circuit_breaker import CircuitBreakerRegistry, CircuitOpenError
-from jobqueue.models import Task, TaskResult, TaskStatus, WorkerInfo
+from jobqueue.models import Task, TaskResult, TaskStatus
 from jobqueue.worker import Worker
+
+
+def _make_task(name: str, task_id: str = "task-1", **kwargs) -> Task:
+    return Task(
+        id=task_id,
+        name=name,
+        queue="test-queue",
+        payload=kwargs.pop("payload", {"data": "test"}),
+        status=TaskStatus.RUNNING,
+        started_at=datetime.now(timezone.utc),
+        **kwargs,
+    )
 
 
 class TestWorker:
@@ -21,15 +35,10 @@ class TestWorker:
 
     @pytest_asyncio.fixture
     async def mock_broker(self):
-        """Create a mock broker for testing."""
+        """Create a mock broker matching the real Broker interface."""
         broker = AsyncMock(spec=Broker)
-        broker.fetch_task = AsyncMock(return_value=None)
-        broker.heartbeat = AsyncMock(return_value=True)
-        broker.register_worker = AsyncMock()
-        broker.deregister_worker = AsyncMock()
-        broker.update_task_status = AsyncMock()
-        broker.complete_task = AsyncMock()
-        broker.fail_task = AsyncMock()
+        # move_to_dlq is optional on the base interface; add it explicitly so
+        # DLQ-related tests can assert on it.
         broker.move_to_dlq = AsyncMock()
         return broker
 
@@ -49,7 +58,7 @@ class TestWorker:
 
     @pytest.mark.asyncio
     async def test_worker_initialization(self, worker, mock_broker):
-        """Test worker initialization with correct parameters."""
+        """Worker stores its configuration correctly."""
         assert worker.broker == mock_broker
         assert worker.queues == ["test-queue"]
         assert worker.concurrency == 2
@@ -58,342 +67,182 @@ class TestWorker:
         assert worker.enable_circuit_breaker is True
         assert worker.circuit_failure_threshold == 3
         assert worker.circuit_reset_timeout == 5.0
+        assert worker.worker_id.startswith("worker-")
 
     @pytest.mark.asyncio
     async def test_register_handler(self, worker):
-        """Test registering task handlers."""
+        """The task decorator registers a handler by name."""
 
         @worker.task("test_task")
         async def test_handler(task: Task):
             return {"result": "success"}
 
-        assert "test_task" in worker.handlers
-        assert worker.handlers["test_task"] == test_handler
+        assert "test_task" in worker._handlers
+        assert worker._handlers["test_task"] == test_handler
 
     @pytest.mark.asyncio
     async def test_process_task_success(self, worker, mock_broker):
-        """Test successful task processing."""
-        task = Task(
-            id="task-123",
-            name="test_task",
-            queue="test-queue",
-            payload={"data": "test"},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=1,
-        )
+        """A successful handler acknowledges a SUCCESS result."""
+        task = _make_task("test_task", task_id="task-123")
 
         @worker.task("test_task")
         async def test_handler(task_obj: Task):
             return {"result": "processed"}
 
-        result = await worker._process_task(task)
+        await worker._process_task(task)
 
-        mock_broker.update_task_status.assert_called_with(
-            task.id, TaskStatus.RUNNING
-        )
-        mock_broker.complete_task.assert_called_once()
-
-        # Verify the result
-        call_args = mock_broker.complete_task.call_args[0]
+        mock_broker.acknowledge.assert_awaited_once()
+        call_args = mock_broker.acknowledge.call_args[0]
         assert call_args[0] == task.id
-        assert isinstance(call_args[1], TaskResult)
-        assert call_args[1].task_id == task.id
-        assert call_args[1].result == {"result": "processed"}
+        result = call_args[1]
+        assert isinstance(result, TaskResult)
+        assert result.task_id == task.id
+        assert result.status == TaskStatus.SUCCESS
+        assert result.result == {"result": "processed"}
+        assert worker._tasks_completed == 1
 
     @pytest.mark.asyncio
-    async def test_process_task_failure(self, worker, mock_broker):
-        """Test task processing failure."""
-        task = Task(
-            id="task-124",
-            name="failing_task",
-            queue="test-queue",
-            payload={"data": "test"},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=1,
-        )
+    async def test_process_task_failure_no_retries(self, worker, mock_broker):
+        """A failing handler with no retries left is sent to the DLQ."""
+        task = _make_task("failing_task", task_id="task-124", max_retries=0)
 
         @worker.task("failing_task")
         async def failing_handler(task_obj: Task):
             raise ValueError("Task processing failed")
 
-        result = await worker._process_task(task)
+        await worker._process_task(task)
 
-        mock_broker.fail_task.assert_called_once()
-        call_args = mock_broker.fail_task.call_args[0]
-        assert call_args[0] == task.id
-        assert "Task processing failed" in call_args[1]
-
-    @pytest.mark.asyncio
-    async def test_process_task_timeout(self, worker, mock_broker):
-        """Test task timeout handling."""
-        task = Task(
-            id="task-125",
-            name="slow_task",
-            queue="test-queue",
-            payload={"data": "test"},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=1,
-            timeout=0.1,  # 100ms timeout
-        )
-
-        @worker.task("slow_task")
-        async def slow_handler(task_obj: Task):
-            await asyncio.sleep(0.5)  # Sleep longer than timeout
-            return {"result": "too_late"}
-
-        result = await worker._process_task(task)
-
-        mock_broker.fail_task.assert_called_once()
-        call_args = mock_broker.fail_task.call_args[0]
-        assert call_args[0] == task.id
-        assert "timeout" in call_args[1].lower()
+        # max_retries=0 -> no requeue; broker exposes move_to_dlq so DLQ is used.
+        mock_broker.requeue.assert_not_awaited()
+        mock_broker.move_to_dlq.assert_awaited_once()
+        dlq_args = mock_broker.move_to_dlq.call_args[0]
+        assert dlq_args[0] == task.id
+        assert "Task processing failed" in dlq_args[1]
+        assert worker._tasks_failed == 1
 
     @pytest.mark.asyncio
-    async def test_circuit_breaker_integration(self, worker, mock_broker):
-        """Test circuit breaker integration with worker."""
-        task = Task(
-            id="task-126",
-            name="circuit_task",
-            queue="test-queue",
-            payload={"data": "test"},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=1,
-        )
+    async def test_process_task_failure_acknowledges_when_no_dlq(self, mock_broker):
+        """Without DLQ support, a terminal failure is acknowledged as FAILURE."""
+        # Broker without move_to_dlq.
+        broker = AsyncMock(spec=Broker)
+        worker = Worker(broker=broker, queues=["test-queue"], use_dlq=False)
+        task = _make_task("failing_task", task_id="task-131", max_retries=0)
 
-        failure_count = 0
+        @worker.task("failing_task")
+        async def failing_handler(task_obj: Task):
+            raise ValueError("boom")
 
-        @worker.task("circuit_task")
-        async def circuit_handler(task_obj: Task):
-            nonlocal failure_count
-            failure_count += 1
-            if failure_count <= 3:
-                raise Exception("Simulated failure")
-            return {"result": "success"}
+        await worker._process_task(task)
 
-        # Process task multiple times to trigger circuit breaker
-        for i in range(3):
-            await worker._process_task(task)
-
-        # Circuit should be open now
-        circuit = worker.circuit_registry.get_circuit("circuit_task")
-        assert circuit is not None
-        assert circuit.is_open
+        broker.acknowledge.assert_awaited_once()
+        result = broker.acknowledge.call_args[0][1]
+        assert result.status == TaskStatus.FAILURE
+        assert "boom" in result.error
 
     @pytest.mark.asyncio
-    async def test_heartbeat_mechanism(self, worker, mock_broker):
-        """Test worker heartbeat mechanism."""
-        worker.worker_id = "worker-123"
-        worker.running = True
+    async def test_process_task_retries_before_giving_up(self, worker, mock_broker, monkeypatch):
+        """A failure with retries remaining requeues the task."""
+        # Avoid real backoff sleep.
+        monkeypatch.setattr("jobqueue.worker.Worker._calculate_backoff", lambda self, a: 0.0)
 
-        # Start heartbeat task
-        heartbeat_task = asyncio.create_task(worker._heartbeat())
-
-        # Let it run for a short time
-        await asyncio.sleep(0.2)
-
-        # Stop the worker
-        worker.running = False
-        await heartbeat_task
-
-        # Verify heartbeat was called
-        assert mock_broker.heartbeat.called
-
-    @pytest.mark.asyncio
-    async def test_worker_lifecycle(self, worker, mock_broker):
-        """Test complete worker lifecycle: start and stop."""
-        # Mock fetch_task to return a task then None
-        task = Task(
-            id="task-127",
-            name="lifecycle_task",
-            queue="test-queue",
-            payload={"data": "test"},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=1,
-        )
-
-        mock_broker.fetch_task.side_effect = [task, None, None, None]
-
-        @worker.task("lifecycle_task")
-        async def lifecycle_handler(task_obj: Task):
-            return {"result": "processed"}
-
-        # Start worker in background
-        start_task = asyncio.create_task(worker.start())
-
-        # Let it process the task
-        await asyncio.sleep(0.5)
-
-        # Stop the worker
-        await worker.stop()
-
-        # Verify registration and deregistration
-        mock_broker.register_worker.assert_called_once()
-        mock_broker.deregister_worker.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_retry_mechanism(self, worker, mock_broker):
-        """Test task retry mechanism."""
-        task = Task(
-            id="task-128",
-            name="retry_task",
-            queue="test-queue",
-            payload={"data": "test"},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=1,
-            max_retries=3,
-            retry_count=0,
-        )
-
-        attempt_count = 0
+        task = _make_task("retry_task", task_id="task-128", max_retries=3, retries=0)
 
         @worker.task("retry_task")
         async def retry_handler(task_obj: Task):
-            nonlocal attempt_count
-            attempt_count += 1
-            if attempt_count < 3:
-                raise Exception("Retry me")
-            return {"result": "success"}
-
-        # Process task (should retry internally)
-        await worker._process_task(task)
-
-        # Verify retries were attempted
-        assert mock_broker.update_task_status.called
-
-    @pytest.mark.asyncio
-    async def test_dlq_handling(self, worker, mock_broker):
-        """Test Dead Letter Queue handling."""
-        task = Task(
-            id="task-129",
-            name="dlq_task",
-            queue="test-queue",
-            payload={"data": "test"},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=1,
-            max_retries=0,  # No retries, should go to DLQ on failure
-        )
-
-        @worker.task("dlq_task")
-        async def dlq_handler(task_obj: Task):
-            raise Exception("Send to DLQ")
+            raise Exception("Retry me")
 
         await worker._process_task(task)
 
-        # Verify task was moved to DLQ
-        if worker.use_dlq:
-            mock_broker.move_to_dlq.assert_called_once_with(task.id)
+        mock_broker.requeue.assert_awaited_once_with(task.id)
+        mock_broker.acknowledge.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_concurrent_task_processing(self, worker, mock_broker):
-        """Test concurrent processing of multiple tasks."""
-        tasks = [
-            Task(
-                id=f"task-{i}",
-                name="concurrent_task",
-                queue="test-queue",
-                payload={"index": i},
-                status=TaskStatus.PENDING,
-                created_at=datetime.now(timezone.utc),
-                priority=1,
-            )
-            for i in range(5)
-        ]
+    async def test_process_task_timeout(self, worker, mock_broker):
+        """A handler exceeding its timeout is treated as a failure."""
+        # timeout_ms=100 -> 0.1s; handler sleeps 0.5s. max_retries=0 -> terminal.
+        task = _make_task("slow_task", task_id="task-125", timeout_ms=100, max_retries=0)
 
-        processed_tasks = []
+        @worker.task("slow_task")
+        async def slow_handler(task_obj: Task):
+            await asyncio.sleep(0.5)
+            return {"result": "too_late"}
 
-        @worker.task("concurrent_task")
-        async def concurrent_handler(task_obj: Task):
-            processed_tasks.append(task_obj.id)
-            await asyncio.sleep(0.1)
-            return {"index": task_obj.payload["index"]}
+        await worker._process_task(task)
 
-        # Process all tasks concurrently
-        await asyncio.gather(*[worker._process_task(task) for task in tasks])
-
-        # Verify all tasks were processed
-        assert len(processed_tasks) == 5
-        assert set(processed_tasks) == {f"task-{i}" for i in range(5)}
+        mock_broker.move_to_dlq.assert_awaited_once()
+        dlq_args = mock_broker.move_to_dlq.call_args[0]
+        assert dlq_args[0] == task.id
+        assert "timeout" in dlq_args[1].lower()
 
     @pytest.mark.asyncio
-    async def test_priority_queue_handling(self, worker, mock_broker):
-        """Test priority queue task fetching."""
-        high_priority_task = Task(
-            id="high-priority",
-            name="priority_task",
-            queue="test-queue",
-            payload={"priority": "high"},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=10,
-        )
+    async def test_no_handler_registered_fails(self, worker, mock_broker):
+        """A task with no registered handler is treated as a failure."""
+        task = _make_task("unknown_task", task_id="task-140", max_retries=0)
 
-        low_priority_task = Task(
-            id="low-priority",
-            name="priority_task",
-            queue="test-queue",
-            payload={"priority": "low"},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=1,
-        )
+        await worker._process_task(task)
 
-        # Mock broker to return high priority task first
-        mock_broker.fetch_task.side_effect = [high_priority_task, low_priority_task, None]
+        mock_broker.move_to_dlq.assert_awaited_once()
+        assert "No handler" in mock_broker.move_to_dlq.call_args[0][1]
 
-        @worker.task("priority_task")
-        async def priority_handler(task_obj: Task):
-            return {"processed": task_obj.id}
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_opens_after_threshold(self, worker, mock_broker, monkeypatch):
+        """Repeated failures open the per-task circuit breaker."""
+        monkeypatch.setattr("jobqueue.worker.Worker._calculate_backoff", lambda self, a: 0.0)
 
-        # Process tasks
-        processed = []
-        while True:
-            task = await mock_broker.fetch_task(worker.queues)
-            if task is None:
-                break
+        @worker.task("circuit_task")
+        async def circuit_handler(task_obj: Task):
+            raise Exception("Simulated failure")
+
+        # circuit_failure_threshold=3 -> after 3 failures the breaker opens.
+        for _ in range(3):
+            task = _make_task("circuit_task", task_id="task-126", max_retries=5)
             await worker._process_task(task)
-            processed.append(task.id)
 
-        # Verify high priority was processed first
-        assert processed[0] == "high-priority"
-        assert processed[1] == "low-priority"
+        breaker = worker._circuit_registry.get("circuit_task")
+        assert breaker is not None
+        assert breaker.is_open
 
     @pytest.mark.asyncio
-    async def test_graceful_shutdown(self, worker, mock_broker):
-        """Test graceful shutdown with signal handling."""
-        worker.running = True
-        shutdown_called = False
+    async def test_heartbeat_loop_calls_broker(self, worker, mock_broker):
+        """The heartbeat loop periodically calls broker.heartbeat."""
+        worker._running = True
+        worker.heartbeat_interval = 0.05
 
-        async def mock_shutdown():
-            nonlocal shutdown_called
-            shutdown_called = True
-            worker.running = False
+        loop_task = asyncio.create_task(worker._heartbeat_loop())
+        await asyncio.sleep(0.15)
+        worker._running = False
+        await asyncio.wait_for(loop_task, timeout=1.0)
 
-        worker.stop = mock_shutdown
+        assert mock_broker.heartbeat.await_count >= 1
+        # No task in flight -> current_task is None.
+        mock_broker.heartbeat.assert_awaited_with(worker.worker_id, None)
 
-        # Simulate SIGTERM
-        worker._handle_signal(signal.SIGTERM, None)
+    @pytest.mark.asyncio
+    async def test_worker_registers_on_start(self, worker, mock_broker):
+        """Starting the worker registers it with the broker."""
+        mock_broker.dequeue.return_value = None
 
-        await asyncio.sleep(0.1)
-        assert shutdown_called
+        start_task = asyncio.create_task(worker.start())
+        await asyncio.sleep(0.2)
+        await worker.stop()
+        start_task.cancel()
+        try:
+            await start_task
+        except asyncio.CancelledError:
+            pass
+
+        mock_broker.register_worker.assert_awaited_once()
+        worker_info = mock_broker.register_worker.call_args[0][0]
+        assert worker_info.id == worker.worker_id
+        assert worker_info.queues == ["test-queue"]
 
     @pytest.mark.asyncio
     async def test_task_result_serialization(self, worker, mock_broker):
-        """Test task result serialization and deserialization."""
-        task = Task(
-            id="task-130",
-            name="serialization_task",
-            queue="test-queue",
+        """The acknowledged result carries the handler's structured output."""
+        task = _make_task(
+            "serialization_task",
+            task_id="task-130",
             payload={"complex": {"nested": ["data", 123, True]}},
-            status=TaskStatus.PENDING,
-            created_at=datetime.now(timezone.utc),
-            priority=1,
         )
 
         @worker.task("serialization_task")
@@ -401,17 +250,35 @@ class TestWorker:
             return {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "input": task_obj.payload,
-                "output": {"result": [1, 2, 3], "success": True}
+                "output": {"result": [1, 2, 3], "success": True},
             }
 
         await worker._process_task(task)
 
-        # Verify complete_task was called with serializable result
-        mock_broker.complete_task.assert_called_once()
-        call_args = mock_broker.complete_task.call_args[0]
-        result = call_args[1]
+        mock_broker.acknowledge.assert_awaited_once()
+        result = mock_broker.acknowledge.call_args[0][1]
         assert isinstance(result, TaskResult)
         assert result.task_id == task.id
         assert "timestamp" in result.result
         assert "input" in result.result
         assert "output" in result.result
+
+    @pytest.mark.asyncio
+    async def test_concurrent_task_processing(self, worker, mock_broker):
+        """Multiple tasks can be processed concurrently via _process_task."""
+        tasks = [
+            _make_task("concurrent_task", task_id=f"task-{i}", payload={"index": i})
+            for i in range(5)
+        ]
+        processed = []
+
+        @worker.task("concurrent_task")
+        async def concurrent_handler(task_obj: Task):
+            processed.append(task_obj.id)
+            await asyncio.sleep(0.05)
+            return {"index": task_obj.payload["index"]}
+
+        await asyncio.gather(*[worker._process_task(t) for t in tasks])
+
+        assert set(processed) == {f"task-{i}" for i in range(5)}
+        assert mock_broker.acknowledge.await_count == 5
