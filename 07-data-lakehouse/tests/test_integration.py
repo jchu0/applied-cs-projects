@@ -22,17 +22,24 @@ from lakehouse.streaming import StreamProcessor
 
 
 @pytest.fixture(scope="module")
-def spark():
-    """Create SparkSession for integration testing."""
-    return (
-        SparkSession.builder.appName("integration_test")
-        .master("local[*]")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .getOrCreate()
-    )
+def spark(spark_available):
+    """Create SparkSession for integration testing.
+
+    Depends on the session-scoped ``spark_available`` guard so tests SKIP with a
+    clear reason when the Java gateway is broken, instead of erroring at setup.
+    """
+    try:
+        return (
+            SparkSession.builder.appName("integration_test")
+            .master("local[*]")
+            .config("spark.sql.adaptive.enabled", "true")
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+            .getOrCreate()
+        )
+    except BaseException as exc:  # noqa: BLE001
+        pytest.skip(f"Spark JVM unavailable: {type(exc).__name__}: {exc}")
 
 
 @pytest.fixture

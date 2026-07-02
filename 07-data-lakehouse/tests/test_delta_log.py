@@ -22,6 +22,13 @@ from lakehouse.delta_log import (
 )
 
 
+@pytest.fixture
+def temp_table_path():
+    """Create a temporary directory for a test table (module-wide)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir) / "test_table"
+
+
 class TestActions:
     """Test Delta Lake action classes."""
 
@@ -107,12 +114,6 @@ class TestActions:
 
 class TestDeltaLog:
     """Test DeltaLog transaction management."""
-
-    @pytest.fixture
-    def temp_table_path(self):
-        """Create a temporary directory for test table."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir) / "test_table"
 
     @pytest.fixture
     def delta_log(self, temp_table_path):

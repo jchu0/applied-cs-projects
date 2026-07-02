@@ -21,9 +21,16 @@ from lakehouse.optimizer import (
 
 
 @pytest.fixture
-def spark():
-    """Create SparkSession for testing."""
-    return SparkSession.builder.appName("test_optimizer").master("local[*]").getOrCreate()
+def spark(spark_available):
+    """Create SparkSession for testing.
+
+    Depends on the session-scoped ``spark_available`` guard so tests SKIP with a
+    clear reason when the Java gateway is broken, instead of erroring at setup.
+    """
+    try:
+        return SparkSession.builder.appName("test_optimizer").master("local[*]").getOrCreate()
+    except BaseException as exc:  # noqa: BLE001
+        pytest.skip(f"Spark JVM unavailable: {type(exc).__name__}: {exc}")
 
 
 class TestStorageOptimizer:

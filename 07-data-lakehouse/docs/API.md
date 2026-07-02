@@ -515,7 +515,7 @@ for anomaly in anomalies[:5]:
 
 ## Streaming API
 
-### Class: `StreamProcessor`
+### Class: `StreamingProcessor`
 
 Handle streaming data pipelines.
 
@@ -537,9 +537,9 @@ start_bronze_stream(
 
 **Example:**
 ```python
-from lakehouse.streaming import StreamProcessor
+from lakehouse.streaming import StreamingProcessor
 
-stream_processor = StreamProcessor(spark, config)
+stream_processor = StreamingProcessor(spark, config)
 
 bronze_stream = stream_processor.start_bronze_stream(
     source_path="/streaming/events",
