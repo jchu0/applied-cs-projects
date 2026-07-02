@@ -56,8 +56,17 @@ class NameNode:
         self._datanodes: Dict[NodeID, DataNodeInfo] = {}
 
         # Pending operations
-        self._pending_replications: List[Tuple[BlockID, List[NodeID]]] = []
+        # Each pending replication is (block_id, source_node_id, target_node_id):
+        # the target (which lacks the block) is told to pull it from the source.
+        self._pending_replications: List[Tuple[BlockID, NodeID, NodeID]] = []
         self._pending_deletions: Dict[NodeID, List[BlockID]] = defaultdict(list)
+
+        # In-flight replications, so we don't re-schedule the same target for a
+        # block before its BLOCK_RECEIVED lands. Maps block_id -> set of targets.
+        self._replications_in_flight: Dict[BlockID, Set[NodeID]] = defaultdict(set)
+
+        # Checkpointing (set by NameNodeServer / start_background_tasks)
+        self._checkpoint_path: Optional[str] = None
 
         # Safe mode
         self._safe_mode = True
@@ -431,18 +440,28 @@ class NameNode:
                     "block_ids": block_ids
                 })
 
-        # Pending replications
-        for block_id, targets in list(self._pending_replications):
-            if any(t in self._block_to_nodes.get(block_id, set()) for t in [node_id]):
-                # This node has the block, tell it to replicate
-                remaining_targets = [t for t in targets if t != node_id]
-                if remaining_targets:
-                    commands.append({
-                        "type": "replicate",
-                        "block_id": block_id,
-                        "targets": remaining_targets
-                    })
-                    self._pending_replications.remove((block_id, targets))
+        # Pending replications (pull model): if this node is the target for a
+        # scheduled replication, tell it to copy the block from the source.
+        for entry in list(self._pending_replications):
+            block_id, source_id, target_id = entry
+            if target_id != node_id:
+                continue
+            source = self._datanodes.get(source_id)
+            if source is None or not source.is_alive:
+                # Source vanished; drop this task, the monitor will reschedule.
+                self._pending_replications.remove(entry)
+                self._replications_in_flight[block_id].discard(target_id)
+                continue
+            commands.append({
+                "type": "replicate",
+                "block_id": block_id,
+                "source": {
+                    "node_id": source_id,
+                    "host": source.host,
+                    "port": source.port,
+                },
+            })
+            self._pending_replications.remove(entry)
 
         return HeartbeatResponse(commands=commands)
 
@@ -477,6 +496,10 @@ class NameNode:
             self._block_to_nodes[block_id].add(node_id)
             if node_id in self._datanodes:
                 self._datanodes[node_id].blocks.add(block_id)
+
+        # A replica landed here, so any in-flight re-replication to this node
+        # for this block is done.
+        self._replications_in_flight[block_id].discard(node_id)
 
         logger.info(f"Block {block_id} received at {node_id}, size: {size}")
 
@@ -808,33 +831,73 @@ class NameNode:
         del self._datanodes[node_id]
         logger.info(f"Removed DataNode: {node_id}")
 
-        # Schedule re-replication for under-replicated blocks
-        self._schedule_replication_for_lost_node(node_id)
+        # Schedule re-replication for any now under-replicated blocks.
+        self.scan_and_schedule_replication()
 
-    def _schedule_replication_for_lost_node(self, lost_node_id: NodeID) -> None:
-        """Schedule re-replication for blocks that were on the lost node."""
-        under_replicated = self._check_under_replicated_blocks()
+    def _replication_target_for_block(self, block_id: BlockID) -> int:
+        """Return the desired replication factor for a block."""
+        for file_info in self._files.values():
+            if block_id in file_info.blocks:
+                return file_info.replication
+        return self.default_replication
 
-        for block_id in under_replicated:
-            # Find file that owns this block to get target replication
-            target_replication = self.default_replication
-            for path, file_info in self._files.items():
-                if block_id in file_info.blocks:
-                    target_replication = file_info.replication
-                    break
+    def scan_and_schedule_replication(self) -> int:
+        """Scan for under-replicated blocks and schedule real re-replication.
 
-            current_replicas = len(self._block_to_nodes.get(block_id, set()))
-            if current_replicas < target_replication:
-                # Find nodes that don't have this block
-                nodes_with_block = self._block_to_nodes.get(block_id, set())
-                available_targets = [
-                    nid for nid, node in self._datanodes.items()
-                    if nid not in nodes_with_block and node.is_alive
-                ]
+        For each block below its replication factor, picks a live source
+        DataNode that already holds a healthy replica and a live target that
+        lacks it, then enqueues a pending replication delivered to the target
+        on its next heartbeat (pull model). Returns the number of new tasks
+        scheduled. Idempotent: never schedules the same (block, target) twice
+        while a copy is in flight or already queued.
+        """
+        scheduled = 0
 
-                if available_targets:
-                    self._pending_replications.append((block_id, available_targets[:1]))
-                    logger.info(f"Scheduled replication for block {block_id} to {available_targets[:1]}")
+        for block_id in self._check_under_replicated_blocks():
+            target_replication = self._replication_target_for_block(block_id)
+
+            # Live nodes that hold a healthy replica -> possible sources.
+            holders = {
+                nid for nid in self._block_to_nodes.get(block_id, set())
+                if nid in self._datanodes and self._datanodes[nid].is_alive
+            }
+            if not holders:
+                # No live source: the block is lost, nothing we can copy.
+                logger.warning(
+                    f"Block {block_id} has no live replica; cannot re-replicate"
+                )
+                continue
+
+            # Nodes already queued/in-flight as targets for this block.
+            queued_targets = {
+                t for (b, _s, t) in self._pending_replications if b == block_id
+            } | self._replications_in_flight.get(block_id, set())
+
+            # Effective replica count includes copies already on the way.
+            effective = len(holders) + len(queued_targets)
+            if effective >= target_replication:
+                continue
+
+            # Candidate targets: live, lacking the block, not already targeted.
+            candidates = [
+                nid for nid, node in self._datanodes.items()
+                if node.is_alive
+                and nid not in holders
+                and nid not in queued_targets
+            ]
+
+            source = sorted(holders)[0]
+            need = target_replication - effective
+            for target in sorted(candidates)[:need]:
+                self._pending_replications.append((block_id, source, target))
+                self._replications_in_flight[block_id].add(target)
+                scheduled += 1
+                logger.info(
+                    f"Scheduled re-replication of {block_id} from {source} "
+                    f"to {target}"
+                )
+
+        return scheduled
 
     # Checkpointing
 
@@ -947,34 +1010,146 @@ class NameNode:
                 last_heartbeat=time.time()
             )
 
-        # Load block-to-nodes mapping
-        self._block_to_nodes = {}
+        # Load block-to-nodes mapping (defaultdict so callers can index freely)
+        self._block_to_nodes = defaultdict(set)
         for bid, nodes in checkpoint.get("block_to_nodes", {}).items():
             self._block_to_nodes[bid] = set(nodes)
 
         logger.info(f"Loaded checkpoint from {path}")
 
+    # Durable-namespace helpers (checkpoint_interval made live)
+
+    def configure_checkpointing(self, checkpoint_path: str, load: bool = True) -> None:
+        """Point the NameNode at a checkpoint file and optionally load it.
+
+        Loading recovers the namespace (files, directories, blocks and block
+        locations) from a prior run so a restarted NameNode comes back with its
+        state. A full edit-log/WAL is intentionally out of scope: only the
+        periodic checkpoint is persisted, so writes since the last checkpoint
+        are not durable.
+        """
+        self._checkpoint_path = checkpoint_path
+        if load and os.path.exists(checkpoint_path):
+            try:
+                self.load_checkpoint(checkpoint_path)
+            except (OSError, ValueError, KeyError) as e:
+                logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
+
+    def _write_checkpoint_atomic(self, path: str) -> None:
+        """Save the checkpoint atomically (write temp then rename)."""
+        tmp_path = f"{path}.tmp"
+        self.save_checkpoint(tmp_path)
+        os.replace(tmp_path, path)
+
+    async def checkpoint_loop(self) -> None:
+        """Background task: persist the namespace every checkpoint_interval.
+
+        This is what makes ``checkpoint_interval`` live. Runs off the asyncio
+        event loop and writes atomically so a crash mid-write cannot corrupt an
+        existing checkpoint.
+        """
+        while getattr(self, "_bg_running", False):
+            await asyncio.sleep(self.checkpoint_interval)
+            if not getattr(self, "_bg_running", False):
+                break
+            if not self._checkpoint_path:
+                continue
+            try:
+                await asyncio.to_thread(
+                    self._write_checkpoint_atomic, self._checkpoint_path
+                )
+                logger.info(
+                    f"Periodic checkpoint written to {self._checkpoint_path}"
+                )
+            except (OSError, ValueError) as e:
+                logger.error(f"Periodic checkpoint failed: {e}")
+
+    async def replication_monitor_loop(self, interval: Optional[float] = None) -> None:
+        """Background task: periodically self-heal under-replicated blocks.
+
+        Drives ``scan_and_schedule_replication`` so that missed heartbeats /
+        dead DataNodes result in real byte-copying re-replication (the actual
+        copy is issued to the target DataNode on its heartbeat).
+        """
+        poll = interval if interval is not None else self.heartbeat_interval
+        while getattr(self, "_bg_running", False):
+            await asyncio.sleep(poll)
+            if not getattr(self, "_bg_running", False):
+                break
+            try:
+                self.check_and_remove_dead_nodes()
+                self.scan_and_schedule_replication()
+            except Exception:
+                # Never let the self-healing loop die on an unexpected error.
+                logger.exception("Replication monitor iteration failed")
+
+    def start_background_tasks(self) -> List[asyncio.Task]:
+        """Start the checkpoint and replication-monitor background tasks."""
+        self._bg_running = True
+        return [
+            asyncio.create_task(self.checkpoint_loop()),
+            asyncio.create_task(self.replication_monitor_loop()),
+        ]
+
+    def stop_background_tasks(self) -> None:
+        """Signal background tasks to stop at their next wakeup."""
+        self._bg_running = False
+
 
 class NameNodeServer:
     """Async server for NameNode."""
 
-    def __init__(self, namenode: NameNode, host: str = "0.0.0.0", port: int = 9000):
+    def __init__(
+        self,
+        namenode: NameNode,
+        host: str = "0.0.0.0",
+        port: int = 9000,
+        checkpoint_path: Optional[str] = None
+    ):
         self.namenode = namenode
         self.host = host
         self.port = port
+        self.checkpoint_path = checkpoint_path
         self._server = None
+        self._bg_tasks: List[asyncio.Task] = []
 
     async def start(self):
-        """Start the NameNode server."""
+        """Start the NameNode server and its background tasks."""
+        # Recover namespace from a prior checkpoint before serving.
+        if self.checkpoint_path:
+            self.namenode.configure_checkpointing(self.checkpoint_path, load=True)
+
         self._server = await asyncio.start_server(
             self._handle_client,
             self.host,
             self.port
         )
+
+        # Periodic checkpointing (makes checkpoint_interval live) and
+        # self-healing re-replication.
+        self._bg_tasks = self.namenode.start_background_tasks()
+
         logger.info(f"NameNode server started on {self.host}:{self.port}")
 
     async def stop(self):
-        """Stop the server."""
+        """Stop the server and background tasks; write a final checkpoint."""
+        self.namenode.stop_background_tasks()
+        for task in self._bg_tasks:
+            task.cancel()
+        for task in self._bg_tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._bg_tasks = []
+
+        # Best-effort final checkpoint so a clean shutdown is durable.
+        if self.checkpoint_path:
+            try:
+                self.namenode._write_checkpoint_atomic(self.checkpoint_path)
+            except (OSError, ValueError) as e:
+                logger.error(f"Final checkpoint failed: {e}")
+
         if self._server:
             self._server.close()
             await self._server.wait_closed()

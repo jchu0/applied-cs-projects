@@ -49,7 +49,7 @@ DataNodes provide actual storage:
 - **Block Storage**: Stores and retrieves data blocks on local filesystem
 - **Block Reporting**: Periodically sends list of blocks to NameNode
 - **Heartbeat**: Sends regular heartbeats to indicate aliveness
-- **Pipeline Replication**: Participates in write pipelines for replication
+- **Peer Re-replication**: On a NameNode `replicate` command, pulls a block's bytes from a source DataNode over `COPY_BLOCK` and stores it locally (self-healing). Client-side write pipelining is out of scope.
 
 **Key Features:**
 - Local filesystem-based storage
@@ -120,15 +120,15 @@ sequenceDiagram
 
 ### NameNode Persistence
 
-- **Checkpointing**: Manual JSON snapshots of namespace and block mappings via `save_checkpoint(path)` / `load_checkpoint(path)`
-- **No Edit Log**: There is no write-ahead log; metadata changes made after the last checkpoint are lost on restart
-- **Secondary NameNode**: (Future) Standby node for failover
+- **Periodic Checkpointing**: A background task persists the namespace and block map to a JSON checkpoint every `checkpoint_interval` (written atomically via temp-file + rename). The NameNode loads the checkpoint on startup, so a restarted NameNode recovers its files, blocks, and block-to-node locations. `save_checkpoint(path)` / `load_checkpoint(path)` are also callable manually.
+- **No Edit Log (out of scope)**: There is deliberately no write-ahead log; namespace changes made between checkpoints are lost on a NameNode crash. A full edit-log/WAL is out of scope for this project.
+- **NameNode HA / failover (out of scope)**: Single process, single point of failure. No standby NameNode.
 
 ### DataNode Failure Handling
 
-- **Heartbeat Monitoring**: Detect failed nodes via missing heartbeats
-- **Block Re-replication**: When a dead node is removed, the NameNode queues re-replication work for its under-replicated blocks and delivers `replicate` commands to surviving replica holders in heartbeat responses
-- **Rack Awareness**: (Future) Place replicas across different racks
+- **Heartbeat Monitoring**: Detect failed nodes via missing heartbeats (silence > 30 s → eviction).
+- **Self-Healing Block Re-replication**: When a block falls below its replication factor (a dead node was removed, or live replicas dropped), the NameNode's replication monitor picks a live *source* that holds the block and a live *target* that lacks it, then hands the target a `replicate` command carrying the source's address. The target pulls the block bytes from the source over the `COPY_BLOCK` DataNode operation and reports the new replica, so the replication factor is actually restored with byte-identical content.
+- **Rack Awareness**: Single placement hint only; deeper rack topology is out of scope.
 
 ### Data Integrity
 
@@ -148,10 +148,10 @@ sequenceDiagram
 
 ### Under-Replication Handling
 
-1. NameNode detects under-replicated blocks when a DataNode is declared dead and removed
-2. For each under-replicated block, it picks an available live DataNode that lacks the block
-3. The (block, target) pair is appended to a pending-replication queue
-4. A DataNode that holds the block receives a `replicate` command in its next heartbeat response
+1. A background replication monitor (and dead-node removal) detects under-replicated blocks — a DataNode was declared dead, or a block's live replica count is below the file's replication factor
+2. For each such block, the NameNode picks a live source that holds a healthy replica and a live target that lacks it
+3. The `(block, source, target)` triple is appended to a pending-replication queue; scheduling is idempotent (it counts in-flight copies, so a re-scan will not double-schedule)
+4. On its next heartbeat the *target* DataNode receives a `replicate` command carrying the source address, then pulls the block bytes from the source via `COPY_BLOCK` and reports `BLOCK_RECEIVED`, restoring the replication factor
 
 ## Network Protocol
 

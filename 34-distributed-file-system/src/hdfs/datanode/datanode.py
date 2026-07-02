@@ -427,13 +427,92 @@ class DataNode:
                 self.delete_block(block_id)
 
         elif cmd_type == "replicate":
+            # Pull-based re-replication: this DataNode lacks the block and is
+            # told to copy it from a source peer that holds a healthy replica.
             block_id = command.get("block_id")
-            targets = command.get("targets", [])
-            # Would copy block to targets
-            logger.info(f"Replicating {block_id} to {targets}")
+            source = command.get("source")
+            if not block_id or not source:
+                logger.warning(f"Ignoring malformed replicate command: {command}")
+                return
+            await self.copy_block_from_peer(
+                block_id, source["host"], source["port"]
+            )
 
         elif cmd_type == "re-register":
             await self.register_with_namenode()
+
+    async def copy_block_from_peer(
+        self,
+        block_id: BlockID,
+        source_host: str,
+        source_port: int,
+        timeout: float = 30.0
+    ) -> bool:
+        """Copy a block's bytes from a peer DataNode over the wire.
+
+        Opens a connection to the source DataNode, issues a COPY_BLOCK request,
+        receives the block bytes, writes them to local storage and reports the
+        received block to the NameNode. Used for self-healing re-replication.
+        """
+        if block_id in self._blocks:
+            # Already have it (a duplicate command); nothing to do.
+            return True
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(source_host, source_port),
+                timeout=timeout
+            )
+        except (OSError, asyncio.TimeoutError) as e:
+            logger.error(
+                f"Re-replication: cannot connect to source "
+                f"{source_host}:{source_port} for {block_id}: {e}"
+            )
+            return False
+
+        try:
+            message = Message(MessageType.COPY_BLOCK, {"block_id": block_id})
+            data = serialize_message(message)
+            writer.write(len(data).to_bytes(4, 'big'))
+            writer.write(data)
+            await asyncio.wait_for(writer.drain(), timeout=timeout)
+
+            length_data = await asyncio.wait_for(
+                reader.readexactly(4), timeout=timeout
+            )
+            length = int.from_bytes(length_data, 'big')
+            response_data = await asyncio.wait_for(
+                reader.readexactly(length), timeout=timeout
+            )
+            response = deserialize_message(response_data)
+
+            if response.msg_type != MessageType.SUCCESS:
+                logger.error(
+                    f"Re-replication: source refused {block_id}: "
+                    f"{response.payload.get('error')}"
+                )
+                return False
+
+            block_bytes = bytes.fromhex(response.payload["data"])
+            size = self.write_block(block_id, block_bytes)
+            logger.info(
+                f"Re-replicated block {block_id} ({size} bytes) from "
+                f"{source_host}:{source_port}"
+            )
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError,
+                OSError, ValueError, KeyError) as e:
+            logger.error(f"Re-replication of {block_id} failed: {e}")
+            return False
+        finally:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=timeout)
+            except (asyncio.TimeoutError, OSError):
+                pass
+
+        # Inform the NameNode the replica now exists here.
+        await self.report_block_received(block_id, size)
+        return True
 
     # Background tasks
 
@@ -546,6 +625,18 @@ class DataNodeServer:
                 return Message(MessageType.SUCCESS, {
                     "block_id": block_id,
                     "size": size
+                })
+
+            elif message.msg_type == MessageType.COPY_BLOCK:
+                # Peer DataNode requests the raw bytes of a block for
+                # re-replication (pull model). Serve it like a read.
+                block_id = message.payload["block_id"]
+                data = self.datanode.read_block(block_id)
+
+                return Message(MessageType.SUCCESS, {
+                    "block_id": block_id,
+                    "size": len(data),
+                    "data": data.hex()
                 })
 
             elif message.msg_type == MessageType.DELETE_BLOCK:

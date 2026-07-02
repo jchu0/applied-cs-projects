@@ -29,14 +29,18 @@ class TestNameNodeServer:
         self.namenode = namenode
         self.port = port
         self.server = None
+        self._bg_tasks = []
 
     async def start(self):
-        """Start the test server."""
+        """Start the test server and the NameNode background tasks."""
         self.server = await asyncio.start_server(
             self.handle_client, 'localhost', self.port
         )
         addrs = self.server.sockets[0].getsockname()
         self.port = addrs[1]
+        # Start periodic checkpoint + replication-monitor loops, matching the
+        # production NameNodeServer.
+        self._bg_tasks = self.namenode.start_background_tasks()
 
     async def handle_client(self, reader, writer):
         """Handle client connections with proper protocol handling."""
@@ -177,7 +181,18 @@ class TestNameNodeServer:
             return Message(MessageType.ERROR, {"error": str(e)})
 
     async def stop(self):
-        """Stop the test server."""
+        """Stop the test server and background tasks."""
+        self.namenode.stop_background_tasks()
+        for task in self._bg_tasks:
+            task.cancel()
+        for task in self._bg_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        self._bg_tasks = []
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -256,6 +271,19 @@ class TestDataNodeServer:
                 try:
                     data = self.datanode.retrieve_block(block_id)
                     return Message(MessageType.SUCCESS, {"data": data.hex()})
+                except Exception:
+                    return Message(MessageType.ERROR, {"error": f"Block not found: {block_id}"})
+
+            elif message.msg_type == MessageType.COPY_BLOCK:
+                # Peer re-replication pull: serve raw block bytes.
+                block_id = message.payload["block_id"]
+                try:
+                    data = self.datanode.retrieve_block(block_id)
+                    return Message(MessageType.SUCCESS, {
+                        "block_id": block_id,
+                        "size": len(data),
+                        "data": data.hex(),
+                    })
                 except Exception:
                     return Message(MessageType.ERROR, {"error": f"Block not found: {block_id}"})
 

@@ -395,3 +395,210 @@ class TestHDFSIntegration:
             # that may reference non-existent files (by design, to test chaos resilience)
             success_rate = sum(results) / len(results)
             assert success_rate > 0.4  # At least 40% success rate for chaos test
+
+
+class TestSelfHealingReplication:
+    """Proof that re-replication copies real bytes and restores durability."""
+
+    @pytest.mark.asyncio
+    async def test_dead_datanode_triggers_byte_copy_rereplication(self):
+        """A file is written R=3; one holder dies; the block is re-replicated
+        (real byte copy) to a fresh live node and the live replica count
+        returns to R with byte-identical content.
+        """
+        import hashlib
+        from hdfs.common.types import BlockReport
+
+        async with hdfs_cluster(num_datanodes=4, default_block_size=64 * 1024) as cluster:
+            client = cluster['client']
+            namenode = cluster['namenode']
+            datanodes = cluster['datanodes']
+            dn_servers = cluster['dn_servers']
+
+            # Write a single-block file with replication factor 3.
+            payload = generate_test_data(4096)
+            await client.create('/heal.txt', replication=3)
+            await client.write('/heal.txt', payload)
+
+            file_info = namenode.get_file_info('/heal.txt')
+            assert len(file_info.blocks) == 1
+            block_id = file_info.blocks[0]
+            expected_md5 = hashlib.md5(payload).hexdigest()
+
+            # Confirm the block starts at R=3 across live nodes.
+            holders = sorted(
+                nid for nid in namenode._block_to_nodes[block_id]
+                if namenode._datanodes[nid].is_alive
+            )
+            assert len(holders) == 3
+
+            # Identify the one live node WITHOUT the block (future target).
+            spare_id = next(
+                nid for nid in namenode._datanodes
+                if nid not in namenode._block_to_nodes[block_id]
+            )
+            spare_dn = next(dn for dn in datanodes if dn.node_id == spare_id)
+            assert block_id not in spare_dn.get_block_ids()
+
+            # Kill one holder: stop its server and mark it dead.
+            victim_id = holders[0]
+            victim_idx = next(
+                i for i, dn in enumerate(datanodes) if dn.node_id == victim_id
+            )
+            await dn_servers[victim_idx].stop()
+            namenode._datanodes[victim_id].last_heartbeat = time.time() - 120
+
+            # Drive the NameNode's self-healing cycle (short dead-node timeout).
+            namenode.check_and_remove_dead_nodes(timeout=1.0)
+            assert victim_id not in namenode._datanodes
+            namenode.scan_and_schedule_replication()
+            # Exactly one re-replication task should be queued for this block
+            # (idempotent even if the background monitor also fired).
+            block_tasks = [
+                e for e in namenode._pending_replications if e[0] == block_id
+            ]
+            assert len(block_tasks) == 1, "expected exactly one re-replication task"
+
+            # The target should be our spare node; deliver the command via its
+            # heartbeat, exactly as the DataNode heartbeat loop would.
+            response = namenode.heartbeat(
+                spare_id,
+                used=spare_dn.used_space,
+                remaining=spare_dn.remaining_space,
+            )
+            replicate_cmds = [c for c in response.commands if c.get("type") == "replicate"]
+            assert len(replicate_cmds) == 1
+            cmd = replicate_cmds[0]
+            assert cmd["block_id"] == block_id
+            assert cmd["source"]["node_id"] in holders[1:]
+
+            # Execute the command: real TCP byte copy from source peer, then
+            # BLOCK_RECEIVED back to the NameNode.
+            await spare_dn.execute_command(cmd)
+
+            # Bytes actually landed on the target and match the original.
+            assert block_id in spare_dn.get_block_ids()
+            copied = spare_dn.read_block(block_id)
+            assert copied == payload
+            assert hashlib.md5(copied).hexdigest() == expected_md5
+
+            # Live replica count is restored to R=3.
+            live_holders = [
+                nid for nid in namenode._block_to_nodes[block_id]
+                if nid in namenode._datanodes and namenode._datanodes[nid].is_alive
+            ]
+            assert len(live_holders) == 3
+            assert spare_id in live_holders
+
+            # And the file is still fully readable end-to-end.
+            assert await client.read('/heal.txt') == payload
+
+    @pytest.mark.asyncio
+    async def test_scan_is_idempotent_while_copy_in_flight(self):
+        """Re-scanning before BLOCK_RECEIVED must not double-schedule."""
+        async with hdfs_cluster(num_datanodes=4, default_block_size=64 * 1024) as cluster:
+            client = cluster['client']
+            namenode = cluster['namenode']
+
+            await client.create('/idem.txt', replication=3)
+            await client.write('/idem.txt', generate_test_data(2048))
+            block_id = namenode.get_file_info('/idem.txt').blocks[0]
+
+            victim = sorted(namenode._block_to_nodes[block_id])[0]
+            namenode._remove_datanode(victim)  # schedules one task
+
+            block_tasks = [e for e in namenode._pending_replications if e[0] == block_id]
+            assert len(block_tasks) == 1
+            # Scanning again while the copy is queued must add nothing.
+            assert namenode.scan_and_schedule_replication() == 0
+            block_tasks = [e for e in namenode._pending_replications if e[0] == block_id]
+            assert len(block_tasks) == 1
+
+
+class TestNamespaceDurability:
+    """Proof that checkpoint_interval is live and recovery works."""
+
+    @pytest.mark.asyncio
+    async def test_periodic_checkpoint_task_persists_namespace(self):
+        """The background checkpoint loop actually writes to disk on its
+        interval (checkpoint_interval is no longer dead)."""
+        with temp_directory() as ckpt_dir:
+            ckpt = os.path.join(ckpt_dir, 'fsimage.json')
+            # Fast interval so the periodic task fires quickly.
+            async with hdfs_cluster(
+                num_datanodes=3, checkpoint_interval=0.2
+            ) as cluster:
+                client = cluster['client']
+                namenode = cluster['namenode']
+                namenode.configure_checkpointing(ckpt, load=False)
+
+                await client.mkdir('/data')
+                await client.write('/data/a.txt', b'periodic-durability')
+
+                # No checkpoint yet.
+                assert not os.path.exists(ckpt)
+
+                # Wait for the periodic checkpoint loop to fire.
+                for _ in range(50):
+                    if os.path.exists(ckpt):
+                        break
+                    await asyncio.sleep(0.1)
+
+                assert os.path.exists(ckpt), "periodic checkpoint never ran"
+
+            # A fresh NameNode over the same checkpoint recovers the namespace.
+            from hdfs.namenode.namenode import NameNode
+            recovered = NameNode()
+            recovered.configure_checkpointing(ckpt, load=True)
+
+            info = recovered.get_file_info('/data/a.txt')
+            assert info is not None
+            assert info.path == '/data/a.txt'
+            assert info.size == len(b'periodic-durability')
+            assert '/data' in recovered._directories
+
+    @pytest.mark.asyncio
+    async def test_fresh_namenode_recovers_files_and_block_locations(self):
+        """After an explicit checkpoint, a brand-new NameNode over the same
+        checkpoint dir recovers files, blocks and their DataNode locations."""
+        with temp_directory() as ckpt_dir:
+            ckpt = os.path.join(ckpt_dir, 'fsimage.json')
+
+            saved_files = None
+            saved_block_map = None
+
+            async with hdfs_cluster(num_datanodes=3) as cluster:
+                client = cluster['client']
+                namenode = cluster['namenode']
+
+                await client.mkdir('/recover')
+                await client.write('/recover/f1.txt', generate_test_data(4096))
+                await client.write('/recover/f2.txt', generate_test_data(1024))
+
+                saved_files = set(namenode._files.keys())
+                saved_block_map = {
+                    bid: set(nodes)
+                    for bid, nodes in namenode._block_to_nodes.items()
+                }
+
+                namenode._write_checkpoint_atomic(ckpt)
+
+            # Restart: fresh NameNode, same checkpoint dir.
+            from hdfs.namenode.namenode import NameNode
+            restarted = NameNode()
+            restarted.configure_checkpointing(ckpt, load=True)
+
+            # Files recovered.
+            assert set(restarted._files.keys()) == saved_files
+            f1 = restarted.get_file_info('/recover/f1.txt')
+            assert f1.size == 4096
+
+            # Block locations recovered identically.
+            assert {
+                bid: set(nodes)
+                for bid, nodes in restarted._block_to_nodes.items()
+            } == saved_block_map
+
+            # Directory tree recovered.
+            assert '/recover' in restarted._directories
+            assert set(restarted.list_directory('/recover')) == {'f1.txt', 'f2.txt'}

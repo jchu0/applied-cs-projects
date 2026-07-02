@@ -8,9 +8,10 @@ An HDFS-style distributed file system built from scratch in Python with `asyncio
 - **Block-based storage** — files split into 128 MiB blocks; each `DataNode` stores blocks as plain files under `<data_dir>/blocks/` named by block ID (`datanode/datanode.py`).
 - **Configurable replication** — per-file replication factor (default 3) with rack-aware, load-balanced replica placement (`_select_datanodes_for_block`).
 - **Heartbeats and block reports** — DataNodes heartbeat every 3 s and send periodic block reports; the NameNode piggybacks delete/replicate/re-register commands on heartbeat replies.
-- **Dead-node detection** — any node silent for more than 30 s is evicted, its blocks dropped from the location map, and re-replication scheduled.
+- **Dead-node detection** — any node silent for more than 30 s is evicted and its blocks dropped from the location map.
+- **Self-healing re-replication** — a background monitor detects under-replicated blocks (dead node, or live replicas below the target factor), picks a live source holding the block and a live target lacking it, and drives a real byte-for-byte copy over the DataNode `COPY_BLOCK` protocol (pull model) until the replication factor is restored.
 - **Safe mode** — on startup the NameNode refuses block allocation until at least 99.9% of known blocks have a reporting replica.
-- **Checkpoint persistence** — `save_checkpoint` / `load_checkpoint` serialize the full namespace and block map to a single JSON file.
+- **Durable namespace checkpoints** — a background task persists the full namespace and block map to a JSON checkpoint every `checkpoint_interval` (written atomically), and the NameNode loads it on startup, so a restarted NameNode recovers its files and block locations. `save_checkpoint` / `load_checkpoint` remain available for manual use.
 - **Async client API** — `HDFSClient` exposes file, directory, bulk-I/O, and streaming operations over a length-prefixed JSON wire protocol.
 - **Streaming I/O** — `HDFSOutputStream` and `HDFSInputStream` write and read block-at-a-time without buffering whole files; `stream_read` yields chunks.
 - **Checksums** — each DataNode computes and caches an MD5 per block and can verify or scan for corruption.
@@ -121,8 +122,9 @@ async for chunk in client.stream_read("/big.bin", chunk_size=1 << 20):
 
 ## What's Real vs Simulated
 
-- **Real:** namespace operations, block allocation and placement, the rack-aware load-balanced selection algorithm, heartbeats, block reports, dead-node detection, safe mode, checkpoint save/load, the full client API, streaming I/O, and per-block MD5 checksums. All of this is exercised by the test suite, including 40 dedicated replication tests.
-- **Simulated / not wired:** the NameNode-issued `replicate` command is logged but does not copy bytes, so re-replication is *scheduled* but does not self-heal. Client writes fan out to each replica in a star, not the HDFS pipeline; `store_block_pipeline` only forwards to in-process objects. Block bodies travel as hex-encoded strings inside JSON (2x wire size). There is no edit log, no NameNode HA, and no auth/encryption. `ReplicationPolicy.ERASURE_CODING` is an enum value with no implementation, and `checkpoint_interval` is stored but never drives an automatic save. See [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the full list.
+- **Real:** namespace operations, block allocation and placement, the rack-aware load-balanced selection algorithm, heartbeats, block reports, dead-node detection, safe mode, **self-healing re-replication that copies real block bytes between DataNodes**, **periodic namespace checkpointing driven by `checkpoint_interval` with load-on-startup recovery**, the full client API, streaming I/O, and per-block MD5 checksums. All of this is exercised by the test suite, including the replication and durability integration tests that stand up real in-process servers on ephemeral ports.
+- **Simulated / not wired:** client writes fan out to each replica in a star, not the HDFS write pipeline; `store_block_pipeline` only forwards to in-process objects. Block bodies travel as hex-encoded strings inside JSON (~2x wire size). `ReplicationPolicy.ERASURE_CODING` is an enum value with no implementation.
+- **Honestly out of scope:** NameNode HA / failover, an edit log / write-ahead log (so namespace changes since the last checkpoint are lost on a NameNode crash), auth/TLS on the wire, and rack-awareness beyond the existing single-hint placement. These are stated deliberately rather than faked. See [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the full list.
 
 ## Testing
 
