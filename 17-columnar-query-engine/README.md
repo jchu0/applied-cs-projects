@@ -160,7 +160,6 @@ pre-existing aggregate type-mismatch behavior. No external services are required
   tests/            # vector, storage, expression, executor, integration tests
   benches/          # criterion harness (placeholder)
   docs/
-    ARCHITECTURE.md # deeper architecture notes
     BLUEPRINT.md    # full design document
 ```
 

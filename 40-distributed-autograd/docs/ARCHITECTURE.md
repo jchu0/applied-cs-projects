@@ -12,12 +12,11 @@ The Distributed Autograd System provides automatic differentiation across distri
 - **DistributedContext**: Global distributed state
 - **WorkerInfo**: Worker identification and topology
 - **ProcessGroup**: Communication group abstraction
-- **GradientAccumulator**: Gradient aggregation logic
+- **GradBucket**: Gradient bucketing/aggregation logic
 
 #### Tensor Abstractions
-- **DistributedTensor**: Tensor with distributed semantics
-- **ShardedTensor**: Tensor sharded across workers
-- **ReplicatedTensor**: Replicated tensor with synchronization
+- **DistributedTensor**: Tensor with distributed semantics (sharded or replicated placement)
+- **DeviceMesh**: Multi-dimensional worker topology for placement
 
 ### 2. Distributed Layer (`distautograd/distributed/`)
 
@@ -29,14 +28,14 @@ The Distributed Autograd System provides automatic differentiation across distri
 #### Model Parallel
 - **FullyShardedDataParallel (FSDP)**: Memory-efficient model parallelism
 - **ShardingStrategy**: Model sharding strategies
-- **CPUOffload**: CPU memory offloading
+- **CPUOffloadPolicy**: CPU memory offloading
 
 ### 3. RPC Layer (`distautograd/rpc/`)
 
 #### Remote Execution
 - **RPCAutograd**: Automatic differentiation over RPC
-- **RemoteFunction**: Remote function execution
-- **SendRecvFunction**: Point-to-point communication
+- **RRef / RemoteModule**: References to remote values and modules
+- **rpc_sync / rpc_async / remote**: Remote function invocation primitives
 
 ### 4. Pipeline Layer (`distautograd/pipeline/`)
 

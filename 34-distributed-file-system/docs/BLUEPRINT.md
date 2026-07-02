@@ -824,12 +824,10 @@ shortcuts that would need work to claim full HDFS parity:
 34-distributed-file-system/
 ├── README.md
 ├── pyproject.toml
-├── docker-compose.yml                 (NameNode + 3 DataNode services)
 ├── docs/
 │   ├── BLUEPRINT.md                   ← this document
 │   ├── API.md
 │   ├── ARCHITECTURE.md
-│   ├── DEPLOYMENT.md
 │   └── CONTRIBUTING.md
 ├── src/
 │   └── hdfs/

@@ -33,10 +33,10 @@ Execute a workflow asynchronously.
 
 ```python
 async def run_flow(
-    flow_definition: FlowDefinition,
-    inputs: Dict[str, Any] = None,
-    enable_retry: bool = True,
-    checkpoint: bool = False
+    flow_definition: FlowDefinition = None,
+    inputs: dict[str, Any] = None,
+    enable_retry: bool = False,
+    run_id: str = None
 ) -> FlowRun
 ```
 
@@ -242,131 +242,183 @@ retry_config = RetryConfig(
     jitter=True
 )
 
-node = NodeDefinition(
+# Node.retry_config takes a plain dict
+node = Node(
     id="flaky_node",
     name="FlakyOperation",
     type=NodeType.PROCESS,
-    retry_config=retry_config.to_dict()
+    retry_config={
+        "max_retries": 5,
+        "base_delay": 1.0,
+        "max_delay": 60.0,
+        "exponential_factor": 2.0,
+        "jitter": True,
+    },
 )
 ```
 
 ## REST API
 
+The REST API is implemented in `aiworkflow.api.app` (FastAPI, installed via the
+`api` extra). Build an app with `create_app()` or serve the module-level app:
+
+```bash
+uvicorn aiworkflow.api:app
+```
+
 ### Endpoints
 
-#### POST /workflows/execute
-Execute a workflow.
+#### GET /health
+Health check.
+
+**Response:**
+```json
+{
+    "status": "ok",
+    "flows": 2
+}
+```
+
+#### POST /flows
+Register a flow definition. Returns `201` on success, `400` on parse/validation
+errors.
 
 **Request:**
 ```json
 {
-    "workflow": {
+    "spec": {
         "name": "api-workflow",
         "version": "1.0.0",
         "nodes": [...],
         "edges": [...]
     },
-    "inputs": {
-        "data": "input_value"
-    },
-    "options": {
-        "enable_retry": true,
-        "checkpoint": false
-    }
+    "description": "Optional description"
 }
 ```
 
 **Response:**
 ```json
 {
-    "run_id": "run-456",
-    "status": "RUNNING",
-    "started_at": "2024-01-01T00:00:00Z",
-    "message": "Workflow execution started"
+    "name": "api-workflow",
+    "version": "1.0.0",
+    "nodes": 3
 }
 ```
 
-#### GET /workflows/runs/{run_id}
-Get workflow run status.
+#### GET /flows
+List registered flows.
+
+**Response:**
+```json
+[
+    {"name": "api-workflow", "version": "1.0.0", "nodes": 3}
+]
+```
+
+#### GET /flows/{name}
+Get a registered flow's definition (`404` if unknown).
+
+**Response:**
+```json
+{
+    "name": "api-workflow",
+    "version": "1.0.0",
+    "description": "...",
+    "nodes": [
+        {"id": "loader", "type": "data", "dependencies": []}
+    ],
+    "outputs": {}
+}
+```
+
+#### GET /flows/{name}/diagram
+Render a flow as a Mermaid or Graphviz DOT diagram.
+
+**Query Parameters:**
+- `fmt`: `mermaid` (default) or `dot`
+
+**Response:**
+```json
+{
+    "format": "mermaid",
+    "diagram": "graph TD; ..."
+}
+```
+
+#### POST /flows/{name}/run
+Execute a registered flow and return the completed run (`404` if unknown).
+
+**Request:**
+```json
+{
+    "inputs": {"data": "input_value"}
+}
+```
 
 **Response:**
 ```json
 {
     "run_id": "run-456",
     "flow_id": "api-workflow",
-    "status": "COMPLETED",
-    "started_at": "2024-01-01T00:00:00Z",
-    "completed_at": "2024-01-01T00:05:00Z",
-    "outputs": {
-        "result": "processed_data"
+    "flow_version": "1.0.0",
+    "status": "completed",
+    "inputs": {"data": "input_value"},
+    "outputs": {"result": "processed_data"},
+    "error": null,
+    "start_time": "2024-01-01T00:00:00",
+    "end_time": "2024-01-01T00:05:00",
+    "node_executions": [
+        {"node_id": "loader", "status": "completed", "latency_ms": 12.5, "attempts": 1, "error": null}
+    ]
+}
+```
+
+#### POST /runs
+Execute an inline (unregistered) flow spec. Returns the same run shape as
+`POST /flows/{name}/run`; `400` on parse errors.
+
+**Request:**
+```json
+{
+    "spec": {
+        "name": "inline-flow",
+        "nodes": [...],
+        "edges": [...]
     },
-    "metrics": {
-        "execution_time": 300,
-        "nodes_executed": 5
-    }
+    "inputs": {"data": "input_value"}
 }
 ```
 
-#### POST /workflows/runs/{run_id}/pause
-Pause a running workflow.
-
-**Response:**
-```json
-{
-    "success": true,
-    "message": "Workflow paused",
-    "run_id": "run-456"
-}
-```
-
-#### POST /workflows/runs/{run_id}/resume
-Resume a paused workflow.
-
-**Response:**
-```json
-{
-    "success": true,
-    "message": "Workflow resumed",
-    "run_id": "run-456"
-}
-```
-
-#### DELETE /workflows/runs/{run_id}
-Cancel a running workflow.
-
-**Response:**
-```json
-{
-    "success": true,
-    "message": "Workflow cancelled",
-    "run_id": "run-456"
-}
-```
-
-#### GET /workflows/runs
-List all workflow runs.
+#### GET /runs
+List run history.
 
 **Query Parameters:**
-- `status`: Filter by status (RUNNING, COMPLETED, FAILED)
-- `limit`: Maximum number of results
-- `offset`: Pagination offset
+- `flow_name`: Filter by flow name
+- `limit`: Maximum number of results (default 100)
 
-**Response:**
+#### GET /runs/{run_id}
+Get a single run by id (`404` if unknown).
+
+#### GET /reviews
+List pending human-in-the-loop reviews.
+
+#### GET /reviews/{review_id}
+Get a single review (`404` if unknown).
+
+#### POST /reviews/{review_id}/approve
+Approve a pending review (`404` unknown, `409` already resolved).
+
+**Request:**
 ```json
 {
-    "runs": [
-        {
-            "run_id": "run-456",
-            "flow_id": "workflow-1",
-            "status": "COMPLETED",
-            "started_at": "2024-01-01T00:00:00Z"
-        }
-    ],
-    "total": 100,
-    "limit": 10,
-    "offset": 0
+    "reviewer": "alice",
+    "comment": "Looks good",
+    "data": {}
 }
 ```
+
+#### POST /reviews/{review_id}/reject
+Reject a pending review. Same request/response shape as approve.
 
 ## Workflow DSL Reference
 
@@ -592,56 +644,27 @@ Conditional branching based on inputs.
 
 ### Engine Configuration
 
-```python
-config = {
-    "engine": {
-        "max_parallel": 10,
-        "enable_versioning": true,
-        "enable_optimization": true,
-        "checkpoint_interval": 5,  # Checkpoint every 5 nodes
-        "checkpoint_dir": "/tmp/checkpoints"
-    },
-    "retry": {
-        "default_strategy": "exponential_backoff",
-        "max_global_retries": 10,
-        "circuit_breaker": {
-            "enabled": true,
-            "failure_threshold": 5,
-            "recovery_timeout": 60
-        }
-    },
-    "monitoring": {
-        "enabled": true,
-        "metrics_port": 9090,
-        "log_level": "INFO"
-    },
-    "storage": {
-        "backend": "s3|local|gcs",
-        "bucket": "workflow-storage",
-        "prefix": "workflows/"
-    }
-}
+Configuration is passed directly to the `WorkflowEngine` constructor:
 
-engine = WorkflowEngine.from_config(config)
+```python
+from aiworkflow import WorkflowEngine
+
+engine = WorkflowEngine(
+    max_parallel=10,            # Maximum parallel node executions
+    enable_versioning=True,     # Save flow versions on each run
+    enable_optimization=True,   # Optimize flows before execution
+    enable_checkpointing=False, # Save checkpoints after runs
+    checkpoint_dir=None,        # Directory for checkpoint files
+    review_store=None,          # Shared HumanReviewStore for HITL nodes
+)
 ```
 
-### Environment Variables
+A convenience factory is also exported:
 
-```bash
-# Engine configuration
-AIWORKFLOW_MAX_PARALLEL=20
-AIWORKFLOW_ENABLE_VERSIONING=true
-AIWORKFLOW_LOG_LEVEL=DEBUG
+```python
+from aiworkflow import create_engine
 
-# Storage configuration
-AIWORKFLOW_STORAGE_BACKEND=s3
-AIWORKFLOW_STORAGE_BUCKET=my-bucket
-AWS_ACCESS_KEY_ID=xxx
-AWS_SECRET_ACCESS_KEY=xxx
-
-# Monitoring
-AIWORKFLOW_METRICS_ENABLED=true
-AIWORKFLOW_METRICS_PORT=9090
+engine = create_engine(max_parallel=10, enable_versioning=True, enable_optimization=True)
 ```
 
 ## Error Handling
@@ -649,58 +672,43 @@ AIWORKFLOW_METRICS_PORT=9090
 ### Error Types
 
 ```python
-from aiworkflow.exceptions import (
-    WorkflowError,          # Base exception
-    ParseError,             # Parsing failures
-    ValidationError,        # Validation failures
-    ExecutionError,         # Runtime execution errors
-    RetryableError,        # Temporary failures
-    NonRetryableError,     # Permanent failures
-    CircularDependencyError # Circular dependencies detected
+from aiworkflow.compiler.parser import ParseError       # Parsing failures
+from aiworkflow.compiler import CircularDependencyError # Circular dependencies detected
+from aiworkflow.retry.strategies import (
+    RetryableError,     # Temporary failures (carries retry_after, attempt)
+    NonRetryableError,  # Permanent failures (carries reason)
 )
 ```
+
+Flow validation failures are raised as plain `ValueError` from
+`WorkflowEngine.run_flow()`; node-level failures during execution do not raise —
+they are recorded on the returned `FlowRun` (`status`, `error`, and per-node
+`node_executions`).
 
 ### Error Handling Examples
 
 ```python
-from aiworkflow import WorkflowEngine
-from aiworkflow.exceptions import WorkflowError, RetryableError
+from aiworkflow import WorkflowEngine, RunStatus
+from aiworkflow.compiler.parser import ParseError
+from aiworkflow.compiler import CircularDependencyError
 
 engine = WorkflowEngine()
 
 try:
+    flow_definition = engine.parser.parse_yaml(yaml_content)
     result = await engine.run_flow(flow_definition)
 except ParseError as e:
     print(f"Failed to parse workflow: {e}")
-except ValidationError as e:
+except CircularDependencyError as e:
+    print(f"Circular dependency detected: {e}")
+except ValueError as e:
     print(f"Workflow validation failed: {e}")
-    for error in e.errors:
-        print(f"  - {error}")
-except RetryableError as e:
-    print(f"Temporary failure (will retry): {e}")
-    print(f"Retry after: {e.retry_after} seconds")
-except NonRetryableError as e:
-    print(f"Permanent failure: {e}")
-    print(f"Reason: {e.reason}")
-except WorkflowError as e:
-    print(f"Workflow error: {e}")
-except Exception as e:
-    print(f"Unexpected error: {e}")
-```
 
-### Custom Error Handlers
-
-```python
-class CustomErrorHandler:
-    async def handle_node_error(self, node_id: str, error: Exception):
-        if isinstance(error, RetryableError):
-            # Log and allow retry
-            logger.warning(f"Node {node_id} failed (retryable): {error}")
-        else:
-            # Alert team for non-retryable errors
-            await send_alert(f"Node {node_id} failed: {error}")
-
-engine.set_error_handler(CustomErrorHandler())
+if result.status == RunStatus.FAILED:
+    print(f"Run failed: {result.error}")
+    for exec in result.node_executions:
+        if exec.error:
+            print(f"  - {exec.node_id}: {exec.error}")
 ```
 
 ### Retry Configuration with Error Types

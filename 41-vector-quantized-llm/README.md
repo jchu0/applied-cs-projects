@@ -149,7 +149,10 @@ with GGUFReader("model.gguf") as reader:
   tests.
 - **Simulated / illustrative:** The inference model (`LegacyQuantizedModel`) uses
   randomly-initialized weights and a character-level tokenizer in the calibration helpers —
-  there are no pretrained weights, so generated tokens are not meaningful text. `QuantizedLinear`
+  there are no pretrained weights, so generated tokens are not meaningful text.
+  `InferenceEngine.stream_generate` requires a real `generate_token` implementation and
+  raises a `RuntimeError` if none is provided — it never falls back to fabricated tokens.
+  `QuantizedLinear`
   dequantizes weights before a plain NumPy matmul rather than using a fused low-bit kernel.
   There is no GPU, distributed, or CUDA path; everything is single-process CPU NumPy.
 
@@ -179,8 +182,6 @@ No external services or hardware are required.
   docs/
     BLUEPRINT.md             # full architecture and design
     ARCHITECTURE.md          # deeper architecture notes
-    API.md                   # API reference
-    DEPLOYMENT.md            # deployment notes
 ```
 
 ## License

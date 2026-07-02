@@ -16,24 +16,16 @@ Main matrix data structure for dense matrices.
 
 ```rust
 pub struct Matrix {
-    data: Vec<f32>,
-    rows: usize,
-    cols: usize,
+    pub data: Vec<f32>, // row-major
+    pub rows: usize,
+    pub cols: usize,
 }
 ```
 
+The `data`, `rows`, and `cols` fields are public; there is no `Matrix::new`
+constructor — use one of the factory methods below.
+
 ### Creation Methods
-
-#### `Matrix::new(rows: usize, cols: usize) -> Self`
-Creates a new matrix with uninitialized values.
-
-```rust
-use gpu_gemm_optimization::matrix::Matrix;
-
-let mat = Matrix::new(100, 200);
-assert_eq!(mat.rows(), 100);
-assert_eq!(mat.cols(), 200);
-```
 
 #### `Matrix::zeros(rows: usize, cols: usize) -> Self`
 Creates a matrix filled with zeros.
@@ -67,23 +59,14 @@ let mat = Matrix::random(50, 50);
 // Random values between -1.0 and 1.0
 ```
 
-#### `Matrix::from_vec(rows: usize, cols: usize, data: Vec<f32>) -> Self`
-Creates a matrix from existing data.
-
-```rust
-let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-let mat = Matrix::from_vec(2, 3, data);
-// [[1.0, 2.0, 3.0],
-//  [4.0, 5.0, 6.0]]
-```
-
 ### Access Methods
 
 #### `get(&self, row: usize, col: usize) -> f32`
 Returns the value at the specified position.
 
 ```rust
-let mat = Matrix::from_vec(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+let mut mat = Matrix::zeros(2, 2);
+mat.set(0, 1, 2.0);
 assert_eq!(mat.get(0, 1), 2.0);
 ```
 
@@ -102,39 +85,19 @@ assert_eq!(mat.get(1, 1), 5.0);
 Returns the transpose of the matrix.
 
 ```rust
-let mat = Matrix::from_vec(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+let mat = Matrix::random(2, 3);
 let transposed = mat.transpose();
-assert_eq!(transposed.rows(), 3);
-assert_eq!(transposed.cols(), 2);
+assert_eq!(transposed.rows, 3);
+assert_eq!(transposed.cols, 2);
 ```
 
-#### `add(&self, other: &Matrix) -> Result<Matrix, MatrixError>`
-Element-wise addition.
+#### `row_ptr(&self, row: usize) -> &[f32]` / `row_ptr_mut(&mut self, row: usize) -> &mut [f32]`
+Borrow a single row as a slice.
 
 ```rust
-let a = Matrix::ones(3, 3);
-let b = Matrix::ones(3, 3);
-let c = a.add(&b)?;
-// All elements are 2.0
-```
-
-#### `multiply_scalar(&self, scalar: f32) -> Matrix`
-Scalar multiplication.
-
-```rust
-let mat = Matrix::ones(2, 2);
-let scaled = mat.multiply_scalar(3.0);
-// All elements are 3.0
-```
-
-#### `submatrix(&self, row_start: usize, col_start: usize, rows: usize, cols: usize) -> Result<Matrix, MatrixError>`
-Extracts a submatrix.
-
-```rust
-let mat = Matrix::random(10, 10);
-let sub = mat.submatrix(2, 3, 4, 5)?;
-assert_eq!(sub.rows(), 4);
-assert_eq!(sub.cols(), 5);
+let mat = Matrix::ones(4, 8);
+let row = mat.row_ptr(2);
+assert_eq!(row.len(), 8);
 ```
 
 ### Utility Methods
@@ -143,19 +106,22 @@ assert_eq!(sub.cols(), 5);
 Computes the Frobenius norm.
 
 ```rust
-let mat = Matrix::from_vec(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
+let mat = Matrix::ones(2, 2);
 let norm = mat.frobenius_norm();
-// sqrt(1 + 4 + 9 + 16) = sqrt(30)
+// sqrt(4) = 2.0
 ```
 
-#### `approx_equal(&self, other: &Matrix, tolerance: f32) -> bool`
-Checks if two matrices are approximately equal.
+#### `approx_eq(&self, other: &Matrix, tolerance: f32) -> bool`
+Checks if two matrices are approximately equal (relative tolerance).
 
 ```rust
-let a = Matrix::from_vec(1, 2, vec![1.0, 2.0]);
-let b = Matrix::from_vec(1, 2, vec![1.0001, 2.0001]);
-assert!(a.approx_equal(&b, 1e-3));
+let a = Matrix::ones(1, 2);
+let b = Matrix::ones(1, 2);
+assert!(a.approx_eq(&b, 1e-3));
 ```
+
+#### `max_diff(&self, other: &Matrix) -> f32` / `max_relative_error(&self, other: &Matrix) -> f32`
+Maximum absolute / relative element-wise difference between two matrices.
 
 ## GEMM Module
 

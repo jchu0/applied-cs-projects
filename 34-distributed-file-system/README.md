@@ -81,8 +81,6 @@ async def main():
 asyncio.run(main())
 ```
 
-`docker-compose.yml` defines a NameNode plus three DataNode services for a multi-node layout.
-
 ## Usage
 
 ```python
@@ -142,7 +140,6 @@ Tests run entirely in-process (no live NameNode/DataNode processes needed). Cove
 34-distributed-file-system/
   README.md                  # this file
   pyproject.toml             # package metadata and tooling config
-  docker-compose.yml         # NameNode plus three DataNode services
   src/hdfs/
     common/                  # types.py (core types), protocol.py (wire protocol)
     namenode/                # NameNode plus NameNodeServer
@@ -153,13 +150,12 @@ Tests run entirely in-process (no live NameNode/DataNode processes needed). Cove
     BLUEPRINT.md             # full architecture and design
     ARCHITECTURE.md          # deeper architecture notes
     API.md                   # full API reference
-    DEPLOYMENT.md            # cluster deployment runbook
     CONTRIBUTING.md          # contribution guide
 ```
 
 ## Configuration
 
-The NameNode, DataNode, and client take constructor keyword arguments rather than config files: replication factor, block size, heartbeat interval, capacity, cache TTL, and checksum verification. See [docs/API.md](docs/API.md) and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full set.
+The NameNode, DataNode, and client take constructor keyword arguments rather than config files: replication factor, block size, heartbeat interval, capacity, cache TTL, and checksum verification. See [docs/API.md](docs/API.md) for the full set.
 
 ## License
 

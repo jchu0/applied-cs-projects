@@ -36,19 +36,7 @@ The Dynamic Graph Execution Runtime is a Python-native system for capturing, opt
 - Tracks assumptions about inputs
 - Validates guard conditions
 
-### 3. IR Layer (`dynamicgraph/ir/`)
-
-#### Graph Builder
-- Constructs IR from traced operations
-- Manages symbolic value tracking
-- Handles control flow
-
-#### FX Graph
-- TorchFX-compatible graph representation
-- Node transformations
-- Pattern matching
-
-### 4. Optimizer Layer (`dynamicgraph/optimizer/`)
+### 3. Optimizer Layer (`dynamicgraph/optimizer/`)
 
 #### Graph Optimizer
 - Orchestrates optimization passes
@@ -61,7 +49,7 @@ The Dynamic Graph Execution Runtime is a Python-native system for capturing, opt
 - **DeadCodeElimination**: Remove unreachable code
 - **CommonSubexpressionElimination**: Eliminate redundant computations
 
-### 5. Code Generation Layer (`dynamicgraph/codegen/`)
+### 4. Code Generation Layer (`dynamicgraph/codegen/`)
 
 #### Backend Registry
 - Manages available backends
@@ -79,7 +67,7 @@ The Dynamic Graph Execution Runtime is a Python-native system for capturing, opt
 graph TD
     A[Python Code] --> B[Bytecode Tracer]
     B --> C[Symbolic Execution]
-    C --> D[IR Graph Builder]
+    C --> D[Captured Graph]
     D --> E[Graph Optimizer]
     E --> F[Backend Lowering]
     F --> G[Code Cache]
@@ -97,17 +85,17 @@ graph TD
    - User decorates function with `@compile`
    - Or uses explicit compilation API
 
-2. **Bytecode Interception**
-   - Monkey-patch function's code object
-   - Install custom eval frame hook
+2. **Bytecode Tracing**
+   - Disassemble the function's bytecode with `dis`
+   - Symbolically interpret it in `BytecodeTracer` (no eval-frame hooks or code-object patching)
 
 3. **Symbolic Tracing**
    - Execute with symbolic tensors
    - Record operations in graph
    - Handle graph breaks
 
-4. **IR Construction**
-   - Build intermediate representation
+4. **Graph Construction**
+   - The captured `Graph` serves as the intermediate representation
    - Preserve semantic information
    - Add metadata
 
@@ -150,37 +138,33 @@ graph TD
 
 ### Thread Safety
 - **Global State**: Thread-local contexts
-- **Compilation**: Lock-free cache with atomic updates
+- **Compilation**: Context registry guarded by a lock
 - **Execution**: Independent per-thread execution
 
 ## Extension Points
 
-### Custom Operations
-```python
-@register_op("custom_op")
-def custom_operation(graph, node, inputs):
-    # Custom lowering logic
-    pass
-```
-
 ### Backend Integration
 ```python
 class CustomBackend(Backend):
-    def compile(self, graph):
-        # Backend-specific compilation
-        pass
+    def name(self) -> str:
+        return "custom"
 
-    def execute(self, compiled, inputs):
-        # Backend-specific execution
-        pass
+    def is_available(self) -> bool:
+        return True
+
+    def compile(self, graph) -> CompiledFunction:
+        # Backend-specific compilation
+        ...
+
+BackendRegistry.register(CustomBackend())
 ```
 
 ### Optimization Passes
 ```python
 class CustomPass(OptimizationPass):
-    def apply(self, graph):
+    def run(self, graph) -> PassResult:
         # Graph transformation logic
-        pass
+        ...
 ```
 
 ## Performance Considerations

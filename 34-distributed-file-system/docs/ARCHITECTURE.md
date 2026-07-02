@@ -118,16 +118,16 @@ sequenceDiagram
 
 ## Fault Tolerance
 
-### NameNode High Availability
+### NameNode Persistence
 
-- **Checkpointing**: Periodic snapshots of namespace and block mappings
-- **Edit Log**: Write-ahead log for all metadata changes
+- **Checkpointing**: Manual JSON snapshots of namespace and block mappings via `save_checkpoint(path)` / `load_checkpoint(path)`
+- **No Edit Log**: There is no write-ahead log; metadata changes made after the last checkpoint are lost on restart
 - **Secondary NameNode**: (Future) Standby node for failover
 
 ### DataNode Failure Handling
 
 - **Heartbeat Monitoring**: Detect failed nodes via missing heartbeats
-- **Block Re-replication**: Automatically create new replicas when nodes fail
+- **Block Re-replication**: When a dead node is removed, the NameNode queues re-replication work for its under-replicated blocks and delivers `replicate` commands to surviving replica holders in heartbeat responses
 - **Rack Awareness**: (Future) Place replicas across different racks
 
 ### Data Integrity
@@ -148,13 +148,10 @@ sequenceDiagram
 
 ### Under-Replication Handling
 
-1. NameNode continuously monitors replication levels
-2. Detects under-replicated blocks during block reports
-3. Schedules re-replication on available DataNodes
-4. Prioritizes based on:
-   - Current replication level
-   - Block age
-   - File priority
+1. NameNode detects under-replicated blocks when a DataNode is declared dead and removed
+2. For each under-replicated block, it picks an available live DataNode that lacks the block
+3. The (block, target) pair is appended to a pending-replication queue
+4. A DataNode that holds the block receives a `replicate` command in its next heartbeat response
 
 ## Network Protocol
 
@@ -303,7 +300,7 @@ flowchart TD
 **NameNode:**
 - CPU: 4+ cores
 - RAM: 8GB minimum (1GB per million files)
-- Disk: SSD preferred for edit logs
+- Disk: SSD preferred for checkpoint files
 - Network: 1Gbps minimum
 
 **DataNode:**

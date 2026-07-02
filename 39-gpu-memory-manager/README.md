@@ -160,7 +160,6 @@ access. No external services or GPU are required.
   tests/                          # pytest suite (230 tests)
   docs/
     BLUEPRINT.md                  # full architecture and design
-    ARCHITECTURE.md               # deeper architecture notes
 ```
 
 ## License
