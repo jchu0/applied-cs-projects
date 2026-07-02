@@ -23,6 +23,7 @@ from dynamicgraph.codegen.compiler import (
     DtypeGuard,
     compile,
     trace,
+    explain,
 )
 
 
@@ -377,6 +378,91 @@ class TestCompileFunction(unittest.TestCase):
             return x
 
         self.assertTrue(hasattr(my_fn, '_compiled'))
+
+
+class TestTraceAndExplain(unittest.TestCase):
+    """Tests for the trace/explain entry points, including unwrapping."""
+
+    def test_trace_plain_function(self):
+        """Tracing a plain function captures its real body."""
+        def f(x, y):
+            return x * y + x
+
+        x = np.ones((4, 4), dtype=np.float32)
+        y = np.full((4, 4), 2.0, dtype=np.float32)
+        graph = trace(f, x, y)
+
+        # Two inputs, mul, add, output = 5 nodes; not a degenerate stub.
+        self.assertEqual(len(graph.nodes), 5)
+        op_types = {n.op_type for n in graph.nodes.values()}
+        self.assertIn(OpType.MUL, op_types)
+        self.assertIn(OpType.ADD, op_types)
+
+    def test_trace_unwraps_compiled_function(self):
+        """Tracing a @compile-decorated function traces the original body.
+
+        Without unwrapping, trace() would capture the compiler's *args/**kwargs
+        wrapper and yield a degenerate input-only graph.
+        """
+        @compile(optimization_level=2)
+        def f(x, y):
+            return x * y + x
+
+        x = np.ones((4, 4), dtype=np.float32)
+        y = np.full((4, 4), 2.0, dtype=np.float32)
+
+        decorated_graph = trace(f, x, y)
+        plain_graph = trace(f._original, x, y)
+
+        # Decorated trace matches the undecorated body, not a 2-node stub.
+        self.assertEqual(len(decorated_graph.nodes), len(plain_graph.nodes))
+        self.assertEqual(len(decorated_graph.nodes), 5)
+
+    def test_explain_unwraps_compiled_function(self):
+        """explain() also unwraps and reports a non-degenerate graph."""
+        @compile(optimization_level=2)
+        def f(x, y):
+            return x * y + x
+
+        x = np.ones((4, 4), dtype=np.float32)
+        y = np.full((4, 4), 2.0, dtype=np.float32)
+        report = explain(f, x, y)
+
+        self.assertIn("Function: f", report)
+        self.assertIn("Nodes: 5", report)
+
+
+class TestEndToEndCompile(unittest.TestCase):
+    """End-to-end tests of the compile decorator's execution correctness."""
+
+    def test_compiled_function_matches_eager(self):
+        """A compiled function returns the same result as plain Python."""
+        compiler = DynamicCompiler(optimization_level=2, fallback_to_eager=False)
+
+        @compiler
+        def f(x, y):
+            return (x - y) / x
+
+        x = np.array([10.0, 20.0, 5.0])
+        y = np.array([3.0, 4.0, 1.0])
+        result = f(x, y)
+        np.testing.assert_allclose(result, (x - y) / x)
+
+        # It actually compiled (a cache entry exists), not just eager fallback.
+        self.assertEqual(compiler.get_stats()["cache"]["total_entries"], 1)
+
+    def test_compiled_pointwise_chain_matches_eager(self):
+        """A fusable pointwise chain compiles and stays numerically correct."""
+        compiler = DynamicCompiler(optimization_level=2, fallback_to_eager=False)
+
+        @compiler
+        def f(a, b, c):
+            return (a + b) * c
+
+        a = np.array([1.0, -5.0, 2.0])
+        b = np.array([2.0, 1.0, 3.0])
+        c = np.array([1.0, 1.0, -1.0])
+        np.testing.assert_allclose(f(a, b, c), (a + b) * c)
 
 
 if __name__ == "__main__":

@@ -86,22 +86,24 @@ class EagerBackend(Backend):
         # Create execution function
         op_map = self._op_map
 
+        # Bind positional arguments in the graph's declared input order, not the
+        # topological order (which is not guaranteed to preserve argument order,
+        # e.g. after fusion reshuffles the node table).
+        input_order = list(graph.input_nodes)
+
         def execute(*args, **kwargs):
             # Build value storage
             values: Dict[str, Any] = {}
 
             # Map inputs
-            input_idx = 0
-            for node_id in exec_order:
+            for input_idx, node_id in enumerate(input_order):
                 node = graph.nodes[node_id]
-                if node.op_type == OpType.INPUT:
-                    if input_idx < len(args):
-                        values[node_id] = args[input_idx]
-                    elif node.name and node.name in kwargs:
-                        values[node_id] = kwargs[node.name]
-                    else:
-                        raise ValueError(f"Missing input for {node.name or node_id}")
-                    input_idx += 1
+                if input_idx < len(args):
+                    values[node_id] = args[input_idx]
+                elif node.name and node.name in kwargs:
+                    values[node_id] = kwargs[node.name]
+                else:
+                    raise ValueError(f"Missing input for {node.name or node_id}")
 
             # Execute in topological order
             for node_id in exec_order:
@@ -298,9 +300,14 @@ class EagerBackend(Backend):
         x = inputs[0]
         eps = attrs.get("eps", 1e-5)
 
-        # Get parameters
-        gamma = attrs.get("weight") or attrs.get("gamma")
-        beta = attrs.get("bias") or attrs.get("beta")
+        # Get parameters. Use explicit None checks: these may be NumPy arrays,
+        # whose truth value is ambiguous under ``or``.
+        gamma = attrs.get("weight")
+        if gamma is None:
+            gamma = attrs.get("gamma")
+        beta = attrs.get("bias")
+        if beta is None:
+            beta = attrs.get("beta")
         running_mean = attrs.get("running_mean")
         running_var = attrs.get("running_var")
 
@@ -324,11 +331,27 @@ class EagerBackend(Backend):
 
         return x_norm
 
-    def _custom_op(self, inputs: List[Any], attrs: Dict[str, Any]) -> np.ndarray:
-        """Handle custom/fused operations."""
-        op_name = attrs.get("name", "")
+    # Numpy implementations of each pointwise op in a fused chain.
+    _POINTWISE_FN = {
+        "add": lambda x, y: np.add(x, y),
+        "sub": lambda x, y: np.subtract(x, y),
+        "mul": lambda x, y: np.multiply(x, y),
+        "div": lambda x, y: np.divide(x, y),
+        "relu": lambda x, y=None: np.maximum(x, 0),
+        "sigmoid": lambda x, y=None: 1 / (1 + np.exp(-x)),
+    }
+    _POINTWISE_BINARY = frozenset({"add", "sub", "mul", "div"})
 
-        if op_name == "fused_conv_bn_relu":
+    def _custom_op(self, inputs: List[Any], attrs: Dict[str, Any]) -> np.ndarray:
+        """Handle custom/fused operations.
+
+        Fused nodes are identified by their ``fused_from`` attribute (set by the
+        fusion passes) rather than by the node's display name, which is not
+        threaded through to this handler.
+        """
+        fused_from = attrs.get("fused_from", [])
+
+        if list(fused_from) == ["conv2d", "batchnorm", "relu"]:
             # Execute fused conv + batchnorm + relu
             x = self._conv2d(inputs, attrs)
             x = self._batchnorm([x], {
@@ -340,8 +363,36 @@ class EagerBackend(Backend):
             })
             return np.maximum(x, 0)  # ReLU
 
+        op_chain = attrs.get("op_chain")
+        if op_chain:
+            return self._eval_pointwise_chain(op_chain, list(inputs))
+
         # Unknown custom op - just return first input
         return inputs[0] if inputs else None
+
+    def _eval_pointwise_chain(self, op_chain: List[str], inputs: List[Any]) -> Any:
+        """Evaluate a fused chain of pointwise ops over a flattened input list.
+
+        Binary ops consume two operands (the running accumulator, then the next
+        input); unary ops consume only the accumulator. Inputs are consumed in
+        the same order the fusion pass flattened them, which matches the chain's
+        producer-before-consumer ordering.
+        """
+        if not inputs:
+            return None
+        acc = inputs[0]
+        idx = 1
+        for op in op_chain:
+            fn = self._POINTWISE_FN.get(op)
+            if fn is None:
+                raise RuntimeError(f"Unknown pointwise op in fused chain: {op}")
+            if op in self._POINTWISE_BINARY:
+                operand = inputs[idx] if idx < len(inputs) else None
+                idx += 1
+                acc = fn(acc, operand)
+            else:
+                acc = fn(acc)
+        return acc
 
 
 class TorchBackend(Backend):

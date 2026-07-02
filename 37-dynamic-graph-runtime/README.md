@@ -49,10 +49,19 @@ flowchart TD
 
 ### Installation
 
-There is no packaging file; the package lives under `src/`. Add it to the path:
+The package lives under `src/` and ships a `pyproject.toml`, so it installs like
+any other Python package:
 
 ```bash
 cd 37-dynamic-graph-runtime
+pip install -e .            # runtime (NumPy only)
+pip install -e ".[torch]"   # also enable the optional PyTorch backend
+pip install -e ".[dev]"     # test/lint tooling (pytest, black, ruff, mypy)
+```
+
+Or, without installing, just add the source directory to the path:
+
+```bash
 export PYTHONPATH="$PWD/src:$PYTHONPATH"
 ```
 
@@ -82,14 +91,17 @@ y = np.full((4, 4), 2.0, dtype=np.float32)
 print(f(x, y))   # traced, optimized, executed; falls back to eager on a graph break
 ```
 
-Trace and inspect a graph without executing it:
+Trace and inspect a graph without executing it. `trace` (and `explain`) accept
+either a plain function or a `@compile`-decorated one — a decorated function is
+automatically unwrapped to its original body, so you capture the real tensor
+graph rather than the compiler's `*args, **kwargs` wrapper:
 
 ```python
 from dynamicgraph import trace, explain
 
-g = trace(f, x, y)
-print(g)                  # Graph(name=f, nodes=..., edges=...)
-print(explain(f, x, y))   # node counts and per-pass change summary
+g = trace(f, x, y)        # unwraps f to its body: 2 inputs, mul, add, output
+print(g)                  # multi-line summary: name, node/edge counts, first nodes
+print(explain(f, x, y))   # original vs. optimized node counts + per-pass changes
 ```
 
 Build a graph by hand and run optimization passes:

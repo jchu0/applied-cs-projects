@@ -259,6 +259,12 @@ class Graph:
                 subg.add_edge(edge.source, edge.target,
                             edge.index, dict(edge.attributes))
 
+        # Preserve the declared input/output ordering. ``add_node`` appends to
+        # these lists in the (unordered) node-id iteration order, so restore the
+        # original relative order for the nodes that survived into the subgraph.
+        subg.input_nodes = [n for n in self.input_nodes if n in node_ids]
+        subg.output_nodes = [n for n in self.output_nodes if n in node_ids]
+
         return subg
 
     def clone(self) -> 'Graph':

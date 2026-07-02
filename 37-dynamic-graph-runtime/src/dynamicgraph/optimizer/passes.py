@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
-from ..core.graph import Graph, Node, OpType, NodeMetadata
+from ..core.graph import Graph, Node, Edge, OpType, NodeMetadata
 
 
 @dataclass
@@ -469,19 +469,21 @@ class OperatorFusion(OptimizationPass):
                 if len(users) != 1:
                     continue
 
-                # Get the bias (the other input to add)
+                # Get the bias (the other input to add) and the matmul operands
+                # in operand (edge-index) order before we mutate the graph.
                 bias_id = node.inputs[1 - i]
+                matmul_operands = self._ordered_operands(graph, input_id)
 
                 # Create fused linear node
                 node.op_type = OpType.LINEAR
                 node.attributes["has_bias"] = True
                 node.attributes["fused_from"] = ["matmul", "add"]
 
-                # Update inputs: matmul inputs + bias
-                node.inputs = input_node.inputs + [bias_id]
-
-                # Remove the matmul node
+                # Update inputs: matmul inputs + bias, keeping edges/adjacency
+                # consistent. Remove the matmul first (drops its edges).
+                new_inputs = list(matmul_operands) + [bias_id]
                 graph.remove_node(input_id)
+                self._rewire_inputs(graph, node, new_inputs)
                 fused += 1
                 break
 
@@ -536,22 +538,141 @@ class OperatorFusion(OptimizationPass):
                 f"bn_{k}": v for k, v in bn_node.attributes.items()
             })
 
-            # Update inputs to conv inputs
-            node.inputs = conv_node.inputs
+            # Update inputs to the conv operands (edge-index order), keeping the
+            # graph's edges/adjacency consistent.
+            conv_operands = self._ordered_operands(graph, conv_id)
 
-            # Remove intermediate nodes
+            # Remove intermediate nodes, then rewire the fused node's inputs.
             graph.remove_node(bn_id)
             graph.remove_node(conv_id)
+            self._rewire_inputs(graph, node, conv_operands)
             fused += 1
 
         return fused
 
+    # Pointwise (elementwise) ops that are safe to fuse into a single chain.
+    _POINTWISE_OPS = frozenset({
+        OpType.ADD, OpType.SUB, OpType.MUL, OpType.DIV,
+        OpType.RELU, OpType.SIGMOID,
+    })
+
     def _fuse_pointwise_chain(self, graph: Graph) -> int:
-        """Fuse chains of pointwise operations."""
-        # For now, this is a placeholder
-        # A full implementation would identify chains like:
-        # x -> add -> mul -> relu -> ... and create a single fused kernel
+        """Fuse a producer→consumer pair of pointwise ops into one node.
+
+        Identifies a pointwise producer whose *only* user is another pointwise
+        op, and collapses the pair into a single ``CUSTOM`` ``fused_pointwise``
+        node that records the chain of ops in execution order. Running this to
+        the fixed point in :meth:`run` grows the chain one op at a time, so a
+        sequence ``add → mul → relu`` collapses into one fused node.
+
+        The fused node keeps the consumer's remaining inputs after the
+        producer's inputs, so the recorded ``op_chain`` and the flattened input
+        list stay consistent for left-to-right evaluation. Fusion requires the
+        producer to feed the consumer's *first* input slot and to have exactly
+        one user, which keeps the producer-before-consumer evaluation order
+        semantically exact (the backend evaluates the chain left-to-right over
+        the flattened inputs).
+        """
+        # Fuse at most one pair per scan, then let run()'s loop re-scan. This
+        # keeps the graph consistent between fusions and avoids reasoning about
+        # a mutated node table mid-iteration.
+        for node_id in list(graph.nodes.keys()):
+            if node_id not in graph.nodes:
+                continue
+            node = graph.nodes[node_id]
+            if node.op_type not in self._POINTWISE_OPS:
+                continue
+
+            # Operand order is taken from edge indices, not the raw inputs list,
+            # which other passes mutate without preserving order.
+            consumer_operands = self._ordered_operands(graph, node_id)
+            if not consumer_operands:
+                continue
+
+            # The producer must feed the consumer's first operand slot so that
+            # left-to-right chain evaluation stays exact.
+            producer_id = consumer_operands[0]
+            if producer_id not in graph.nodes:
+                continue
+            producer = graph.nodes[producer_id]
+            if producer.op_type not in self._POINTWISE_OPS:
+                continue
+            # Producer must be used only by this consumer.
+            users = {e.target for e in graph.edges if e.source == producer_id}
+            if users != {node_id}:
+                continue
+
+            producer_operands = self._ordered_operands(graph, producer_id)
+
+            # Build the fused op chain: producer's chain first, then consumer op.
+            producer_chain = producer.attributes.get(
+                "op_chain", [producer.op_type.name.lower()]
+            )
+            consumer_chain = node.attributes.get(
+                "op_chain", [node.op_type.name.lower()]
+            )
+            op_chain = list(producer_chain) + list(consumer_chain)
+
+            # Flatten operands: producer's operands replace slot 0, then the
+            # consumer's remaining operands follow.
+            new_inputs = list(producer_operands) + list(consumer_operands[1:])
+
+            # Skip when the flattened chain would consume the same source in more
+            # than one slot (e.g. ``(x - y) / x``). The graph's adjacency model
+            # de-duplicates a node's successors, so a fused node with a repeated
+            # input cannot be scheduled consistently; leaving the pair unfused
+            # keeps the graph valid and still executes correctly.
+            if len(set(new_inputs)) != len(new_inputs):
+                continue
+
+            node.op_type = OpType.CUSTOM
+            node.name = "fused_pointwise"
+            node.attributes["op_chain"] = op_chain
+            node.attributes["fused_from"] = list(op_chain)
+
+            # Remove the producer (drops its edges) then rewire the fused node's
+            # inputs so the graph's edge list and adjacency stay consistent.
+            graph.remove_node(producer_id)
+            self._rewire_inputs(graph, node, new_inputs)
+            return 1
+
         return 0
+
+    @staticmethod
+    def _ordered_operands(graph: Graph, node_id: str) -> List[str]:
+        """Return a node's input sources in operand (edge-index) order.
+
+        The graph tolerates the same source feeding several operand slots, so
+        this reads the inbound edges and orders them by ``index`` rather than
+        trusting the (mutation-prone) ``node.inputs`` list order.
+        """
+        inbound = [e for e in graph.edges if e.target == node_id]
+        inbound.sort(key=lambda e: e.index)
+        return [e.source for e in inbound]
+
+    @staticmethod
+    def _rewire_inputs(graph: Graph, node: Node, new_inputs: List[str]) -> None:
+        """Replace ``node``'s inputs, keeping edges and adjacency consistent.
+
+        Directly assigning ``node.inputs`` would leave the graph's ``edges``
+        list and the source nodes' ``outputs`` adjacency stale, which breaks the
+        topological sort. This drops the node's existing inbound edges and adds
+        fresh ones for ``new_inputs`` (only for sources still in the graph).
+        """
+        node_id = node.id
+        # Drop existing inbound edges and adjacency for this node.
+        graph.edges = [e for e in graph.edges if e.target != node_id]
+        for src in list(node.inputs):
+            if src in graph.nodes:
+                graph.nodes[src].remove_output(node_id)
+
+        # Set inputs directly (may contain the same source more than once, e.g.
+        # a fused ``x + x``) and add a matching edge + outputs entry per source.
+        node.inputs = [src for src in new_inputs if src in graph.nodes]
+        for index, src in enumerate(node.inputs):
+            graph.edges.append(Edge(source=src, target=node_id, index=index))
+            graph.nodes[src].add_output(node_id)
+        graph._topological_order = None
 
 
 class LayoutOptimization(OptimizationPass):

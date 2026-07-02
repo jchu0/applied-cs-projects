@@ -433,7 +433,15 @@ nodes_modified, message)` is the uniform return type. The passes:
   `_fuse_matmul_bias` rewrites `matmul → add` into a single `LINEAR` (only when the matmul
   has exactly one user), `_fuse_conv_bn_relu` collapses `conv2d → batchnorm → relu` into a
   `CUSTOM` `fused_conv_bn_relu` node (folding the bn/conv attributes in, again gated on
-  single users), and `_fuse_pointwise_chain` is a stub returning 0.
+  single users), and `_fuse_pointwise_chain` greedily collapses a single-user producer→
+  consumer pair of elementwise ops (`add`/`sub`/`mul`/`div`/`relu`/`sigmoid`) into a
+  `CUSTOM` `fused_pointwise` node that records the ops as an `op_chain`; run to the fixed
+  point this grows a chain one op at a time. It fuses only when the producer feeds the
+  consumer's first operand and the flattened operand list has no repeated source, which
+  keeps the fused kernel's left-to-right evaluation exact and the graph acyclic; the eager
+  backend executes the chain via `_eval_pointwise_chain`. All three patterns rewrite the
+  graph through a shared `_rewire_inputs` helper so edges and node adjacency stay
+  consistent (and the result validates and schedules) after a fusion.
 - **`LayoutOptimization`** — annotates `CONV2D` nodes with a `memory_format` and `MATMUL`
   nodes with `ensure_contiguous`, modeling the layout-assignment stage of a real compiler.
 

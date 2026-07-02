@@ -17,6 +17,7 @@ from dynamicgraph.optimizer.passes import (
     OperatorFusion,
     ShapeInference,
 )
+from dynamicgraph.codegen.backend import EagerBackend
 
 
 class TestConstantFolding(unittest.TestCase):
@@ -256,6 +257,154 @@ class TestAlgebraicSimplification(unittest.TestCase):
         self.assertEqual(graph.nodes[mul.id].attributes["value"], 0.0)
 
 
+class TestOperatorFusion(unittest.TestCase):
+    """Tests for the operator fusion pass.
+
+    Each pattern must leave the graph valid (acyclic, consistent adjacency) and
+    numerically equivalent to the unfused graph.
+    """
+
+    def _pointwise_chain_graph(self):
+        """Build relu((a + b) * c) as an add -> mul -> relu chain."""
+        g = Graph(name="pw")
+        a = g.add_node(Node(op_type=OpType.INPUT, name="a"))
+        b = g.add_node(Node(op_type=OpType.INPUT, name="b"))
+        c = g.add_node(Node(op_type=OpType.INPUT, name="c"))
+        add = g.add_node(Node(op_type=OpType.ADD, name="add"))
+        mul = g.add_node(Node(op_type=OpType.MUL, name="mul"))
+        relu = g.add_node(Node(op_type=OpType.RELU, name="relu"))
+        out = g.add_node(Node(op_type=OpType.OUTPUT, name="out"))
+        g.add_edge(a, add, 0)
+        g.add_edge(b, add, 1)
+        g.add_edge(add, mul, 0)
+        g.add_edge(c, mul, 1)
+        g.add_edge(mul, relu, 0)
+        g.add_edge(relu, out)
+        return g
+
+    def test_pointwise_chain_fuses(self):
+        """A pointwise pair is fused into a fused_pointwise CUSTOM node."""
+        g = self._pointwise_chain_graph()
+        result = OperatorFusion().run(g)
+
+        self.assertTrue(result.changed)
+        custom = [n for n in g.nodes.values() if n.op_type == OpType.CUSTOM]
+        self.assertEqual(len(custom), 1)
+        self.assertEqual(custom[0].name, "fused_pointwise")
+        self.assertEqual(custom[0].attributes["op_chain"], ["add", "mul"])
+
+    def test_pointwise_chain_graph_stays_valid(self):
+        """Fusion must not introduce cycles or dangling adjacency."""
+        g = self._pointwise_chain_graph()
+        OperatorFusion().run(g)
+        self.assertFalse(g.has_cycle())
+        self.assertEqual(g.validate(), [])
+
+    def test_pointwise_chain_execution_matches(self):
+        """The fused graph computes the same result as the unfused one."""
+        backend = EagerBackend()
+        a = np.array([1.0, -5.0, 2.0])
+        b = np.array([2.0, 1.0, 3.0])
+        c = np.array([1.0, 1.0, -1.0])
+
+        reference = backend.compile(self._pointwise_chain_graph())(a, b, c)
+
+        g = self._pointwise_chain_graph()
+        OperatorFusion().run(g)
+        fused_result = backend.compile(g)(a, b, c)
+
+        np.testing.assert_allclose(fused_result, reference)
+        np.testing.assert_allclose(fused_result, np.maximum((a + b) * c, 0))
+
+    def test_pointwise_skips_repeated_operand(self):
+        """A chain that would reuse the same source is left unfused (still valid)."""
+        # (x - y) / x reuses x, which cannot be represented as a single fused node.
+        g = Graph(name="shared")
+        x = g.add_node(Node(op_type=OpType.INPUT, name="x"))
+        y = g.add_node(Node(op_type=OpType.INPUT, name="y"))
+        sub = g.add_node(Node(op_type=OpType.SUB, name="sub"))
+        div = g.add_node(Node(op_type=OpType.DIV, name="div"))
+        out = g.add_node(Node(op_type=OpType.OUTPUT, name="out"))
+        g.add_edge(x, sub, 0)
+        g.add_edge(y, sub, 1)
+        g.add_edge(sub, div, 0)
+        g.add_edge(x, div, 1)
+        g.add_edge(div, out)
+
+        OperatorFusion().run(g)
+
+        # No fused_pointwise node, graph still valid and executes correctly.
+        self.assertFalse(any(n.name == "fused_pointwise" for n in g.nodes.values()))
+        self.assertFalse(g.has_cycle())
+        self.assertEqual(g.validate(), [])
+        xv, yv = np.array([10.0, 20.0]), np.array([3.0, 4.0])
+        np.testing.assert_allclose(EagerBackend().compile(g)(xv, yv), (xv - yv) / xv)
+
+    def test_matmul_bias_fuses_to_linear(self):
+        """matmul + add fuses into a single LINEAR node and stays valid."""
+        g = Graph(name="mm")
+        x = g.add_node(Node(op_type=OpType.INPUT, name="x"))
+        w = g.add_node(Node(op_type=OpType.INPUT, name="w"))
+        bias = g.add_node(Node(op_type=OpType.INPUT, name="bias"))
+        mm = g.add_node(Node(op_type=OpType.MATMUL, name="mm"))
+        add = g.add_node(Node(op_type=OpType.ADD, name="add"))
+        out = g.add_node(Node(op_type=OpType.OUTPUT, name="out"))
+        g.add_edge(x, mm, 0)
+        g.add_edge(w, mm, 1)
+        g.add_edge(mm, add, 0)
+        g.add_edge(bias, add, 1)
+        g.add_edge(add, out)
+
+        OperatorFusion().run(g)
+
+        linear = [n for n in g.nodes.values() if n.op_type == OpType.LINEAR]
+        self.assertEqual(len(linear), 1)
+        self.assertFalse(g.has_cycle())
+        self.assertEqual(g.validate(), [])
+
+        # LINEAR computes x @ w.T + bias.
+        xv = np.random.rand(2, 3)
+        wv = np.random.rand(4, 3)
+        bv = np.random.rand(4)
+        result = EagerBackend().compile(g)(xv, wv, bv)
+        np.testing.assert_allclose(result, xv @ wv.T + bv)
+
+    def test_conv_bn_relu_fuses(self):
+        """conv2d + batchnorm + relu fuses to one CUSTOM node, valid + equivalent."""
+        def build():
+            g = Graph(name="cbr")
+            inp = g.add_node(Node(op_type=OpType.INPUT, name="inp"))
+            conv = g.add_node(Node(
+                op_type=OpType.CONV2D, name="conv",
+                attributes={"weight": np.random.RandomState(0).rand(2, 1, 2, 2)},
+            ))
+            bn = g.add_node(Node(
+                op_type=OpType.BATCHNORM, name="bn",
+                attributes={"weight": np.ones(2), "bias": np.zeros(2)},
+            ))
+            relu = g.add_node(Node(op_type=OpType.RELU, name="relu"))
+            out = g.add_node(Node(op_type=OpType.OUTPUT, name="out"))
+            g.add_edge(inp, conv, 0)
+            g.add_edge(conv, bn, 0)
+            g.add_edge(bn, relu, 0)
+            g.add_edge(relu, out)
+            return g
+
+        backend = EagerBackend()
+        x = np.random.RandomState(1).rand(4, 1, 4, 4)
+        reference = backend.compile(build())(x)
+
+        g = build()
+        OperatorFusion().run(g)
+        custom = [n for n in g.nodes.values() if n.op_type == OpType.CUSTOM]
+        self.assertEqual(len(custom), 1)
+        self.assertEqual(custom[0].attributes["fused_from"],
+                         ["conv2d", "batchnorm", "relu"])
+        self.assertFalse(g.has_cycle())
+        self.assertEqual(g.validate(), [])
+        np.testing.assert_allclose(backend.compile(g)(x), reference)
+
+
 class TestShapeInference(unittest.TestCase):
     """Tests for shape inference pass."""
 
@@ -354,6 +503,46 @@ class TestGraphOptimizer(unittest.TestCase):
         optimized, stats = optimizer.optimize(graph)
 
         self.assertGreater(stats.total_passes, 0)
+
+    def test_level2_preserves_execution_semantics(self):
+        """A level-2 optimize (with fusion) must not change numeric results.
+
+        This guards the input-ordering invariant: clone() preserves the declared
+        input order and the eager backend binds positional args by that order,
+        not by topological order.
+        """
+        backend = EagerBackend()
+
+        def build():
+            g = Graph(name="e2e")
+            a = g.add_node(Node(op_type=OpType.INPUT, name="a"))
+            b = g.add_node(Node(op_type=OpType.INPUT, name="b"))
+            c = g.add_node(Node(op_type=OpType.INPUT, name="c"))
+            add = g.add_node(Node(op_type=OpType.ADD, name="add"))
+            mul = g.add_node(Node(op_type=OpType.MUL, name="mul"))
+            relu = g.add_node(Node(op_type=OpType.RELU, name="relu"))
+            out = g.add_node(Node(op_type=OpType.OUTPUT, name="out"))
+            g.add_edge(a, add, 0)
+            g.add_edge(b, add, 1)
+            g.add_edge(add, mul, 0)
+            g.add_edge(c, mul, 1)
+            g.add_edge(mul, relu, 0)
+            g.add_edge(relu, out)
+            return g
+
+        # Distinct magnitudes so any operand mix-up changes the result.
+        a = np.array([100.0])
+        b = np.array([10.0])
+        c = np.array([1.0])
+        reference = np.maximum((a + b) * c, 0)
+
+        # Run repeatedly: node-table iteration order varies with node ids.
+        for _ in range(25):
+            optimized, _ = GraphOptimizer(optimization_level=2).optimize(build())
+            self.assertFalse(optimized.has_cycle())
+            self.assertEqual(optimized.validate(), [])
+            result = backend.compile(optimized)(a, b, c)
+            np.testing.assert_allclose(result, reference)
 
     def test_optimizer_convergence(self):
         """Test that optimizer converges."""

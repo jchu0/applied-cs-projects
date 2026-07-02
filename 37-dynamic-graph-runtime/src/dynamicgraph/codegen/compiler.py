@@ -386,11 +386,24 @@ def optimize(func: Callable) -> Callable:
     return compile(func)
 
 
+def _unwrap(func: Callable) -> Callable:
+    """Return the user function to trace.
+
+    A function decorated with :func:`compile` / ``DynamicCompiler`` is a thin
+    ``*args, **kwargs`` wrapper; tracing *it* would just capture the wrapper's
+    bytecode (an immediate graph break) and yield a degenerate input-only
+    graph. The wrapper stashes the real function on ``_original``, so unwrap it
+    here to trace the code the user actually wrote.
+    """
+    return getattr(func, "_original", func)
+
+
 def trace(func: Callable, *args, **kwargs) -> Graph:
     """
     Trace a function and return its graph representation.
 
-    Useful for debugging and visualization.
+    Useful for debugging and visualization. If ``func`` was decorated with
+    :func:`compile`, its original (undecorated) body is traced.
 
     Args:
         func: Function to trace
@@ -401,7 +414,7 @@ def trace(func: Callable, *args, **kwargs) -> Graph:
         Computation graph
     """
     tracer = BytecodeTracer()
-    return tracer.trace_function(func, *args, **kwargs)
+    return tracer.trace_function(_unwrap(func), *args, **kwargs)
 
 
 def explain(func: Callable, *args, **kwargs) -> str:
@@ -413,7 +426,8 @@ def explain(func: Callable, *args, **kwargs) -> str:
     tracer = BytecodeTracer()
     optimizer = GraphOptimizer(optimization_level=2, verbose=False)
 
-    # Trace
+    # Trace (unwrap a compiled function to its original body)
+    func = _unwrap(func)
     graph = tracer.trace_function(func, *args, **kwargs)
 
     # Optimize
