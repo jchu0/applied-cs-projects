@@ -96,9 +96,10 @@ Constructs directed acyclic graph from workflow definition.
 
 ```python
 class DAGBuilder:
-    - build()              # Construct DAG
-    - topological_sort()   # Order nodes for execution
-    - find_parallel()      # Identify parallel branches
+    - build()                 # Construct DAG
+    - topological_sort()      # Order nodes for execution
+    - get_execution_levels()  # Group nodes into parallel levels
+    - get_parallel_groups()   # Identify parallel branches
 ```
 
 #### Optimizer (`optimizer.py`)

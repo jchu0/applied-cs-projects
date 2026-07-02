@@ -1,106 +1,97 @@
 # Project 28: AI Workflow Engine - Setup Guide
 
 ## Overview
-Workflow DSL and execution engine for complex AI pipelines with DAG-based orchestration, versioning, and distributed execution.
+
+A from-scratch workflow orchestration engine for AI/ML pipelines. Flows are
+declared in YAML, JSON, a dict, or a small indentation-based DSL, compiled into
+a DAG, and executed level-by-level with bounded async parallelism. The package
+is `aiworkflow` and lives under `src/aiworkflow/`.
+
+There is **no** database, message broker, Redis/PostgreSQL, or distributed
+(Ray/Dask) backend. Run history, the version store, and the human-in-the-loop
+review store are all in-memory. See the README's "What's Real vs Simulated"
+section for what is actually implemented.
 
 ## Prerequisites
+
 - Python 3.9+
-- Redis or PostgreSQL (for state management)
-- 8GB+ RAM
-- Optional: Ray or Dask for distributed execution
+- `pyyaml` — required for the compiler and engine. Without it the package still
+  imports (schemas only) but `WorkflowEngine`, `FlowParser`, etc. are `None`.
+- FastAPI + Uvicorn — only needed for the optional REST API (the `api` extra).
 
 ## Installation
 
-### 1. System Dependencies
+Install the package in editable mode. Extras are declared in `pyproject.toml`:
 
-**Redis (Recommended)**
 ```bash
-# Ubuntu/Debian
-sudo apt-get install redis-server
+# core + test tooling
+pip install -e ".[dev]"
 
-# macOS
-brew install redis
-
-# Start Redis
-redis-server
+# also install FastAPI/uvicorn for the REST API
+pip install -e ".[api,dev]"
 ```
 
-**PostgreSQL (Optional)**
+Verify the install:
+
 ```bash
-# Ubuntu/Debian
-sudo apt-get install postgresql postgresql-contrib
-
-# macOS
-brew install postgresql
-```
-
-### 2. Python Environment
-```bash
-python -m venv venv
-source venv/bin/activate
-
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
-```
-
-### 3. Database Setup
-```bash
-# Initialize database (SQLite by default)
-python -m aiworkflow.db init
-
-# Or with PostgreSQL
-export DATABASE_URL="postgresql://user:pass@localhost/aiworkflow"
-python -m aiworkflow.db init
+python -c "import aiworkflow; print(aiworkflow.__version__)"
 ```
 
 ## Configuration
 
-### 1. Environment Variables
-```bash
-# .env file
-# Database
-DATABASE_URL=sqlite:///./workflow.db
-# DATABASE_URL=postgresql://user:pass@localhost/aiworkflow
+The core library needs no configuration. The optional REST API reads a few
+environment variables (stdlib only, no extra deps). All are optional:
 
-# Redis
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_DB=0
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `API_KEYS` | *(unset)* | Comma-separated valid keys. Unset/empty disables auth (a startup warning is logged). |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Per-client request cap (by API key, else client IP). `0` disables. Over-limit returns `429` with `Retry-After`. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request wall-clock budget. `0` disables. On timeout returns `504`. |
 
-# Execution
-MAX_PARALLEL_NODES=10
-ENABLE_VERSIONING=true
-ENABLE_OPTIMIZATION=true
-
-# Distributed Execution (optional)
-USE_RAY=false
-RAY_ADDRESS=auto
-USE_DASK=false
-DASK_SCHEDULER=localhost:8786
-
-# LLM Providers (for LLM nodes)
-OPENAI_API_KEY=your_key
-ANTHROPIC_API_KEY=your_key
-
-# Monitoring
-PROMETHEUS_PORT=9090
-ENABLE_TELEMETRY=true
-```
-
-### 2. Flow Storage Directory
-```bash
-mkdir -p flows
-mkdir -p logs
-mkdir -p data
-```
+See `.env.example` for a template.
 
 ## Usage
 
-### Basic Workflow
+### Define and run a flow programmatically
 
-**1. Define Workflow (YAML)**
-```yaml
-# flows/qa_workflow.yaml
+LLM and retrieval executors return deterministic mock output — no model API is
+called (see the README).
+
+```python
+import asyncio
+from aiworkflow import WorkflowEngine, FlowDefinition, Node, NodeType, NodeConfig
+
+flow = FlowDefinition(
+    name="qa-flow",
+    version="1.0.0",
+    nodes=[
+        Node(id="retriever", type=NodeType.RETRIEVAL,
+             config=NodeConfig(extra={"top_k": 3}),
+             inputs={"query": "{{inputs.question}}"}),
+        Node(id="generator", type=NodeType.LLM,
+             config=NodeConfig(model="gpt-4", prompt_template="Q: {{question}}"),
+             dependencies=["retriever"],
+             inputs={"question": "{{inputs.question}}"}),
+    ],
+    outputs={"answer": "generator"},
+)
+
+engine = WorkflowEngine(max_parallel=5)
+
+async def main():
+    run = await engine.run_flow(flow_definition=flow, inputs={"question": "What is a DAG?"})
+    print(run.status, run.outputs)
+
+asyncio.run(main())
+```
+
+### Register a flow from YAML and execute by name
+
+```python
+import asyncio
+from aiworkflow import WorkflowEngine
+
+flow_yaml = """
 name: qa_workflow
 version: "1.0.0"
 description: Q&A workflow with retrieval and generation
@@ -111,335 +102,157 @@ nodes:
     inputs:
       query: "{{inputs.question}}"
     config:
-      top_k: 5
-      collection: "documents"
-
-  - id: reranker
-    type: rerank
-    dependencies:
-      - retriever
-    inputs:
-      query: "{{inputs.question}}"
-      documents: "{{retriever.result}}"
-    config:
-      top_k: 3
+      extra:
+        top_k: 5
 
   - id: generator
     type: llm
     dependencies:
-      - reranker
+      - retriever
     inputs:
-      context: "{{reranker.result}}"
       question: "{{inputs.question}}"
     config:
       model: gpt-4
-      temperature: 0.7
-      max_tokens: 500
       prompt_template: |
-        Context: {{context}}
         Question: {{question}}
         Answer:
 
 outputs:
-  answer: generator.result
+  answer: generator
+"""
+
+engine = WorkflowEngine()
+flow = engine.register_flow(flow_yaml)
+run = asyncio.run(engine.execute(flow.name, inputs={"question": "What is machine learning?"}))
+print(run.status, run.outputs)
 ```
 
-**2. Execute Workflow (Python)**
+The package also ships an `EXAMPLE_FLOW` YAML string you can register directly:
+
 ```python
-from aiworkflow import create_engine
+from aiworkflow import WorkflowEngine, EXAMPLE_FLOW
 
-# Create engine
-engine = create_engine(
-    max_parallel=10,
-    enable_versioning=True
-)
-
-# Register flow
-with open("flows/qa_workflow.yaml") as f:
-    flow_spec = f.read()
-
-flow = engine.register_flow(
-    flow_spec,
-    description="Q&A workflow"
-)
-
-# Execute
-result = await engine.execute(
-    flow_name="qa_workflow",
-    inputs={"question": "What is machine learning?"}
-)
-
-print(f"Status: {result.status}")
-print(f"Answer: {result.outputs['answer']}")
+engine = WorkflowEngine()
+flow = engine.register_flow(EXAMPLE_FLOW)
 ```
 
-### Advanced Workflow Features
+### Built-in node types
 
-**1. Conditional Execution**
-```yaml
-nodes:
-  - id: classifier
-    type: llm
-    inputs:
-      text: "{{inputs.query}}"
-    config:
-      prompt: "Classify as: question|command|statement"
+Valid `type` values (from `NodeType` in `schemas.py`): `llm`, `retrieval`,
+`tool`, `branch`, `transform`, `subflow`, `human_review`, `data`, `process`,
+`model`, `conditional`, `validation`. There is no `rerank`, `web_search`, or
+`merge` node type — model those with `transform`/`tool` nodes or a custom
+executor.
 
-  - id: qa_handler
-    type: llm
-    dependencies:
-      - classifier
-    condition: "{{classifier.result}} == 'question'"
-    inputs:
-      query: "{{inputs.query}}"
+### Custom node executors
 
-  - id: command_handler
-    type: custom
-    dependencies:
-      - classifier
-    condition: "{{classifier.result}} == 'command'"
-    inputs:
-      command: "{{inputs.query}}"
-```
-
-**2. Parallel Execution**
-```yaml
-nodes:
-  - id: retrieve_docs
-    type: retrieval
-    inputs:
-      query: "{{inputs.query}}"
-
-  - id: retrieve_web
-    type: web_search
-    inputs:
-      query: "{{inputs.query}}"
-
-  - id: combine
-    type: merge
-    dependencies:
-      - retrieve_docs
-      - retrieve_web
-    inputs:
-      sources:
-        - "{{retrieve_docs.result}}"
-        - "{{retrieve_web.result}}"
-```
-
-**3. Retry & Error Handling**
-```yaml
-nodes:
-  - id: api_call
-    type: llm
-    inputs:
-      prompt: "{{inputs.prompt}}"
-    config:
-      retry_strategy: exponential_backoff
-      max_retries: 3
-      timeout_seconds: 30
-    on_error:
-      action: fallback
-      fallback_value: "Error occurred, using default response"
-```
-
-### Custom Node Executors
+`BaseNodeExecutor.execute` receives the `Node` and a resolved `inputs` dict:
 
 ```python
 from aiworkflow.nodes import BaseNodeExecutor
 
-class CustomNodeExecutor(BaseNodeExecutor):
-    """Custom node executor."""
+class DoubleExecutor(BaseNodeExecutor):
+    async def execute(self, node, inputs):
+        return {"processed": [x * 2 for x in inputs.get("data", [])]}
 
-    async def execute(self, inputs: dict, config: dict) -> dict:
-        # Your custom logic
-        result = await self.process(inputs, config)
-        return {"result": result}
-
-    async def process(self, inputs, config):
-        # Implementation
-        return "processed result"
-
-# Register custom executor
-engine.register_node_executor("custom", CustomNodeExecutor())
+engine.register_node_executor("doubler", DoubleExecutor())
+# reference it from a node via Node(..., executor="doubler")
 ```
 
-### Batch Execution
-```python
-# Execute workflow for multiple inputs
-inputs_list = [
-    {"question": "What is ML?"},
-    {"question": "What is DL?"},
-    {"question": "What is NLP?"}
-]
+### Batch execution
 
+```python
 results = await engine.execute_batch(
     flow_name="qa_workflow",
-    inputs_list=inputs_list
+    inputs_list=[{"question": "What is ML?"}, {"question": "What is DL?"}],
 )
-
-for result in results:
-    print(f"Answer: {result.outputs['answer']}")
+for run in results:
+    print(run.status, run.outputs)
 ```
 
-### Workflow Versioning
+### Versioning and run history
+
 ```python
-from aiworkflow import FlowVersionManager
-
-manager = FlowVersionManager()
-
-# Get specific version
+# Versioning is on by default; register_flow saves a content-hashed version.
 flow_v1 = engine.get_flow("qa_workflow", version="1.0.0")
-flow_v2 = engine.get_flow("qa_workflow", version="2.0.0")
 
-# List versions
-versions = manager.list_versions("qa_workflow")
+# Run history (in-memory)
+for run in engine.get_run_history(flow_name="qa_workflow", limit=100):
+    print(run.run_id, run.status)
+
+single = engine.get_run("some-run-id")
 ```
 
-### Monitoring & Observability
+### Configured engine factory
 
-**1. Execution History**
 ```python
-# Get run history
-history = engine.get_run_history(
-    flow_name="qa_workflow",
-    limit=100
-)
-
-for run in history:
-    print(f"Run {run.run_id}: {run.status} ({run.duration_ms}ms)")
-```
-
-**2. Flow Metrics**
-```python
-# Get specific run
-run = engine.get_run("run-id-123")
-
-print(f"Status: {run.status}")
-print(f"Duration: {run.duration_ms}ms")
-print(f"Nodes executed: {len(run.node_results)}")
-
-if run.error:
-    print(f"Error: {run.error}")
-```
-
-**3. Prometheus Integration**
-```python
-from prometheus_client import start_http_server
-
-# Start metrics server
-start_http_server(9090)
-
-# Metrics available at http://localhost:9090/metrics
-```
-
-## Distributed Execution
-
-### Using Ray
-```python
-import ray
-
-# Initialize Ray
-ray.init(address="auto")
-
-# Engine will use Ray for distributed execution
-engine = create_engine(
-    max_parallel=100,  # Can handle more parallel nodes
-    use_ray=True
-)
-```
-
-### Using Dask
-```python
-from dask.distributed import Client
-
-# Connect to Dask cluster
-client = Client("localhost:8786")
+from aiworkflow import create_engine
 
 engine = create_engine(
-    max_parallel=100,
-    use_dask=True
+    max_parallel=10,
+    enable_versioning=True,
+    enable_optimization=True,
 )
 ```
 
-## Flow Optimization
+## Running the REST API
 
-```python
-from aiworkflow import FlowOptimizer
+The FastAPI app is exported as `aiworkflow.api:app`:
 
-optimizer = FlowOptimizer()
-
-# Optimize flow
-optimized_flow = optimizer.optimize(flow)
-
-# Optimizations include:
-# - Parallel execution of independent nodes
-# - Caching of repeated computations
-# - Dead code elimination
+```bash
+uvicorn aiworkflow.api:app --reload
 ```
+
+With auth enabled, send the key as `Authorization: Bearer <key>` or
+`X-API-Key: <key>`:
+
+```bash
+API_KEYS=mysecret uvicorn aiworkflow.api:app
+curl -H "Authorization: Bearer mysecret" http://localhost:8000/flows
+```
+
+`/health`, `/`, and the docs (`/docs`, `/redoc`, `/openapi.json`) stay open.
 
 ## Testing
 
 ```bash
-# Run all tests
+# run the suite (asyncio_mode = auto)
 pytest
 
-# Test specific workflow
-pytest tests/test_engine.py::test_qa_workflow
+# with coverage
+pytest --cov=aiworkflow
 
-# Test with fixtures
-pytest tests/test_integration.py -v
+# a single file
+pytest tests/test_engine.py -v
 ```
 
-## Common Issues
-
-### Issue: Redis connection failed
-**Solution**: Ensure Redis is running
-```bash
-redis-cli ping  # Should return PONG
-```
-
-### Issue: Node execution timeout
-**Solution**: Increase timeout in node config
-```yaml
-config:
-  timeout_seconds: 60  # Increase from default 30
-```
-
-### Issue: Memory leak with large workflows
-**Solution**: Enable result cleanup
-```python
-engine = create_engine(
-    cleanup_results=True,  # Clean up intermediate results
-    max_result_size_mb=100
-)
-```
+No external services are required — LLM/retrieval calls are mocked in-process.
 
 ## Project Structure
+
 ```
 28-ai-workflow-engine/
 ├── src/aiworkflow/
-│   ├── engine.py           # Main engine
-│   ├── compiler/          # Flow parsing & compilation
-│   ├── executor/          # Execution scheduling
-│   ├── nodes/             # Node executors
-│   ├── retry/             # Retry strategies
-│   ├── versioning/        # Flow versioning
-│   └── ...
-├── flows/                 # Flow definitions
-├── tests/
+│   ├── schemas.py         # core dataclasses and enums
+│   ├── engine.py          # WorkflowEngine, create_engine, EXAMPLE_FLOW
+│   ├── compiler/          # parser, validator, DAG builder, optimizer
+│   ├── executor/          # Scheduler, AsyncScheduler
+│   ├── nodes/             # node executors and the registry
+│   ├── retry/             # retry strategies, circuit breaker, RetryManager
+│   ├── versioning/        # FlowVersionManager, MigrationManager
+│   ├── enterprise/        # HITL review, secrets, visualization
+│   └── api/               # FastAPI app
+├── tests/                 # test suite
+├── docs/                  # ARCHITECTURE.md, API.md, BLUEPRINT.md, this file
+├── pyproject.toml
 ├── requirements.txt
-└── SETUP.md
+└── requirements-dev.txt
 ```
 
-## Next Steps
-1. Define your workflows in YAML
-2. Register custom node executors
-3. Set up distributed execution
-4. Enable monitoring
-5. Deploy flows to production
-
 ## Resources
+
 - [YAML Specification](https://yaml.org/spec/)
-- [Ray Documentation](https://docs.ray.io/)
-- [Dask Documentation](https://docs.dask.org/)
-- [SQLAlchemy](https://docs.sqlalchemy.org/)
+- [FastAPI](https://fastapi.tiangolo.com/)
+- [Uvicorn](https://www.uvicorn.org/)
+</content>
+</invoke>

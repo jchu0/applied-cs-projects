@@ -151,7 +151,7 @@ pytest --cov=aiworkflow     # with coverage
 pytest tests/test_engine.py -v
 ```
 
-The suite has 219 tests across 15 files covering the compiler, DAG edge cases, scheduler under load, node executors, retry strategy scenarios, error propagation, subflows, enterprise features, the API and its hardening layer, and end-to-end integration. No external services are required — LLM/retrieval calls are mocked in-process.
+The suite has 219 tests across 14 files covering the compiler, DAG edge cases, scheduler under load, node executors, retry strategy scenarios, error propagation, subflows, enterprise features, the API and its hardening layer, and end-to-end integration. No external services are required — LLM/retrieval calls are mocked in-process.
 
 ## Project Structure
 
@@ -169,7 +169,7 @@ The suite has 219 tests across 15 files covering the compiler, DAG edge cases, s
     versioning/             # FlowVersionManager, MigrationManager
     enterprise/             # HITL review, secrets, visualization
     api/                    # FastAPI app
-  tests/                    # 215 tests across 14 files
+  tests/                    # 219 tests across 14 files
   docs/
     BLUEPRINT.md            # full architecture and design
     SETUP.md                # environment setup
