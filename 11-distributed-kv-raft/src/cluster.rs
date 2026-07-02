@@ -247,15 +247,46 @@ impl RaftClusterNode {
         }
     }
 
-    /// Propose a command to the cluster.
+    /// Propose a command to the cluster and wait for it to be applied.
+    ///
+    /// Appends the command to the leader's log, replicates it to peers, and
+    /// blocks until the entry has been committed to a quorum and applied to the
+    /// local state machine (read-after-write). Returns the log index once the
+    /// entry is applied, or an error if leadership is lost or the wait times
+    /// out. Callers must be the leader; followers reject in `propose` above.
     pub async fn propose(&self, command: Command) -> Result<LogIndex> {
-        // Append to log.
+        // Append to log (leader-only; returns NotLeader otherwise).
         let index = self.node.write().propose(command)?;
 
-        // Replicate to peers.
-        self.replicate_to_peers().await;
+        // Kick off replication, then drive it until the entry commits and
+        // applies. Followers may need several AppendEntries rounds to catch up,
+        // so we replicate on a short cadence while waiting.
+        let timeout = Duration::from_secs(5);
+        let start = Instant::now();
 
-        Ok(index)
+        loop {
+            self.replicate_to_peers().await;
+
+            // Give in-flight AppendEntries responses time to advance the
+            // commit index and apply the entry.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            {
+                let node = self.node.read();
+                if node.last_applied() >= index {
+                    return Ok(index);
+                }
+                // If we lost leadership before the entry committed, the client
+                // should retry against the new leader.
+                if !node.is_leader() {
+                    return Err(Error::NotLeader(node.leader_id()));
+                }
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(Error::Timeout);
+            }
+        }
     }
 
     /// Perform a linearizable read.

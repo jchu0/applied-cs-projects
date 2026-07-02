@@ -51,7 +51,7 @@ flowchart TD
 | gRPC transport | `grpc.rs` | `tonic` client/server (`GrpcTransport`, `GrpcServerBuilder`) |
 | RPC types | `rpc.rs` | `AppendEntries`, `RequestVote`, `InstallSnapshot`, client messages |
 | Cluster | `cluster.rs` | `RaftClusterNode` event loop and `TestCluster` harness |
-| Client | `client.rs` | `KVClient` with leader discovery and retry/backoff |
+| Client | `client.rs` | `KVClient` end-to-end command path with leader-hint redirect and retry/backoff |
 | Config | `config.rs` | `RaftConfig` builder and `ClusterConfig` quorum logic |
 | Metrics | `metrics.rs` | `RaftMetrics`, `Histogram`, `HealthCheck` |
 | Errors | `error.rs` | Unified `Error` / `Result` |
@@ -111,7 +111,45 @@ println!("appended at log index {index}");
 ```
 
 For a multi-node cluster, build one `RaftConfig` per node, wire them together over a
-`MemoryNetwork`, and run them through `TestCluster` (see `cluster.rs` and `tests/`).
+`MemoryNetwork`, and run them through `TestCluster`. Once a leader is elected, a `KVClient`
+attached to the network's client transport drives the real end-to-end command path —
+propose to the leader, replicate to a quorum, commit, apply, and return the applied result:
+
+```rust,no_run
+use std::sync::Arc;
+use std::time::Duration;
+use distributed_kv_raft::{KVClient, NodeAddress, TestCluster};
+use distributed_kv_raft::config::RaftConfigBuilder;
+use distributed_kv_raft::transport::MemoryNetwork;
+
+# async fn run() {
+let ids = [0u64, 1, 2];
+let configs = ids.iter().map(|&id| {
+    let mut b = RaftConfigBuilder::default().id(id);
+    for &p in &ids { if p != id { b = b.peer(p, format!("127.0.0.1:{}", 5000 + p)); } }
+    b.build()
+}).collect();
+
+// Wire the nodes together over an in-process MemoryNetwork and start them.
+let mut network = MemoryNetwork::new(&ids);
+let client_transport = network.client_transport(); // reaches every node
+let mut cluster = TestCluster::new(configs, &mut network);
+cluster.start().await;
+cluster.wait_for_leader(Duration::from_secs(3)).await.unwrap();
+
+// The client follows NotLeader hints automatically; sending to a follower is fine.
+let addrs = ids.iter().map(|&id| NodeAddress { id, addr: format!("127.0.0.1:{}", 5000 + id) }).collect();
+let mut client = KVClient::new(addrs).with_transport(client_transport as Arc<_>);
+
+client.put(b"name".to_vec(), b"raft".to_vec()).await.unwrap();
+assert_eq!(client.get(b"name").await.unwrap(), Some(b"raft".to_vec()));
+cluster.stop().await;
+# }
+```
+
+The same `KVClient` path would run over `GrpcTransport` once that transport's client leg is
+wired (see below); the request/redirect logic is transport-agnostic. See `cluster.rs` and
+`tests/e2e_client_tests.rs` for the full working flow.
 
 ## What's Real vs Simulated
 
@@ -119,14 +157,21 @@ For a multi-node cluster, build one `RaftConfig` per node, wire them together ov
   backtracking), pre-vote, check-quorum, the WAL with CRC checks and crash recovery, FSM
   snapshot/restore, `InstallSnapshot` handling, and joint-consensus membership are fully
   implemented. The `MemoryNetwork` transport is complete and backs the multi-node tests,
-  including partition injection. The `GrpcTransport` client/server is functional and uses
-  real `tonic` channels.
-- **Simulated / not implemented:** `KVClient::send_request` is a stub that returns a
-  success placeholder rather than performing real network I/O — it demonstrates the
-  leader-discovery and retry/backoff logic, not end-to-end RPC. gRPC TLS is a
-  configuration flag (`GrpcConfig::enable_tls`) only; encryption is not wired up. WAL
-  `truncate_suffix` and `compact` update in-memory state and the index but do not yet
-  rewrite or delete on-disk segment files.
+  including partition injection. **The end-to-end client path is real over
+  `MemoryNetwork`:** `KVClient::put`/`get`/`delete` deliver a `ClientRequest` to a node's
+  event loop, which proposes it through Raft, replicates to a quorum, commits, applies to
+  the `KeyValueFSM`, and returns the applied result. A request sent to a follower is
+  answered with `NotLeader { leader_hint }`, and the client automatically retries against
+  the hinted leader (`Transport::send_client_request`, `RaftClusterNode::propose`,
+  `tests/e2e_client_tests.rs`). Reads are served from the leader's applied state after a
+  leadership check (read-after-commit).
+- **Not yet wired:** The `GrpcTransport` client/server is structurally complete and uses
+  real `tonic` channels for Raft RPCs, but its client-request leg is not wired — the
+  default `Transport::send_client_request` returns a network error there, so the
+  end-to-end path above runs only over `MemoryNetwork` today. gRPC TLS is a configuration
+  flag (`GrpcConfig::enable_tls`) only; encryption is not wired up. WAL `truncate_suffix`
+  and `compact` update in-memory state and the index but do not yet rewrite or delete
+  on-disk segment files (stale segments remain until the next full rewrite).
 
 ## Testing
 
@@ -134,13 +179,15 @@ For a multi-node cluster, build one `RaftConfig` per node, wire them together ov
 cargo test
 ```
 
-The suite is 419 test functions across 8 files in `tests/` (plus inline `#[cfg(test)]`
+The suite is 435 test functions across 9 files in `tests/` (plus inline `#[cfg(test)]`
 modules). It covers Raft election and replication (`raft_tests.rs`), RPC handling
 (`rpc_tests.rs`), WAL/FSM/snapshot storage (`storage_comprehensive_tests.rs`), the
 transport layer and partitions (`transport_tests.rs`), client and config behavior
 (`client_config_tests.rs`), metrics (`metrics_tests.rs`), edge cases (`edge_case_tests.rs`),
-and broad integration scenarios (`comprehensive_tests.rs`). No external services are
-required; multi-node tests run over the in-process `MemoryNetwork`.
+broad integration scenarios (`comprehensive_tests.rs`), and the end-to-end client command
+path — put/get through Raft and follower redirect — over `MemoryNetwork`
+(`e2e_client_tests.rs`). No external services are required; multi-node tests run over the
+in-process `MemoryNetwork`.
 
 ## Project Structure
 
@@ -159,7 +206,7 @@ required; multi-node tests run over the in-process `MemoryNetwork`.
     error.rs       # Error / Result
     lib.rs         # public exports
   proto/raft.proto # gRPC service and message definitions
-  tests/           # integration tests (8 files)
+  tests/           # integration tests (9 files, incl. e2e_client_tests.rs)
   benches/         # Criterion microbenchmarks
   docs/BLUEPRINT.md   # Full architecture and Raft protocol design
 ```

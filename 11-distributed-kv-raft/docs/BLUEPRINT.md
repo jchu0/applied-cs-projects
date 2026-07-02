@@ -25,10 +25,15 @@ production-operational:
   records and recovers them on restart, and an FSM snapshot mechanism bounds log growth.
 
 The scope is the consensus core and its supporting data structures, exercised by an
-extensive test suite. It is not a turnkey server: the client-side network path is a stub,
-gRPC TLS is a flag only, and on-disk log truncation is partial. Those boundaries are
-called out explicitly throughout this document and in the README's "What's Real vs
-Simulated" section.
+extensive test suite. A real end-to-end client path now works over the in-process
+`MemoryNetwork`: `KVClient` submits a command, it is proposed to the leader, replicated to
+a quorum, committed, applied to the KV state machine, and the applied result is returned;
+a request to a follower is redirected via a leader hint that the client follows
+automatically. The remaining boundaries are honest and narrow: the `GrpcTransport`
+client-request leg is not yet wired (Raft RPCs over gRPC are, but `send_client_request`
+falls back to its default error there), gRPC TLS is a flag only, and on-disk log
+truncation is partial. Those boundaries are called out explicitly throughout this document
+and in the README's "What's Real vs Simulated" section.
 
 The core types are concentrated in a handful of modules:
 
@@ -62,10 +67,14 @@ flowchart TD
 The system is layered:
 
 - **Client layer (`client.rs`).** `KVClient` holds the list of node addresses, the
-  currently believed leader, and retry/backoff parameters. It turns `put`/`get`/`delete`
-  into a `ClientRequest` and retries against other nodes on `NotLeader` or failure. The
-  actual send is a stub today; the layer demonstrates leader discovery and deduplication
-  (`RequestTracker`) rather than real I/O.
+  currently believed leader, retry/backoff parameters, and an optional `Transport`. It
+  turns `put`/`get`/`delete` into a `ClientRequest` and sends it through the transport's
+  `send_client_request` to the target node's event loop. On `NotLeader { leader_hint }` it
+  records the hint and retries against the hinted leader (falling back to round-robin when
+  the hint is absent); on transport failure it clears its leader guess and retries. With a
+  `MemoryTransport` attached (via `MemoryNetwork::client_transport`), this is a real
+  end-to-end path — the previous stub returned a placeholder without touching Raft. The
+  layer also carries deduplication scaffolding (`RequestTracker`).
 
 - **Coordination layer (`cluster.rs`).** `RaftClusterNode` owns the async event loop. A
   `tokio::select!` multiplexes three sources: inbound `RaftMessage`s from the transport, a
@@ -86,11 +95,16 @@ The system is layered:
   chunked install. A `Storage` trait plus `MemoryStorage` give an in-memory backend for
   tests.
 
-- **Transport layer (`transport.rs`, `grpc.rs`).** The `Transport` trait has exactly three
-  methods — `send_request_vote`, `send_append_entries`, `send_install_snapshot`.
-  `MemoryTransport`/`MemoryNetwork` implement it with `tokio::mpsc` channels and support
-  injected partitions and delays. `GrpcTransport` implements it with cached `tonic`
-  channels.
+- **Transport layer (`transport.rs`, `grpc.rs`).** The `Transport` trait has four methods —
+  `send_request_vote`, `send_append_entries`, `send_install_snapshot`, and
+  `send_client_request`. The first three are the Raft peer RPCs; `send_client_request`
+  carries the client-facing command path and has a default implementation returning a
+  network error, so a transport can opt in without breaking. `MemoryTransport` /
+  `MemoryNetwork` implement all four with `tokio::mpsc` channels and support injected
+  partitions and delays; `MemoryNetwork::client_transport` builds a transport registered
+  with every node's channel so an external client can reach any node. `GrpcTransport`
+  implements the three peer RPCs with cached `tonic` channels and inherits the default
+  (error) `send_client_request` — its client leg is not yet wired.
 
 ## Core Components
 
@@ -326,21 +340,38 @@ peer to send it and apply the response. A critical detail throughout is that the
 guard is always dropped before any `.await`, so the lock is never held across suspension
 points.
 
+`handle_client_request` is the server end of the client path. A follower short-circuits to
+`NotLeader { leader_hint }`; the leader turns a `Put`/`Delete` into a `Command` and calls
+`propose`, and a `Get` into a `linearizable_read`. `propose` appends the entry, then drives
+replication on a short cadence and blocks until the entry's index has been applied to the
+local FSM (read-after-write), returning `NotLeader` if leadership is lost mid-flight and
+`Timeout` if the entry does not commit in time. Because the response is sent only after the
+entry is applied, a client's subsequent `get` observes its own write.
+
 `linearizable_read` shows the read-index protocol: if the leader lease is valid, read
 locally; otherwise confirm leadership by exchanging `AppendEntries` with a quorum, wait
-until `last_applied` reaches the saved commit index, then read from the FSM.
+until `last_applied` reaches the saved commit index, then read from the FSM. Reads served
+through the `KVClient` are therefore read-after-commit against the leader's applied state;
+the client wrapper does not itself assert linearizability across leader changes.
 
 `TestCluster` builds a `RaftClusterNode` per config over a shared `MemoryNetwork`, starts
 each in its own task, and offers `leader()` and `wait_for_leader(timeout)` helpers.
 
 ### Client (client.rs)
 
-`KVClient` stores the cluster addresses, the believed leader, a timeout, and a retry
-budget. `execute_with_retry` picks a target (the known leader, else round-robin), sends the
-request, and on a `NotLeader` hint updates its leader belief and retries with exponential
-backoff; on error it forgets the leader and retries. After the retry budget is exhausted it
-returns `Error::ClusterUnavailable`. `RequestTracker` provides idempotency by remembering
-the last `(sequence, response)` per `client_id`. The `send_request` method is a stub today.
+`KVClient` stores the cluster addresses, the believed leader, a timeout, a retry budget,
+and an optional `Transport`. `execute_with_retry` picks a target (the known leader, else
+round-robin), calls `send_request`, and on a `NotLeader` hint updates its leader belief and
+retries with exponential backoff; on error it forgets the leader and retries. After the
+retry budget is exhausted it returns `Error::ClusterUnavailable`. `send_request` routes the
+`ClientRequest` by node ID through the attached transport (`send_client_request`), bounded
+by the client timeout; when no transport is attached it returns `Error::Network` rather
+than a placeholder. Attaching a `MemoryTransport` from `MemoryNetwork::client_transport`
+makes this a real end-to-end path — `with_known_leader` can seed the initial target to
+exercise the follower-redirect flow, as `tests/e2e_client_tests.rs` does. `RequestTracker`
+provides idempotency scaffolding by remembering the last `(sequence, response)` per
+`client_id`. The same path would run over `GrpcTransport` once its `send_client_request`
+leg is wired.
 
 ### Configuration (config.rs)
 
@@ -592,6 +623,10 @@ pub trait Transport: Send + Sync {
         -> Result<AppendEntriesResponse>;
     async fn send_install_snapshot(&self, target: NodeId, request: InstallSnapshotRequest)
         -> Result<InstallSnapshotResponse>;
+    // Client command path. Default impl returns Error::Network; MemoryTransport
+    // overrides it, GrpcTransport (for now) inherits the default.
+    async fn send_client_request(&self, target: NodeId, request: ClientRequest)
+        -> Result<ClientResponse> { /* default: unsupported */ }
 }
 ```
 
@@ -683,6 +718,8 @@ impl KVClient {
     pub fn new(cluster: Vec<NodeAddress>) -> Self;
     pub fn with_timeout(self, timeout: Duration) -> Self;
     pub fn with_retries(self, max_retries: usize) -> Self;
+    pub fn with_transport(self, transport: Arc<dyn Transport>) -> Self; // wire real I/O
+    pub fn with_known_leader(self, leader_id: NodeId) -> Self;          // seed leader guess
 
     pub async fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()>;
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
@@ -799,7 +836,7 @@ backtracking to make catch-up O(conflicting region) instead of O(log length); a
 
 ## Testing Strategy
 
-Correctness is verified by 419 test functions across eight integration files in `tests/`,
+Correctness is verified by 435 test functions across nine integration files in `tests/`,
 plus inline `#[cfg(test)]` modules in `storage.rs`, `transport.rs`, and `cluster.rs`. The
 multi-node tests run entirely over the in-process `MemoryNetwork`, so the suite is
 deterministic and needs no external services.
@@ -837,6 +874,13 @@ components.
 `TestCluster` together with `MemoryNetwork::create_partition` / `heal_all_partitions` to cut
 the cluster, assert that a majority partition keeps a working leader while a minority
 cannot elect one, and confirm convergence after healing.
+
+**End-to-end client path.** `e2e_client_tests.rs` (2 tests) starts a 3-node `TestCluster`
+over `MemoryNetwork`, drives an election, and then drives the real client path: `put(k, v)`
+followed by `get(k)` returns `v` (including overwrite and missing-key cases), and a `put`
+issued to a follower is redirected via its leader hint and applied by the leader, with the
+value visible on a subsequent read. This is the proof that the client → leader → replicate
+→ commit → apply → response path works, not just the consensus core in isolation.
 
 ## References
 

@@ -66,6 +66,28 @@ pub trait Transport: Send + Sync {
         target: NodeId,
         request: InstallSnapshotRequest,
     ) -> Result<InstallSnapshotResponse>;
+
+    /// Send a client request to a node.
+    ///
+    /// This is the client-facing command path: a `Put`/`Get`/`Delete` is
+    /// delivered to the target node's event loop, which proposes it through
+    /// Raft (leader), replicates to a quorum, applies it, and returns the
+    /// applied result. Followers reply with [`ClientResponse::NotLeader`] and a
+    /// leader hint so the caller can retry against the current leader.
+    ///
+    /// The default implementation returns a network error; transports that do
+    /// not (yet) carry the client path — e.g. `GrpcTransport`, which is
+    /// structurally complete but not wired for client requests — inherit it.
+    async fn send_client_request(
+        &self,
+        target: NodeId,
+        request: ClientRequest,
+    ) -> Result<ClientResponse> {
+        let _ = (target, request);
+        Err(Error::Network(
+            "send_client_request not supported by this transport".to_string(),
+        ))
+    }
 }
 
 /// In-memory transport for testing.
@@ -216,6 +238,22 @@ impl Transport for MemoryTransport {
         })
         .await
     }
+
+    async fn send_client_request(
+        &self,
+        target: NodeId,
+        request: ClientRequest,
+    ) -> Result<ClientResponse> {
+        debug!(
+            "Node {} forwarding client request {:?} to {}",
+            self.node_id, request, target
+        );
+        self.send_with_timeout(target, |response_tx| RaftMessage::ClientRequest {
+            request,
+            response_tx,
+        })
+        .await
+    }
 }
 
 /// Network of memory transports for testing.
@@ -224,6 +262,9 @@ pub struct MemoryNetwork {
     transports: HashMap<NodeId, Arc<MemoryTransport>>,
     /// Message receivers by node ID.
     receivers: HashMap<NodeId, mpsc::Receiver<RaftMessage>>,
+    /// Message senders by node ID (retained so external clients can be wired
+    /// to every node's event loop).
+    senders: HashMap<NodeId, mpsc::Sender<RaftMessage>>,
 }
 
 impl MemoryNetwork {
@@ -253,12 +294,28 @@ impl MemoryNetwork {
         Self {
             transports,
             receivers,
+            senders,
         }
     }
 
     /// Get transport for a node.
     pub fn get_transport(&self, node_id: NodeId) -> Option<Arc<MemoryTransport>> {
         self.transports.get(&node_id).cloned()
+    }
+
+    /// Build a transport for an external client.
+    ///
+    /// Unlike a node's transport (which is registered with peers only), the
+    /// returned transport is registered with *every* node's event loop, so a
+    /// client can deliver [`ClientRequest`]s to any node — including a
+    /// follower, which will respond with a leader hint. The synthetic node ID
+    /// [`u64::MAX`] identifies the client in transport logs.
+    pub fn client_transport(&self) -> Arc<MemoryTransport> {
+        let transport = MemoryTransport::new(u64::MAX);
+        for (&id, sender) in &self.senders {
+            transport.register_peer(id, sender.clone());
+        }
+        Arc::new(transport)
     }
 
     /// Take the receiver for a node.

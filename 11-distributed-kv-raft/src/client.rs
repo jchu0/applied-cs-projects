@@ -1,11 +1,12 @@
 //! Client API for the Raft KV store.
 
 use crate::error::{Error, Result};
-use crate::node::Command;
 use crate::rpc::{ClientRequest, ClientResponse};
+use crate::transport::Transport;
 use crate::NodeId;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -32,10 +33,22 @@ pub struct KVClient {
     client_id: u64,
     /// Sequence number for requests.
     sequence: u64,
+    /// Transport used to deliver client requests to nodes.
+    ///
+    /// When set (see [`KVClient::with_transport`]), the client sends real
+    /// requests through Raft over this transport — today a `MemoryTransport`
+    /// built from a `MemoryNetwork`. When `None`, `send_request` has no wired
+    /// backend and returns a network error; the same code path would run over
+    /// `GrpcTransport` once that transport's client leg is wired.
+    transport: Option<Arc<dyn Transport>>,
 }
 
 impl KVClient {
     /// Create a new client.
+    ///
+    /// The client has no wired transport until [`KVClient::with_transport`] is
+    /// called; use it to attach a `MemoryTransport` (via
+    /// `MemoryNetwork::client_transport`) for the end-to-end path.
     pub fn new(cluster: Vec<NodeAddress>) -> Self {
         Self {
             cluster,
@@ -44,7 +57,17 @@ impl KVClient {
             max_retries: 3,
             client_id: rand::random(),
             sequence: 0,
+            transport: None,
         }
+    }
+
+    /// Attach a transport used to carry client requests to cluster nodes.
+    ///
+    /// The transport must be able to reach every node in `cluster` by node ID
+    /// (e.g. one produced by `MemoryNetwork::client_transport`).
+    pub fn with_transport(mut self, transport: Arc<dyn Transport>) -> Self {
+        self.transport = Some(transport);
+        self
     }
 
     /// Set request timeout.
@@ -56,6 +79,16 @@ impl KVClient {
     /// Set maximum retries.
     pub fn with_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// Seed the client's initial guess for the current leader.
+    ///
+    /// The client will send its first request to this node. If that node is not
+    /// the leader it replies with [`ClientResponse::NotLeader`] and a hint, and
+    /// the client automatically follows the hint on retry.
+    pub fn with_known_leader(mut self, leader_id: NodeId) -> Self {
+        self.leader_id = Some(leader_id);
         self
     }
 
@@ -137,17 +170,31 @@ impl KVClient {
         self.cluster[idx].clone()
     }
 
-    /// Send request to a node (stub - would use gRPC in real implementation).
+    /// Send a request to a node over the attached transport.
+    ///
+    /// Routes by node ID through the wired transport (`MemoryTransport` today).
+    /// The target node's event loop proposes the command through Raft, waits
+    /// for it to commit and apply, and returns the applied result; a follower
+    /// returns [`ClientResponse::NotLeader`] with a leader hint. If no
+    /// transport is attached, returns [`Error::Network`] — the same call would
+    /// run over `GrpcTransport` once its client leg is wired.
     async fn send_request(
         &self,
         target: &NodeAddress,
         request: ClientRequest,
     ) -> Result<ClientResponse> {
-        // In real implementation, this would use gRPC
-        debug!("Sending {:?} to {}", request, target.addr);
+        debug!("Sending {:?} to node {} ({})", request, target.id, target.addr);
 
-        // Stub response
-        Ok(ClientResponse::Success { value: None })
+        let transport = self.transport.as_ref().ok_or_else(|| {
+            Error::Network("no transport attached to client (see KVClient::with_transport)".into())
+        })?;
+
+        tokio::time::timeout(
+            self.timeout,
+            transport.send_client_request(target.id, request),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
     }
 }
 
