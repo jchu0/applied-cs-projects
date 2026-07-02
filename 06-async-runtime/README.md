@@ -162,6 +162,10 @@ cargo test --lib          # in-module unit tests (reactor, timer, scheduler, cha
 cargo bench               # Criterion benchmarks
 ```
 
+> **Note:** use `cargo test --lib`, not a bare `cargo test`. The default target
+> also compiles the `tests/` integration files, which intentionally target an
+> unimplemented API and therefore fail to compile (see below).
+
 The in-module unit tests cover the reactor (register/poll/deregister), the timer
 wheel (insert/cancel/cascade), the scheduler (push/pop/steal), the channels, the
 combinators, and the TCP listener. They need no external services. The standalone
