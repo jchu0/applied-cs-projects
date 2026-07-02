@@ -119,3 +119,7 @@ See the project's own `README.md` for endpoints, configuration, and design notes
 ## License
 
 [MIT](LICENSE) © 2026 James Hu
+
+---
+
+<sub>🤖 Built with [Claude Code](https://claude.com/claude-code).</sub>
