@@ -709,10 +709,11 @@ impl ReplicaFetcher {
     /// Process fetch response from a leader.
     pub fn process_fetch_response(&self, response: FetchResponse) -> Result<()> {
         for partition_response in response.responses {
+            // The topic is carried on each partition response, so a fetch that
+            // spans multiple topics is routed correctly (previously every
+            // response beyond the first was silently misattributed).
             let tp = TopicPartition::new(
-                // Topic is not in FetchPartitionResponse, need to track separately
-                // For now, we'll use a placeholder approach
-                "",
+                partition_response.topic.clone(),
                 partition_response.partition,
             );
 

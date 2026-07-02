@@ -717,9 +717,11 @@ fn convert_fetch_response(resp: proto::FetchResponse) -> protocol::FetchResponse
             .responses
             .into_iter()
             .flat_map(|t| {
+                let topic = t.topic.clone();
                 t.partitions
                     .into_iter()
-                    .map(|p| protocol::FetchPartitionResponse {
+                    .map(move |p| protocol::FetchPartitionResponse {
+                        topic: topic.clone(),
                         partition: p.partition,
                         error_code: p.error_code as i16,
                         high_watermark: p.high_watermark,
@@ -738,29 +740,42 @@ fn convert_fetch_response(resp: proto::FetchResponse) -> protocol::FetchResponse
 }
 
 fn convert_fetch_request_response(resp: protocol::FetchResponse) -> proto::FetchResponse {
+    // Group partition responses back under their topic so a multi-topic fetch
+    // round-trips correctly (preserving insertion order of topics).
+    let mut topic_order: Vec<String> = Vec::new();
+    let mut by_topic: std::collections::HashMap<String, Vec<proto::FetchPartitionResponse>> =
+        std::collections::HashMap::new();
+
+    for p in resp.responses {
+        let converted = proto::FetchPartitionResponse {
+            partition: p.partition,
+            error_code: p.error_code as i32,
+            high_watermark: p.high_watermark,
+            last_stable_offset: p.last_stable_offset,
+            log_start_offset: p.log_start_offset,
+            record_batches: p
+                .record_batches
+                .into_iter()
+                .map(|b| convert_record_batch(&b))
+                .collect(),
+        };
+        if !by_topic.contains_key(&p.topic) {
+            topic_order.push(p.topic.clone());
+        }
+        by_topic.entry(p.topic).or_default().push(converted);
+    }
+
     proto::FetchResponse {
         throttle_time_ms: resp.throttle_time_ms,
         error_code: resp.error_code as i32,
         session_id: resp.session_id,
-        responses: vec![proto::FetchTopicResponse {
-            topic: String::new(),
-            partitions: resp
-                .responses
-                .into_iter()
-                .map(|p| proto::FetchPartitionResponse {
-                    partition: p.partition,
-                    error_code: p.error_code as i32,
-                    high_watermark: p.high_watermark,
-                    last_stable_offset: p.last_stable_offset,
-                    log_start_offset: p.log_start_offset,
-                    record_batches: p
-                        .record_batches
-                        .into_iter()
-                        .map(|b| convert_record_batch(&b))
-                        .collect(),
-                })
-                .collect(),
-        }],
+        responses: topic_order
+            .into_iter()
+            .map(|topic| proto::FetchTopicResponse {
+                partitions: by_topic.remove(&topic).unwrap_or_default(),
+                topic,
+            })
+            .collect(),
     }
 }
 

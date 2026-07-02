@@ -1,9 +1,11 @@
 //! Comprehensive tests for log storage components.
 
+use distributed_log_system::cleaner::{CleanerConfig, LogCompactor, SegmentInfo};
 use distributed_log_system::log::{
     Header, IndexEntry, LogSegment, Partition, Record, RecordBatch, SegmentConfig,
     TimeIndexEntry, TopicPartition,
 };
+use std::time::SystemTime;
 use tempfile::tempdir;
 
 // =============================================================================
@@ -835,4 +837,122 @@ fn test_many_small_records() {
     }
 
     assert_eq!(partition.log_end_offset, 1000);
+}
+
+// =============================================================================
+// Compaction and retention/deletion tests
+// =============================================================================
+
+/// Helper: write one single-record batch per offset into a segment dir.
+fn write_kv_segment(dir: &std::path::Path, entries: &[(u64, &str, Option<&str>)]) {
+    let mut seg = LogSegment::new(dir, 0, SegmentConfig::default()).unwrap();
+    for (offset, key, value) in entries {
+        let batch = RecordBatch::new(
+            *offset,
+            vec![Record {
+                attributes: 0,
+                timestamp_delta: 0,
+                offset_delta: 0,
+                key: Some(key.as_bytes().to_vec()),
+                value: value.map(|v| v.as_bytes().to_vec()),
+                headers: vec![],
+            }],
+        );
+        seg.append(&batch).unwrap();
+    }
+    seg.flush().unwrap();
+}
+
+#[test]
+fn test_compaction_reduces_to_latest_value_per_key() {
+    // A compacted topic with repeated keys must be reduced to the latest value
+    // per key. Candidates must actually be found and compacted (regression for
+    // the empty `get_segment_metadata` / no-op compaction).
+    let data_dir = tempdir().unwrap();
+    let work_dir = tempdir().unwrap();
+
+    // key1 written 3x, key2 written 2x, key3 once -> 6 records, 3 unique keys.
+    write_kv_segment(
+        data_dir.path(),
+        &[
+            (0, "key1", Some("v1a")),
+            (1, "key2", Some("v2a")),
+            (2, "key1", Some("v1b")),
+            (3, "key3", Some("v3")),
+            (4, "key2", Some("v2b")),
+            (5, "key1", Some("v1c")),
+        ],
+    );
+
+    let compactor = LogCompactor::new(
+        CleanerConfig::default(),
+        work_dir.path().to_path_buf(),
+        SegmentConfig::default(),
+    );
+
+    let segments = vec![SegmentInfo {
+        base_offset: 0,
+        size: 1000,
+        last_modified: SystemTime::now(),
+    }];
+
+    let result = compactor.compact(data_dir.path(), &segments).unwrap();
+
+    // Compaction actually ran over the segment.
+    assert_eq!(result.segments_read, 1);
+    // Exactly one surviving record per unique key.
+    assert_eq!(result.records_kept, 3, "expected 3 latest-value records kept");
+    // The three superseded duplicates were removed.
+    assert_eq!(result.records_removed, 3, "expected 3 duplicates removed");
+}
+
+#[test]
+fn test_retention_deletion_reclaims_disk() {
+    // After deleting a segment, its underlying files must no longer exist on
+    // disk (regression for delete_segment not unlinking files).
+    let dir = tempdir().unwrap();
+
+    // Use a tiny max segment size so appends roll into multiple segments.
+    let small = SegmentConfig {
+        max_segment_bytes: 1,
+        index_interval_bytes: 4096,
+    };
+    let mut partition = Partition::new(dir.path(), "retention-topic-2", 0, small).unwrap();
+
+    for i in 0..5 {
+        let batch = RecordBatch::new(
+            0,
+            vec![Record {
+                attributes: 0,
+                timestamp_delta: 0,
+                offset_delta: 0,
+                key: Some(format!("k{}", i).into_bytes()),
+                value: Some(vec![0u8; 64]),
+                headers: vec![],
+            }],
+        );
+        partition.append(batch).unwrap();
+    }
+    partition.flush().unwrap();
+
+    // There must be more than one segment (offset 0 is not active).
+    assert!(partition.segment_count() > 1, "expected multiple segments");
+
+    let meta = partition.segment_metadata();
+    let base = meta[0].base_offset;
+
+    // Files for the oldest segment must exist before deletion.
+    let dir_for_partition = dir.path().join("retention-topic-2").join("0");
+    let log_path = dir_for_partition.join(format!("{:020}.log", base));
+    let index_path = dir_for_partition.join(format!("{:020}.index", base));
+    let time_path = dir_for_partition.join(format!("{:020}.timeindex", base));
+    assert!(log_path.exists(), "log file should exist before deletion");
+
+    // Delete the segment; files must be unlinked from disk.
+    partition.delete_segment(base).unwrap();
+
+    assert!(!log_path.exists(), "log file should be removed from disk");
+    assert!(!index_path.exists(), "index file should be removed from disk");
+    assert!(!time_path.exists(), "timeindex file should be removed from disk");
+    assert_eq!(partition.segment_count(), meta.len() - 1);
 }

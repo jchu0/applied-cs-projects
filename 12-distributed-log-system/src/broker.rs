@@ -227,6 +227,7 @@ impl Broker {
             );
 
             topic_responses.push(crate::protocol::FetchPartitionResponse {
+                topic: partition_req.topic.clone(),
                 partition: partition_req.partition,
                 error_code: 0,
                 high_watermark: partition.high_watermark,

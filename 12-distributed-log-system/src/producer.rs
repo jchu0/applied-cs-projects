@@ -179,6 +179,10 @@ impl RecordAccumulator {
     }
 }
 
+/// Default number of partitions assumed for a topic whose partition count
+/// has not been registered with the producer.
+pub const DEFAULT_PARTITION_COUNT: u32 = 3;
+
 /// Kafka-lite producer.
 pub struct Producer {
     /// Configuration.
@@ -193,6 +197,8 @@ pub struct Producer {
     producer_epoch: i16,
     /// Sequence numbers by partition.
     sequences: HashMap<TopicPartition, u32>,
+    /// Known partition counts per topic (from cluster/topic metadata).
+    partition_counts: HashMap<String, u32>,
 }
 
 impl Producer {
@@ -205,7 +211,29 @@ impl Producer {
             producer_id: -1,
             producer_epoch: -1,
             sequences: HashMap::new(),
+            partition_counts: HashMap::new(),
         }
+    }
+
+    /// Register (or update) the partition count for a topic.
+    ///
+    /// The producer uses this metadata to route keyed and round-robin records
+    /// across the topic's actual partitions. A `count` of 0 is ignored.
+    pub fn set_partition_count(&mut self, topic: impl Into<String>, count: u32) {
+        if count > 0 {
+            self.partition_counts.insert(topic.into(), count);
+        }
+    }
+
+    /// Get the partition count the producer will use for a topic.
+    ///
+    /// Falls back to [`DEFAULT_PARTITION_COUNT`] when the topic's partition
+    /// count has not been registered via [`Producer::set_partition_count`].
+    pub fn partition_count(&self, topic: &str) -> u32 {
+        self.partition_counts
+            .get(topic)
+            .copied()
+            .unwrap_or(DEFAULT_PARTITION_COUNT)
     }
 
     /// Send a record.
@@ -238,15 +266,19 @@ impl Producer {
         Ok(tp)
     }
 
-    /// Determine partition for a record.
+    /// Determine partition for a record using the target topic's actual
+    /// partition count (falling back to [`DEFAULT_PARTITION_COUNT`] when the
+    /// topic's partition count is unknown).
     fn partition_for(&self, record: &ProducerRecord) -> u32 {
+        let num_partitions = self.partition_count(&record.topic);
         if let Some(key) = &record.key {
-            // Hash key to determine partition (simplified)
+            // Hash key modulo the real partition count so keyed records are
+            // routed deterministically across all of the topic's partitions.
             let hash = crc32fast::hash(key);
-            hash % 3 // Assume 3 partitions
+            hash % num_partitions
         } else {
-            // Round-robin
-            self.partition_counter.fetch_add(1, Ordering::Relaxed) % 3
+            // Round-robin across the topic's real partitions.
+            self.partition_counter.fetch_add(1, Ordering::Relaxed) % num_partitions
         }
     }
 

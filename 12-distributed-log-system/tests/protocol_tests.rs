@@ -261,6 +261,7 @@ fn test_fetch_response_success() {
         error_code: 0,
         session_id: 0,
         responses: vec![FetchPartitionResponse {
+            topic: "topic".to_string(),
             partition: 0,
             error_code: 0,
             high_watermark: 1000,
@@ -293,6 +294,7 @@ fn test_fetch_response_with_records() {
         error_code: 0,
         session_id: 0,
         responses: vec![FetchPartitionResponse {
+            topic: "topic".to_string(),
             partition: 0,
             error_code: 0,
             high_watermark: 101,

@@ -304,6 +304,43 @@ fn test_producer_partitioning_by_key() {
     assert_eq!(tp1.partition, tp2.partition);
 }
 
+#[test]
+fn test_producer_routes_keyed_messages_across_n_partitions() {
+    // A topic with N != 3 partitions must have keyed messages routed across
+    // ALL N partitions deterministically (regression for the hardcoded
+    // `hash % 3` partitioner).
+    const N: u32 = 7;
+
+    let mut producer = Producer::new(ProducerConfig::default());
+    producer.set_partition_count("events", N);
+    assert_eq!(producer.partition_count("events"), N);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut assignments = std::collections::HashMap::new();
+
+    for i in 0..500u32 {
+        let key = format!("user-{i}").into_bytes();
+        let record = ProducerRecord::new("events", Some(key.clone()), Some(b"v".to_vec()));
+        let tp = producer.send(record).unwrap();
+
+        // Every partition must be within range for the real partition count.
+        assert!(tp.partition < N, "partition {} out of range", tp.partition);
+        seen.insert(tp.partition);
+
+        // Same key -> same partition (deterministic).
+        let prev = assignments.entry(key).or_insert(tp.partition);
+        assert_eq!(*prev, tp.partition);
+    }
+
+    // Distribution must span all N partitions, proving we no longer assume 3.
+    assert_eq!(
+        seen.len() as u32,
+        N,
+        "expected keys spread across all {N} partitions, saw {:?}",
+        seen
+    );
+}
+
 // =============================================================================
 // ConsumerConfig Tests
 // =============================================================================

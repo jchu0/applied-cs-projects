@@ -113,8 +113,8 @@ for partition in fetched.responses {
 
 ## What's Real vs Simulated
 
-- **Real:** Segmented log append/read with CRC32 verification and sparse memory-mapped-style index lookup; segment rolling; record-batch (de)serialization; partitioning and per-partition high watermark / log-end offset; producer batching and ack levels; consumer offset tracking, seek, and commit; range and round-robin assignors; the group-coordinator join/sync/heartbeat/leave state machine; idempotent sequence checking with epoch fencing and duplicate detection; controller metadata, broker liveness, failover, and leader election; time/size retention and key-based compaction logic; the protocol message types and gRPC transport. These are exercised by 178 test functions across five integration test files (~3,700 lines).
-- **Simulated / incomplete:** Two stubs remain. `LogCleaner::get_segment_metadata` in `cleaner.rs` returns an empty list, so the compaction-candidate scan and `cleanable_ratio` report no work. `ReplicaFetcher::process_fetch_response` in `replication.rs` uses a placeholder empty topic name because `FetchPartitionResponse` does not carry the topic, so the follower catch-up path is simplified. Producer partitioning hashes assume three partitions. Neither stub affects the core produce/consume path.
+- **Real:** Segmented log append/read with CRC32 verification and sparse memory-mapped-style index lookup; segment rolling; record-batch (de)serialization; partitioning that honors each topic's actual partition count (keyed records hash modulo the real count, so the same key always lands on the same partition and the distribution spans every partition); per-partition high watermark / log-end offset; producer batching and ack levels; consumer offset tracking, seek, and commit; range and round-robin assignors; the group-coordinator join/sync/heartbeat/leave state machine; idempotent sequence checking with epoch fencing and duplicate detection; controller metadata, broker liveness, failover, and leader election; time/size retention that unlinks segment files from disk to reclaim space; working key-based compaction that discovers candidate segments from the partition's real segment metadata and reduces each key to its latest value; multi-topic follower fetch (each `FetchPartitionResponse` carries its topic, so a follower can replicate many topics in one fetch); the protocol message types and gRPC transport. These are exercised by 181 test functions across five integration test files.
+- **Simulated / incomplete:** The core produce/consume/retention/compaction paths are real. Compaction currently rewrites survivors into a working directory and reports the results (records kept/removed, bytes freed) but does not yet atomically swap the compacted segments back over the originals in place — the dedup logic and candidate discovery are complete; only the final in-place segment swap is left as a follow-up. Cluster metadata (topics, assignments, group and producer state) is in-memory and does not survive a full process restart, though the partition data on disk is durable.
 
 ## Testing
 
@@ -123,7 +123,7 @@ cargo test
 cargo test -- --nocapture   # with tracing output
 ```
 
-The suite has 178 test functions across `log_tests.rs` (segments, index, retention), `broker_tests.rs` (partitions, ISR, failover), `producer_consumer_tests.rs` (end-to-end produce/consume, assignors), `protocol_tests.rs` (wire encoding), and `integration_tests.rs` (multi-component scenarios), plus unit tests inside `log.rs` and `consumer.rs`. No external services are required; storage uses `tempfile`.
+The suite has 181 integration test functions across `log_tests.rs` (segments, index, retention, deletion, compaction), `broker_tests.rs` (partitions, ISR, failover), `producer_consumer_tests.rs` (end-to-end produce/consume, partitioning across N partitions, assignors), `protocol_tests.rs` (wire encoding), and `integration_tests.rs` (multi-component scenarios), plus 47 unit tests inside the library modules (228 total). No external services are required; storage uses `tempfile`.
 
 ## Project Structure
 
@@ -142,7 +142,7 @@ The suite has 178 test functions across `log_tests.rs` (segments, index, retenti
     cleaner.rs       # retention and compaction
     protocol.rs      # request/response wire types
     transport.rs     # Tokio TCP and tonic/gRPC transport
-  tests/             # 178 test functions across 5 files (~3,700 lines)
+  tests/             # 181 integration test functions across 5 files
   benches/kafka_benchmarks.rs   # Criterion throughput benchmarks
   proto/kafka.proto             # Protobuf definitions (tonic/gRPC)
   docs/BLUEPRINT.md             # full architecture and design

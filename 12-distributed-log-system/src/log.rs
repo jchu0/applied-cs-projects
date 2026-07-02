@@ -374,6 +374,30 @@ impl LogSegment {
         self.time_index_file.sync_all()?;
         Ok(())
     }
+
+    /// Paths of the on-disk files backing this segment (log, index, timeindex).
+    pub fn file_paths(&self) -> [PathBuf; 3] {
+        [
+            self.dir.join(format!("{:020}.log", self.base_offset)),
+            self.dir.join(format!("{:020}.index", self.base_offset)),
+            self.dir.join(format!("{:020}.timeindex", self.base_offset)),
+        ]
+    }
+
+    /// Remove the segment's underlying files from disk, reclaiming space.
+    ///
+    /// Missing files are tolerated (already gone); any other I/O error is
+    /// propagated so callers can surface a real failure.
+    pub fn delete_files(&self) -> Result<()> {
+        for path in self.file_paths() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A partition (ordered log for a topic).
@@ -511,12 +535,62 @@ impl Partition {
         Ok(())
     }
 
-    /// Delete old segments for retention.
+    /// Delete a segment for retention, reclaiming its disk space.
+    ///
+    /// Removes the segment from the in-memory map and unlinks its underlying
+    /// log, index, and time-index files from disk.
     pub fn delete_segment(&mut self, base_offset: Offset) -> Result<()> {
-        self.segments.remove(&base_offset);
-        // Would also delete files in real implementation
-        Ok(())
+        match self.segments.remove(&base_offset) {
+            Some(segment) => segment.delete_files(),
+            None => Ok(()),
+        }
     }
+
+    /// Number of segments currently held by this partition.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Metadata for every segment in this partition, ordered by base offset.
+    ///
+    /// Exposes the per-segment information the log cleaner needs to make
+    /// retention and compaction decisions.
+    pub fn segment_metadata(&self) -> Vec<SegmentMetadataInfo> {
+        self.segments
+            .iter()
+            .map(|(&base_offset, segment)| {
+                let last_modified_ms = segment
+                    .file_paths()
+                    .iter()
+                    .filter_map(|p| std::fs::metadata(p).ok())
+                    .filter_map(|m| m.modified().ok())
+                    .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .max()
+                    .unwrap_or(0);
+
+                SegmentMetadataInfo {
+                    base_offset,
+                    size: segment.size(),
+                    last_modified_ms,
+                    max_timestamp: segment.max_timestamp,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Per-segment metadata surfaced by [`Partition::segment_metadata`].
+#[derive(Debug, Clone)]
+pub struct SegmentMetadataInfo {
+    /// Base offset of the segment.
+    pub base_offset: Offset,
+    /// Current size in bytes.
+    pub size: u64,
+    /// Last-modified time of the segment files (epoch ms).
+    pub last_modified_ms: u64,
+    /// Maximum timestamp observed in the segment.
+    pub max_timestamp: Timestamp,
 }
 
 #[cfg(test)]

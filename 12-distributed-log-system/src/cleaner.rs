@@ -205,11 +205,42 @@ impl LogCleaner {
     }
 
     /// Get metadata for all segments in a partition.
+    ///
+    /// Reads the real per-segment metadata from the partition so retention and
+    /// compaction can actually discover candidate segments.
     fn get_segment_metadata(&self, partition: &Partition) -> Result<Vec<SegmentMetadata>> {
-        // This would query the partition for its segments
-        // For now, return an empty list as a placeholder
-        // In a real implementation, this would iterate over partition.segments
-        Ok(Vec::new())
+        Ok(partition
+            .segment_metadata()
+            .into_iter()
+            .map(|info| SegmentMetadata {
+                base_offset: info.base_offset,
+                size: info.size,
+                last_modified_ms: info.last_modified_ms,
+                max_timestamp: info.max_timestamp,
+                record_count: 0,
+                cleanable_bytes: 0,
+            })
+            .collect())
+    }
+
+    /// Build [`SegmentInfo`] descriptors for the non-active segments of a
+    /// partition, suitable for feeding to [`LogCompactor::compact`].
+    ///
+    /// The active (last) segment is excluded because it is still being written.
+    pub fn compaction_candidates(&self, partition: &Partition) -> Vec<SegmentInfo> {
+        let metadata = partition.segment_metadata();
+        let active_base = metadata.last().map(|m| m.base_offset);
+
+        metadata
+            .into_iter()
+            .filter(|m| Some(m.base_offset) != active_base)
+            .map(|m| SegmentInfo {
+                base_offset: m.base_offset,
+                size: m.size,
+                last_modified: SystemTime::UNIX_EPOCH
+                    + Duration::from_millis(m.last_modified_ms),
+            })
+            .collect()
     }
 
     /// Calculate cleanable ratio for a partition.
@@ -420,10 +451,9 @@ impl LogCompactor {
                                         true
                                     }
                                 }
-                                _ => {
-                                    result.records_removed += 1;
-                                    false
-                                }
+                                // Superseded by a later value for this key;
+                                // removal is accounted for once below.
+                                _ => false,
                             }
                         }
                         None => {

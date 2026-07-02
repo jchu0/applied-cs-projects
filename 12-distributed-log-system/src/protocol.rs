@@ -107,6 +107,11 @@ pub struct FetchResponse {
 /// Fetch response for a partition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchPartitionResponse {
+    /// Topic this partition response belongs to.
+    ///
+    /// Carried explicitly so a follower can correctly route each response when
+    /// a single fetch spans multiple topics.
+    pub topic: String,
     pub partition: u32,
     pub error_code: i16,
     pub high_watermark: Offset,
