@@ -4,7 +4,7 @@ JWT authentication for the SaaS platform.
 import jwt
 import hashlib
 import secrets
-from datetime import datetime, timedelta
+from datetime import timedelta
 from django.conf import settings
 from django.utils import timezone
 from rest_framework import authentication, exceptions
@@ -32,11 +32,17 @@ def create_jwt_token(user, expires_in_hours=None):
     """Create a JWT token for a user."""
     if expires_in_hours is None:
         expires_in_hours = getattr(settings, 'JWT_EXPIRATION_HOURS', 24)
+    now = timezone.now()
     payload = {
         'user_id': str(user.id),
         'email': user.email,
-        'exp': datetime.utcnow() + timedelta(hours=expires_in_hours),
-        'iat': datetime.utcnow(),
+        'exp': now + timedelta(hours=expires_in_hours),
+        'iat': now,
+        # Unique token identifier. ``iat`` only has second granularity, so two
+        # tokens minted for the same user within the same second would
+        # otherwise be byte-for-byte identical. A random jti guarantees every
+        # issued token (e.g. concurrent logins) is distinct.
+        'jti': secrets.token_urlsafe(16),
     }
     algorithm = getattr(settings, 'JWT_ALGORITHM', 'HS256')
     return jwt.encode(payload, _jwt_secret(), algorithm=algorithm)
@@ -85,6 +91,18 @@ class JWTAuthentication(authentication.BaseAuthentication):
             raise exceptions.AuthenticationFailed('User account is disabled')
 
         return (user, token)
+
+    def authenticate_header(self, request):
+        """Return the ``WWW-Authenticate`` header value for 401 responses.
+
+        DRF decides between ``401 Unauthorized`` and ``403 Forbidden`` for an
+        unauthenticated request based on whether the *first* authentication
+        class exposes an auth header. Returning one here ensures anonymous
+        access to protected endpoints yields a semantically correct 401 for
+        this token-based API (rather than the 403 that ``SessionAuthentication``
+        would produce).
+        """
+        return 'Bearer'
 
 
 class APIKeyAuthentication(authentication.BaseAuthentication):

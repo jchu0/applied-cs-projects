@@ -133,7 +133,14 @@ class TaskScheduler:
         return True
 
     def retry_task(self, task: ScheduledTask) -> Optional[TaskExecution]:
-        """Retry a failed task."""
+        """Retry a failed task.
+
+        Increments the retry counter and re-submits the task. ``run_task``
+        creates a fresh execution (which is legitimately ``RUNNING``) but also
+        flips the *parent* task's status to ``RUNNING``; we restore ``RETRYING``
+        afterwards so the task record reflects that it is being retried rather
+        than running for the first time.
+        """
         if task.retry_count >= task.max_retries:
             logger.warning(f"Task {task.name} exceeded max retries")
             return None
@@ -142,7 +149,16 @@ class TaskScheduler:
         task.status = TaskStatus.RETRYING
         task.save()
 
-        return self.run_task(task)
+        execution = self.run_task(task)
+
+        # ``run_task`` set the task status to RUNNING for a normal run; for a
+        # retry the task should remain marked RETRYING. Only override when the
+        # submission succeeded (a failed submission correctly leaves it FAILED).
+        if execution is not None and execution.status != TaskStatus.FAILED:
+            task.status = TaskStatus.RETRYING
+            task.save(update_fields=['status'])
+
+        return execution
 
     def get_pending_tasks(self, limit: int = 100) -> List[ScheduledTask]:
         """Get tasks that are due to run."""

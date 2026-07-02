@@ -112,9 +112,13 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # REST Framework
 REST_FRAMEWORK = {
+    # JWTAuthentication is listed first so DRF uses its ``authenticate_header``
+    # (``Bearer``) when no credentials are supplied, yielding a semantically
+    # correct 401 for this token-based API. SessionAuthentication returns no
+    # auth header and would otherwise cause anonymous requests to 403.
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.SessionAuthentication',
         'apps.users.authentication.JWTAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',

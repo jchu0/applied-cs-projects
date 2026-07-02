@@ -2,6 +2,7 @@
 
 from rest_framework import serializers
 from .models import ScheduledTask, TaskExecution, TaskQueue, CronSchedule
+from .services import TaskScheduler
 
 
 class TaskExecutionSerializer(serializers.ModelSerializer):
@@ -88,8 +89,6 @@ class ScheduledTaskCreateSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
-        from .services import TaskScheduler
-
         run_at = validated_data.pop('run_at', None)
         request = self.context.get('request')
         tenant = getattr(request, 'tenant', None) if request else None
