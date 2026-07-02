@@ -21,6 +21,9 @@ from .inference import (
     QuantizedModel,
     QuantizedEngine,
     KVCache,
+    GenerationConfig,
+    LegacyQuantizedModel,
+    InferenceEngine,
 )
 from .calibration import (
     Calibrator,
@@ -57,6 +60,9 @@ __all__ = [
     "QuantizedModel",
     "QuantizedEngine",
     "KVCache",
+    "GenerationConfig",
+    "LegacyQuantizedModel",
+    "InferenceEngine",
     # Calibration
     "Calibrator",
     "MinMaxCalibrator",

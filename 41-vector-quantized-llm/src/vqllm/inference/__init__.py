@@ -5,6 +5,8 @@ from .engine import (
     QuantizedEngine,
     KVCache,
     GenerationConfig,
+    LegacyQuantizedModel,
+    InferenceEngine,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "QuantizedEngine",
     "KVCache",
     "GenerationConfig",
+    "LegacyQuantizedModel",
+    "InferenceEngine",
 ]

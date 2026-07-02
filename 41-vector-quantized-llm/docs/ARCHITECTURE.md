@@ -9,7 +9,7 @@ The Vector Quantized LLM project provides a high-performance quantization framew
 ```mermaid
 flowchart TD
     API["User API"]
-    Inference["Inference Engine<br/>Batched Inference · KV Cache Management · Memory Manager"]
+    Inference["Inference Engine<br/>Batched Inference · KV Cache · Sampling"]
     Quant["Quantization Layer<br/>INT8 · INT4 · GPTQ · AWQ Quantizers"]
     Calib["Calibration Layer<br/>Dataset Loader · Hessian Calculator · Activation Collector"]
     Core["Core Types<br/>Quantized Tensor · Quant Config · Tensor Operations"]
@@ -92,40 +92,37 @@ The inference engine provides optimized execution for quantized models:
 
 #### Key Features:
 
-**Batched Inference**
-- Dynamic batching for throughput optimization
-- Continuous batching with variable sequence lengths
-- Priority-based request scheduling
+**Batched Inference** (`BatchedInference`)
+- Priority-based request scheduling via a `heapq` max-heap (negative priority, insertion-order
+  tiebreak)
+- Padded batch construction with an attention mask (`create_padded_batch`)
+- Continuous-batching-style helpers (`create_batch`, `get_next_batch_ids`,
+  `should_process_batch`)
 
-**KV Cache Management**
+**KV Cache Management** (`KVCache` / `LegacyKVCache`)
 - Efficient key-value caching for autoregressive generation
-- Memory-mapped cache for large models
-- Cache reuse across batches
+- Pre-allocated cache arrays reused across generations via `reset()` / `clear()`
+- `memory_usage()` reports the cache byte footprint
 
-**Memory Management**
-- Memory pool allocation
-- Tensor aliasing for reduced memory usage
-- Automatic garbage collection
+**Generation** (`QuantizedEngine.generate`)
+- Autoregressive loop that processes the prompt, then feeds one token at a time
+- Temperature, top-k, and nucleus (top-p) sampling, plus greedy decoding
 
 ### 4. Optimization Techniques
 
-#### Kernel Fusion
-Combines multiple operations into single kernels:
-```
-Quantize → MatMul → Dequantize → Add
-          ↓
-    Fused_Quant_MatMul_Add
-```
+Note: `QuantizedLinear` dequantizes weights to FP32 and uses a plain NumPy matmul — there are no
+fused low-bit kernels. The optimizations below are the ones actually implemented.
 
 #### Graph Optimization
-Removes redundant operations:
+`optimize_inference(graph)` removes redundant `dequantize → quantize` pairs from a small
+dict-based graph representation:
 ```
 Before: Dequantize → Quantize → Operation
-After:  Operation (direct on quantized tensors)
+After:  Operation
 ```
 
 #### Weight Packing
-Efficient storage for INT4 weights:
+Efficient storage for INT4 weights via `pack_int4` / `unpack_int4` (two 4-bit values per byte):
 ```
 Original: [4, 7, -3, 2] (4 bytes as INT8)
 Packed:   [0x47, 0xD2] (2 bytes, 2 INT4s per byte)
@@ -213,34 +210,46 @@ Compression: ~7-8x
 
 ### Adding New Quantization Methods
 
-1. Implement the `Quantizer` base class:
+1. Subclass the `Quantizer` base class (in `quantize/quantizers.py`) and implement its abstract
+   `quantize_weight` method, returning a `QuantizedTensor`:
 ```python
+from vqllm.quantize import Quantizer
+from vqllm import QuantizedTensor
+
 class NewQuantizer(Quantizer):
-    def quantize_weight(self, weight, name):
+    def quantize_weight(self, weight, name="") -> QuantizedTensor:
         # Implementation
-        pass
+        ...
 ```
 
-2. Add calibration support if needed
-3. Implement optimized kernels
-4. Register in the quantizer factory
+2. Add calibration support if needed (see `calibration/calibrate.py`)
+3. Instantiate the quantizer directly with a `QuantConfig` and call `quantize_weight` — there is
+   no registry or factory; quantizers are plain classes constructed at the call site.
 
-### Custom Optimization Passes
+### Graph Optimization Helper
 
-The system supports custom optimization passes:
+The inference module ships a standalone `optimize_inference(graph)` helper that walks a small
+dict-based graph representation and removes redundant `dequantize → quantize` pairs that cancel
+out:
+
 ```python
-def custom_optimization(graph):
-    # Modify computation graph
-    return optimized_graph
+from vqllm.inference.engine import optimize_inference
 
-engine.register_optimization(custom_optimization)
+optimized = optimize_inference(graph)
 ```
+
+There is no plugin/registry mechanism — optimization is applied by calling this function
+directly on a graph.
 
 ## Configuration
 
 ### Quantization Configuration
 
+`QuantConfig` (in `core/types.py`) carries the quantization parameters:
+
 ```python
+from vqllm import QuantConfig, QuantType, ScaleType
+
 config = QuantConfig(
     quant_type=QuantType.GPTQ,
     bits=4,
@@ -249,22 +258,31 @@ config = QuantConfig(
     dampening=0.01,
     scale_type=ScaleType.PER_GROUP,
     zero_point=True,
-    symmetric=False
+    symmetric=False,
 )
 ```
 
-### Inference Configuration
+### Generation Configuration
+
+Inference-time behavior is controlled by the `GenerationConfig` dataclass (in
+`inference/engine.py`), which the `QuantizedEngine.generate` loop consumes:
 
 ```python
-inference_config = {
-    "batch_size": 8,
-    "max_seq_length": 2048,
-    "use_kv_cache": True,
-    "memory_pool_size": "16GB",
-    "optimization_level": 2,
-    "device": "cuda"
-}
+from vqllm import GenerationConfig
+
+gen_config = GenerationConfig(
+    max_length=100,
+    temperature=1.0,
+    top_k=50,
+    top_p=0.9,
+    do_sample=True,
+    num_beams=1,
+    repetition_penalty=1.0,
+)
 ```
+
+Everything runs single-process on CPU with NumPy; there is no device, memory-pool, or CUDA
+configuration.
 
 ## Best Practices
 
@@ -287,28 +305,31 @@ inference_config = {
 
 ## Monitoring and Debugging
 
-### Metrics Collection
+### Benchmarking
 
-The system provides comprehensive metrics:
-- Quantization error rates
-- Inference latency percentiles
-- Memory usage statistics
-- Cache hit rates
-- Throughput measurements
+The inference module exposes two benchmarking helpers (in `inference/engine.py`):
+
+- `benchmark_latency(model, input_data, num_runs=100, warmup=10)` — a free function that runs
+  warmup and timed forward passes and returns a latency summary
+  (`mean/std/min/max/p50/p95/p99`, in milliseconds).
+- `QuantizedEngine.benchmark(input_ids, num_tokens=100)` — times greedy generation and returns
+  `total_time_s`, `tokens_generated`, `tokens_per_second`, and `ms_per_token`.
+
+```python
+from vqllm.inference.engine import benchmark_latency
+
+stats = benchmark_latency(model, input_data, num_runs=100, warmup=10)
+print(stats["p95"])
+```
+
+`KVCache.memory_usage()` reports the cache's byte footprint. There is no built-in profiler,
+metrics collector, or cache-hit tracking beyond these helpers.
 
 ### Debug Mode
 
-Enable detailed logging:
+The modules log through the standard library `logging` package, so detailed logging can be
+enabled with:
 ```python
 import logging
 logging.basicConfig(level=logging.DEBUG)
-```
-
-### Profiling Support
-
-Built-in profiling capabilities:
-```python
-with profiler.profile() as prof:
-    output = engine.forward(input)
-prof.print_stats()
 ```
