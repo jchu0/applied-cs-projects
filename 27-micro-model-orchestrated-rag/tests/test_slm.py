@@ -30,7 +30,7 @@ try:
 except ImportError:
     _HAS_TORCH = False
 
-pytestmark = pytest.mark.skipif(not _HAS_TORCH, reason="Requires torch")
+pytestmark = pytest.mark.skipif(not _HAS_TORCH, reason="Requires ML extras (transformers)")
 
 
 # ============================================================================

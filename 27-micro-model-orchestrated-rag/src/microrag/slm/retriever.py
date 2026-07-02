@@ -2,12 +2,28 @@
 
 from typing import Optional, List, Dict
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
-import faiss
 
-from .base import BaseSLM, GenerativeModelMixin, EmbeddingModelMixin, logger
+from .base import (
+    BaseSLM,
+    GenerativeModelMixin,
+    EmbeddingModelMixin,
+    logger,
+    require_torch,
+    require_sentence_transformers,
+)
 from ..schemas import RetrievalResult, RoutingDecision, Document
+
+
+def __getattr__(name):
+    """Lazily resolve heavy deps so mock/offline imports don't require them."""
+    if name == "torch":
+        return require_torch()
+    if name == "faiss":
+        import faiss
+        return faiss
+    if name == "SentenceTransformer":
+        return require_sentence_transformers()[0]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class RetrieverSLM(BaseSLM, GenerativeModelMixin, EmbeddingModelMixin):

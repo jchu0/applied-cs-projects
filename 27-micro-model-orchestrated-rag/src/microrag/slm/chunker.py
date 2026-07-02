@@ -3,12 +3,22 @@
 from typing import Optional, List
 import re
 import numpy as np
-import torch
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
 
-from .base import BaseSLM, EmbeddingModelMixin, GenerativeModelMixin, logger
+from .base import (
+    BaseSLM,
+    EmbeddingModelMixin,
+    GenerativeModelMixin,
+    logger,
+    require_torch,
+)
 from ..schemas import Chunk
+
+
+def __getattr__(name):
+    """Lazily resolve ``torch`` so mock/offline imports don't require it."""
+    if name == "torch":
+        return require_torch()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class ChunkerSLM(BaseSLM, EmbeddingModelMixin, GenerativeModelMixin):
@@ -126,6 +136,7 @@ class ChunkerSLM(BaseSLM, EmbeddingModelMixin, GenerativeModelMixin):
         original_text: str
     ) -> List[Chunk]:
         """Create chunks based on semantic similarity."""
+        from sklearn.metrics.pairwise import cosine_similarity
         chunks = []
         current_chunk = []
         current_chunk_embedding = None
@@ -265,6 +276,7 @@ Category:"""
 
     async def _compute_semantic_coherence(self, content: str) -> float:
         """Compute semantic coherence score for a chunk."""
+        from sklearn.metrics.pairwise import cosine_similarity
         if not content:
             return 0.0
 

@@ -253,21 +253,15 @@ class TestDynamicComputationGraph:
             dependencies=[]
         )
 
-        quality = asyncio.get_event_loop().run_until_complete(
-            graph._compute_quality(node, None)
-        )
+        quality = asyncio.run(graph._compute_quality(node, None))
         assert quality == 0.0
 
         # Test with empty list
-        quality = asyncio.get_event_loop().run_until_complete(
-            graph._compute_quality(node, [])
-        )
+        quality = asyncio.run(graph._compute_quality(node, []))
         assert quality == 0.0
 
         # Test with valid output
-        quality = asyncio.get_event_loop().run_until_complete(
-            graph._compute_quality(node, {"result": "value"})
-        )
+        quality = asyncio.run(graph._compute_quality(node, {"result": "value"}))
         assert quality == 0.8  # Default quality
 
 

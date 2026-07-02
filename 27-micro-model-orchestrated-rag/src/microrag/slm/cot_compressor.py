@@ -1,10 +1,16 @@
 """Chain-of-Thought Compressor SLM for reasoning distillation."""
 
 from typing import List, Optional
-import torch
 import re
 
-from .base import BaseSLM, GenerativeModelMixin, logger
+from .base import BaseSLM, GenerativeModelMixin, logger, require_torch
+
+
+def __getattr__(name):
+    """Lazily resolve ``torch`` so mock/offline imports don't require it."""
+    if name == "torch":
+        return require_torch()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class CoTCompressorSLM(BaseSLM, GenerativeModelMixin):

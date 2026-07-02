@@ -2,11 +2,19 @@
 
 import numpy as np
 from typing import List, Optional
-import torch
-from sklearn.metrics.pairwise import cosine_similarity
 
-from .base import BaseSLM, GenerativeModelMixin, EmbeddingModelMixin, logger
+from .base import BaseSLM, GenerativeModelMixin, EmbeddingModelMixin, logger, require_torch
 from ..schemas import StabilizedAnswer
+
+
+def __getattr__(name):
+    """Lazily resolve heavy deps so mock/offline imports don't require them."""
+    if name == "torch":
+        return require_torch()
+    if name == "cosine_similarity":
+        from sklearn.metrics.pairwise import cosine_similarity
+        return cosine_similarity
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class AnswerStabilizerSLM(BaseSLM, GenerativeModelMixin, EmbeddingModelMixin):

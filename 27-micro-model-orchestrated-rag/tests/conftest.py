@@ -231,13 +231,13 @@ def sample_stabilized_answer():
 # Registry Fixtures
 # ============================================================================
 
-requires_torch = pytest.mark.skipif(not _HAS_TORCH, reason="Requires torch")
+requires_torch = pytest.mark.skipif(not _HAS_TORCH, reason="Requires ML extras (transformers)")
 
 @pytest.fixture
 def mock_registry():
     """Create a component registry with mock SLMs."""
     if not _HAS_TORCH:
-        pytest.skip("Requires torch")
+        pytest.skip("Requires ML extras (transformers)")
     registry = ComponentRegistry()
 
     # Register mock components
@@ -256,7 +256,7 @@ def mock_registry():
 def empty_registry():
     """Create an empty component registry."""
     if not _HAS_TORCH:
-        pytest.skip("Requires torch")
+        pytest.skip("Requires ML extras (transformers)")
     return ComponentRegistry()
 
 
@@ -308,7 +308,7 @@ def indexing_graph(mock_registry):
 def in_memory_exporter():
     """Create an in-memory trace exporter for testing."""
     if not _HAS_TORCH:
-        pytest.skip("Requires torch")
+        pytest.skip("Requires ML extras (transformers)")
     return InMemoryExporter()
 
 
@@ -316,7 +316,7 @@ def in_memory_exporter():
 def tracer(in_memory_exporter):
     """Create a pipeline tracer with in-memory exporter."""
     if not _HAS_TORCH:
-        pytest.skip("Requires torch")
+        pytest.skip("Requires ML extras (transformers)")
     return PipelineTracer(exporter=in_memory_exporter)
 
 
@@ -328,7 +328,7 @@ def tracer(in_memory_exporter):
 def guardrail_engine():
     """Create a guardrail engine with default rules."""
     if not _HAS_TORCH:
-        pytest.skip("Requires torch")
+        pytest.skip("Requires ML extras (transformers)")
     return GuardrailEngine([
         RelevanceGuardrail(min_relevance=0.3),
         ConfidenceGuardrail(min_confidence=0.5),
@@ -339,7 +339,7 @@ def guardrail_engine():
 def strict_guardrail_engine():
     """Create a guardrail engine with strict rules."""
     if not _HAS_TORCH:
-        pytest.skip("Requires torch")
+        pytest.skip("Requires ML extras (transformers)")
     return GuardrailEngine([
         RelevanceGuardrail(min_relevance=0.7),
         ConfidenceGuardrail(min_confidence=0.8),
@@ -356,7 +356,7 @@ def strict_guardrail_engine():
 def mock_pipeline():
     """Create a pipeline with mock SLMs."""
     if not _HAS_TORCH:
-        pytest.skip("Requires torch")
+        pytest.skip("Requires ML extras (transformers)")
     return create_pipeline(use_mock=True, use_guardrails=True)
 
 
@@ -364,7 +364,7 @@ def mock_pipeline():
 def mock_pipeline_no_guardrails():
     """Create a pipeline with mock SLMs and no guardrails."""
     if not _HAS_TORCH:
-        pytest.skip("Requires torch")
+        pytest.skip("Requires ML extras (transformers)")
     return create_pipeline(use_mock=True, use_guardrails=False)
 
 

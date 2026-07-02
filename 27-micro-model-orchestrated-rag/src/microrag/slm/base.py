@@ -3,26 +3,78 @@
 import os
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Union
-import torch
-from transformers import (
-    AutoTokenizer,
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
-    logging as transformers_logging
-)
-from sentence_transformers import SentenceTransformer, CrossEncoder
 import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Suppress excessive warnings from transformers
-transformers_logging.set_verbosity_error()
-
 # Set default cache directory for models
 CACHE_DIR = os.environ.get('TRANSFORMERS_CACHE', './model_cache')
+
+
+# ---------------------------------------------------------------------------
+# Lazy ML imports
+# ---------------------------------------------------------------------------
+# torch / transformers / sentence-transformers are heavy, optional ("ml
+# extras") dependencies. Importing them at module load time breaks the
+# advertised offline/mock path (``create_pipeline(use_mock=True)``) in any
+# environment where they are not installed. We therefore import them lazily,
+# only inside the code paths that actually need a real model. The Mock* SLMs,
+# the orchestrator, and the package import all work without these installed.
+
+_ML_HINT = (
+    "This feature requires the optional ML dependencies (torch, transformers, "
+    "sentence-transformers). Install the project's 'ml' extras, e.g. "
+    "`pip install -e .[ml]`, to use the real (non-mock) SLMs."
+)
+
+
+def require_torch():
+    """Import and return the ``torch`` module, or raise a clear ImportError."""
+    try:
+        import torch
+        return torch
+    except ImportError as e:  # pragma: no cover - exercised only without ml extras
+        raise ImportError(f"{_ML_HINT} (missing: torch)") from e
+
+
+def require_transformers():
+    """Import and return key ``transformers`` symbols, raising a clear error."""
+    try:
+        from transformers import (
+            AutoTokenizer,
+            AutoModel,
+            AutoModelForCausalLM,
+            AutoModelForSequenceClassification,
+            logging as transformers_logging,
+        )
+        # Suppress excessive warnings from transformers
+        transformers_logging.set_verbosity_error()
+        return {
+            "AutoTokenizer": AutoTokenizer,
+            "AutoModel": AutoModel,
+            "AutoModelForCausalLM": AutoModelForCausalLM,
+            "AutoModelForSequenceClassification": AutoModelForSequenceClassification,
+        }
+    except ImportError as e:  # pragma: no cover - exercised only without ml extras
+        raise ImportError(f"{_ML_HINT} (missing: transformers)") from e
+
+
+def require_sentence_transformers():
+    """Import and return ``SentenceTransformer``/``CrossEncoder`` lazily."""
+    try:
+        from sentence_transformers import SentenceTransformer, CrossEncoder
+        return SentenceTransformer, CrossEncoder
+    except ImportError as e:  # pragma: no cover - exercised only without ml extras
+        raise ImportError(f"{_ML_HINT} (missing: sentence-transformers)") from e
+
+
+def __getattr__(name):
+    """Lazily expose ``torch`` at module level for ``base.torch`` references."""
+    if name == "torch":
+        return require_torch()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class BaseSLM(ABC):
@@ -40,8 +92,17 @@ class BaseSLM(ABC):
         self.tokenizer = None
         self.device = self._get_device()
 
-    def _get_device(self) -> torch.device:
-        """Get the best available device (GPU if available, else CPU)."""
+    def _get_device(self):
+        """Get the best available device (GPU if available, else CPU).
+
+        Returns a ``torch.device`` when torch is installed. When torch is
+        absent (mock/offline path), returns ``None`` so that Mock* SLMs can be
+        constructed without the optional ML dependencies.
+        """
+        try:
+            torch = require_torch()
+        except ImportError:
+            return None
         if torch.cuda.is_available():
             return torch.device("cuda")
         elif torch.backends.mps.is_available():
@@ -85,6 +146,7 @@ class BaseSLM(ABC):
             if hasattr(self, 'tokenizer') and self.tokenizer is not None:
                 del self.tokenizer
                 self.tokenizer = None
+            torch = require_torch()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             self._loaded = False
@@ -135,6 +197,8 @@ class BaseSLM(ABC):
         Returns:
             Generated text
         """
+        torch = require_torch()
+        AutoModelForCausalLM = require_transformers()["AutoModelForCausalLM"]
         if not isinstance(self.model, type(AutoModelForCausalLM)):
             raise RuntimeError(f"Model {self.model_name} is not a text generation model")
 
@@ -160,6 +224,7 @@ class EmbeddingModelMixin:
 
     def _load_embedding_model(self, model_name: str):
         """Load a sentence transformer model for embeddings."""
+        SentenceTransformer, _ = require_sentence_transformers()
         try:
             self.model = SentenceTransformer(model_name, cache_folder=CACHE_DIR)
             self.model.to(self.device)
@@ -178,6 +243,7 @@ class CrossEncoderMixin:
 
     def _load_cross_encoder(self, model_name: str):
         """Load a cross-encoder model for reranking."""
+        _, CrossEncoder = require_sentence_transformers()
         try:
             self.model = CrossEncoder(model_name, max_length=512)
             logger.info(f"Loaded cross-encoder model: {model_name}")
@@ -194,6 +260,10 @@ class GenerativeModelMixin:
 
     def _load_generative_model(self, model_name: str, load_in_8bit: bool = False):
         """Load a generative language model."""
+        torch = require_torch()
+        _tf = require_transformers()
+        AutoTokenizer = _tf["AutoTokenizer"]
+        AutoModelForCausalLM = _tf["AutoModelForCausalLM"]
         try:
             # For smaller models, we can use standard loading
             model_kwargs = {

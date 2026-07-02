@@ -2,11 +2,25 @@
 
 from typing import List, Optional
 import numpy as np
-import torch
-from sentence_transformers import CrossEncoder
 
-from .base import BaseSLM, CrossEncoderMixin, GenerativeModelMixin, logger
+from .base import (
+    BaseSLM,
+    CrossEncoderMixin,
+    GenerativeModelMixin,
+    logger,
+    require_torch,
+    require_sentence_transformers,
+)
 from ..schemas import RetrievalResult, RerankResult
+
+
+def __getattr__(name):
+    """Lazily resolve heavy deps so mock/offline imports don't require them."""
+    if name == "torch":
+        return require_torch()
+    if name == "CrossEncoder":
+        return require_sentence_transformers()[1]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class RerankerSLM(BaseSLM, CrossEncoderMixin, GenerativeModelMixin):

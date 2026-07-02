@@ -2,10 +2,15 @@
 
 import numpy as np
 from typing import Optional, List, Union
-import torch
-from sentence_transformers import SentenceTransformer
 
-from .base import BaseSLM, EmbeddingModelMixin, logger
+from .base import BaseSLM, EmbeddingModelMixin, logger, require_torch
+
+
+def __getattr__(name):
+    """Lazily resolve ``torch`` so mock/offline imports don't require it."""
+    if name == "torch":
+        return require_torch()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class EmbedderSLM(BaseSLM, EmbeddingModelMixin):
