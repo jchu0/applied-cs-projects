@@ -746,7 +746,7 @@ directly from the block layouts and array shapes.
 
 ## Testing Strategy
 
-The suite (231 tests) uses `MockGGUFLoader` and small `ModelConfig` fixtures so the entire
+The suite (262 tests) uses `MockGGUFLoader` and small `ModelConfig` fixtures so the entire
 pipeline runs on CPU with NumPy and no external assets. `conftest.py` defines a `tiny_config`
 (vocab 256, hidden 64, 2 layers, 4 heads, max sequence 32) so a full `generate` runs in
 milliseconds:

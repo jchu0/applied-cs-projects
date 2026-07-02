@@ -144,8 +144,9 @@ print(dtype, mae, max_err)
 pytest tests/ -v
 ```
 
-The suite has 231 tests across quantization, operators, memory/KV cache, inference, backends,
-NPU, and speculative decoding. All tests run on CPU with NumPy and the synthetic loader; no
+The suite has 262 tests across quantization, operators, memory/KV cache, GGUF loading,
+inference, backends, NPU, and speculative decoding. All tests run on CPU with NumPy and the
+synthetic loader; no
 model file, GPU, or NPU hardware is required. Numba, CuPy, MLX, and kompute are optional and
 their backends are skipped when the library is absent.
 
@@ -165,7 +166,7 @@ their backends are skipped when the library is absent.
     backend.py                  # ComputeBackend and implementations
     npu.py                      # Int8 tensors and NPU backends
     speculative.py              # Speculative / self-speculative / lookahead
-  tests/                        # 231 tests (pytest)
+  tests/                        # 262 tests (pytest)
   docs/BLUEPRINT.md             # Full architecture and design
 ```
 

@@ -354,6 +354,13 @@ class TensorCache:
         """
         tensor_bytes = tensor.nbytes
 
+        # If the key already exists, drop the old entry first so byte
+        # accounting and access order stay consistent (treat as an update).
+        if key in self._cache:
+            self._total_bytes -= self._cache[key].nbytes
+            self._access_order.remove(key)
+            del self._cache[key]
+
         # Evict if necessary
         while len(self._cache) >= self.max_entries:
             self._evict_oldest()
