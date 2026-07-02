@@ -150,6 +150,34 @@ pub fn init() {
     *SCHEDULER.lock() = Some(scheduler);
 }
 
+/// Run the scheduler.
+///
+/// Performs the initial schedule, switching to the first ready process
+/// (normally init, which runs its main loop in kernel mode). Never returns:
+/// if no process is runnable, idles with `hlt` until an interrupt arrives.
+pub fn run() -> ! {
+    // Pick the first ready process (init) as the current process.
+    let scheduled = {
+        let mut guard = SCHEDULER.lock();
+        if let Some(scheduler) = guard.as_mut() {
+            scheduler.schedule();
+            scheduler.current().is_some()
+        } else {
+            false
+        }
+    };
+
+    if scheduled {
+        // Init runs in kernel mode; enter its main loop (never returns).
+        crate::init::init_main();
+    }
+
+    // No runnable process: idle until an interrupt arrives.
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 /// Handle timer tick.
 pub fn tick() {
     let ticks = TICKS.fetch_add(1, Ordering::SeqCst);

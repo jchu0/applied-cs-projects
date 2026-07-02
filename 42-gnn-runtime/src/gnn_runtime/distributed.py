@@ -1,5 +1,7 @@
 """Distributed GNN training with multi-GPU support."""
 
+from __future__ import annotations
+
 from typing import List, Optional, Dict, Set, Tuple, Any
 import numpy as np
 
@@ -18,6 +20,17 @@ except ImportError:
 
 from .graph import GraphStorage, PartitionedGraph
 from .sampling import NeighborSampler
+
+
+def _no_grad(fn):
+    """Apply ``torch.no_grad()`` if available, else return ``fn`` unchanged.
+
+    Used as an import-time-safe stand-in for the ``@torch.no_grad()``
+    decorator so this module imports without PyTorch installed.
+    """
+    if HAS_TORCH:
+        return torch.no_grad()(fn)
+    return fn
 
 
 class HaloExchange:
@@ -322,7 +335,7 @@ class DistributedGNNTrainer:
 
         return total_loss / max(num_batches, 1)
 
-    @torch.no_grad()
+    @_no_grad
     def evaluate(
         self,
         mask: Optional[np.ndarray] = None,

@@ -90,17 +90,21 @@ Usage), or run the test suite to exercise every subsystem.
 Streaming: a keyed, windowed aggregation executed in-process.
 
 ```python
+import asyncio
+
 from streamanalytics import StreamExecutionEnvironment
-from streamanalytics.windowing import TumblingWindowAssigner
+from streamanalytics.windowing import CountTrigger, TumblingWindowAssigner
 
 env = StreamExecutionEnvironment.get_execution_environment()
-results = (
+stream = (
     env.from_collection([{"user": "a", "amt": 1}, {"user": "b", "amt": 2}])
        .key_by(lambda e: e["user"])
        .window(TumblingWindowAssigner(size_ms=60_000))
+       .trigger_with(CountTrigger(count=1))  # default event-time trigger waits for a watermark
        .reduce(lambda x, y: {"user": x["user"], "amt": x["amt"] + y["amt"]})
-       .execute_sync()
 )
+results = asyncio.run(stream.execute())
+print(results)  # [{'user': 'a', 'amt': 1}, {'user': 'b', 'amt': 2}]
 ```
 
 SQL: parse, optimize, and plan a query (the plan is emitted, not executed).

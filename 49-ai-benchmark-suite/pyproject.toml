@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "aibench"
 version = "0.1.0"
 description = "AI Benchmark Suite - Comprehensive benchmarking for AI/ML systems"
-readme = "PROGRESS.md"
+readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 
@@ -27,7 +27,7 @@ full = [
 ]
 
 [project.scripts]
-aibench = "aibench.runner.runner:CLIRunner.run"
+aibench = "aibench.runner.runner:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

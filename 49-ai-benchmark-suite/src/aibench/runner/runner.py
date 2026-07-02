@@ -330,3 +330,9 @@ def run_benchmarks(
     runner.print_summary()
 
     return results
+
+
+def main() -> int:
+    """Console entry point for the aibench CLI."""
+    import sys
+    return CLIRunner().run(sys.argv[1:])

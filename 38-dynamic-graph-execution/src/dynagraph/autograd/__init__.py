@@ -2,6 +2,10 @@
 
 from .autograd import (
     Function,
+    ReLU,
+    Sigmoid,
+    Tanh,
+    Softmax,
     backward,
     grad,
     GradientTape,
@@ -16,6 +20,10 @@ from .autograd import (
 
 __all__ = [
     "Function",
+    "ReLU",
+    "Sigmoid",
+    "Tanh",
+    "Softmax",
     "backward",
     "grad",
     "GradientTape",

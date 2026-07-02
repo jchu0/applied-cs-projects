@@ -20,6 +20,10 @@ from .kv_cache import (
 from .batching import (
     ContinuousBatcher,
     BatchedInputs,
+    SchedulingPolicy,
+    FIFOPolicy,
+    PriorityPolicy,
+    ShortestJobFirstPolicy,
 )
 from .sampling import TokenSampler
 from .scheduler import InferenceScheduler
@@ -48,6 +52,10 @@ __all__ = [
     # Batching
     "ContinuousBatcher",
     "BatchedInputs",
+    "SchedulingPolicy",
+    "FIFOPolicy",
+    "PriorityPolicy",
+    "ShortestJobFirstPolicy",
     # Sampling
     "TokenSampler",
     # Scheduler

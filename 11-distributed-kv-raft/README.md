@@ -87,7 +87,7 @@ A node is created from a `RaftConfig`, then driven through Raft RPCs. The exampl
 exercises the in-memory FSM and a single-node leader directly via the real public API:
 
 ```rust
-use distributed_kv_raft::{Command, RaftConfig, RaftNode};
+use distributed_kv_raft::{Command, RaftConfig, RaftNode, RequestVoteResponse};
 
 // Build a single-node configuration (no peers => quorum is 1).
 let config = RaftConfig::builder().id(0).build();
@@ -96,7 +96,10 @@ node.start().unwrap();
 
 // With no peers, a candidate immediately wins the election.
 node.transition_to_candidate();
-node.handle_request_vote_response(0, Default::default()); // self-vote already counted
+node.handle_request_vote_response(0, RequestVoteResponse {
+    term: node.current_term,
+    vote_granted: true,
+});
 assert!(node.is_leader());
 
 // Propose a write; it is appended to the log on the leader.

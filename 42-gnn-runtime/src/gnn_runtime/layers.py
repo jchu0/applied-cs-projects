@@ -1,5 +1,7 @@
 """GNN layer implementations."""
 
+from __future__ import annotations
+
 from typing import Optional, List, Callable
 import math
 
@@ -22,7 +24,20 @@ def _check_torch():
         raise ImportError("PyTorch required for GNN layers")
 
 
-class GNNLayer(nn.Module):
+class _ModuleFallback:
+    """Base used in place of ``nn.Module`` when PyTorch is unavailable.
+
+    Lets class bodies be defined at import time; any attempt to actually
+    instantiate a layer without PyTorch raises via ``_check_torch()``.
+    """
+
+
+# Base class for the layer definitions below. When torch is present this is the
+# real ``nn.Module``; otherwise it is a plain placeholder so import still works.
+_Base = nn.Module if HAS_TORCH else _ModuleFallback
+
+
+class GNNLayer(_Base):
     """
     Generic GNN layer with configurable message passing.
 
@@ -155,7 +170,7 @@ class GNNLayer(nn.Module):
         return deg_inv_sqrt[src] * deg_inv_sqrt[dst]
 
 
-class GCNLayer(nn.Module):
+class GCNLayer(_Base):
     """
     Graph Convolutional Network layer.
 
@@ -258,7 +273,7 @@ class GCNLayer(nn.Module):
         return deg_inv_sqrt[src] * deg_inv_sqrt[dst]
 
 
-class GATLayer(nn.Module):
+class GATLayer(_Base):
     """
     Graph Attention Network layer.
 
@@ -372,7 +387,7 @@ class GATLayer(nn.Module):
         return alpha / (alpha_sum[index] + 1e-16)
 
 
-class GraphSAGELayer(nn.Module):
+class GraphSAGELayer(_Base):
     """
     GraphSAGE layer.
 
@@ -465,7 +480,7 @@ class GraphSAGELayer(nn.Module):
         return out
 
 
-class GNNModel(nn.Module):
+class GNNModel(_Base):
     """
     Multi-layer GNN model.
 
