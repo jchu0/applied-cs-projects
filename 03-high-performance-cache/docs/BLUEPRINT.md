@@ -98,13 +98,27 @@ runtime configuration.
 
 ### Server and event loop
 
-`Server::new(config)` binds the listening socket and constructs the poll registry;
-`Server::run` drives the loop. The design uses `mio` for readiness-based, non-blocking
-I/O: rather than a thread per connection, a single loop polls for events and services
-whichever connections are ready. The `ThreadedIO` builder lets read/write work be fanned
-out to a configurable pool of worker threads when single-threaded dispatch becomes the
-bottleneck — modeling Redis 6+'s threaded I/O for socket handling while keeping command
-execution serialized.
+`Server::new(config)` binds the listening socket and constructs the poll registry, then
+wires in the runtime subsystems: it allocates `config.databases` independent `Database`
+keyspaces, builds one `EvictionManager` per database from `--maxmemory`/`--maxmemory-policy`,
+and — depending on `--appendonly` — opens an `AOF` (replaying any existing log) or loads an
+existing RDB snapshot. `Server::run` drives the loop. The design uses `mio` for
+readiness-based, non-blocking I/O: rather than a thread per connection, a single loop polls
+for events and services whichever connections are ready. The registered listener is stored
+on the `Server` for the process lifetime; keeping the registered mio source alive is
+required for accept events to keep being delivered.
+
+Command dispatch runs against the connection's currently-selected database.
+`SELECT <n>`/`SWAPDB` are handled at the server layer (they change connection state, not a
+single keyspace); everything else is routed to `databases[selected]` via `CommandExecutor`.
+Mutating commands (identified by an `is_write_command` table) go through the memory-enforce
+→ execute → AOF-append pipeline described in the eviction and AOF sections. Once per loop
+iteration `run_periodic_tasks` runs an active-expiration cycle across every database
+(`Database::active_expire_cycle` samples keys with a TTL and drops the expired ones, so
+untouched keys are reclaimed even without an access) and performs the `everysec` AOF fsync.
+
+The `ThreadedIO` builder (below) models Redis 6+'s threaded I/O for socket handling, but is
+not wired into `Server::run`; the running server is single-threaded over `mio`.
 
 ### Connection and threaded I/O
 
@@ -407,7 +421,18 @@ or `select_ttl`. The `volatile-*` policies skip keys with no TTL (`db.ttl(&key) 
 Some(-1)`). The LRU/LFU selectors take a random sample from the database; the access-time
 and frequency tracking needed for fully accurate ranking is a deliberately simplified part
 of the implementation (the per-object `EntryMetadata` carries `lru_time` and an
-`lfu_counter`, but the manager's sample loop does not yet read them for full ordering).
+`lfu_counter`, but the manager's sample loop does not yet read them for full ordering, so
+`allkeys-lru` currently evicts an approximately-arbitrary sampled key rather than the
+strictly-oldest one).
+
+**Live server integration.** The server holds one `EvictionManager` per database. Before
+applying any mutating command (and once more after applying it), it calls
+`Database::memory_usage()` to recompute an approximate byte count, feeds it to the manager
+via `set_memory`, and runs `evict_if_needed`. With `noeviction` and the limit exceeded the
+write is rejected with an `OOM` error before it touches the keyspace; with any other policy
+the manager frees keys down to 95% of `maxmemory` first. Reads are never blocked. Memory
+usage is estimated (key length + per-entry overhead + a per-type value estimate) rather
+than measured exactly, which is sufficient to bound growth under `--maxmemory`.
 `EntryMetadata::increment_lfu` does implement Redis's probabilistic logarithmic counter,
 where the chance of incrementing falls as the counter grows:
 
@@ -445,11 +470,11 @@ configured cadence or the OS:
 pub fn append(&self, command: &[RespValue]) -> io::Result<()> {
     if command.is_empty() { return Ok(()); }
     let resp = self.command_to_resp(command);
-    let mut buffer = self.buffer.lock().unwrap();
+    let mut buffer = lock(&self.buffer);       // poison-recovering lock helper
     buffer.extend_from_slice(&resp);
     match self.policy {
         FsyncPolicy::Always => {
-            let mut file = self.file.lock().unwrap();
+            let mut file = lock(&self.file);
             if let Some(f) = file.as_mut() {
                 f.write_all(&buffer)?;
                 f.flush()?;
@@ -468,15 +493,35 @@ pub fn append(&self, command: &[RespValue]) -> io::Result<()> {
 ```
 
 The handler is interior-mutable (`Mutex`-guarded file, buffer, and size counters) so it can
-be shared across the dispatch layer without an exclusive borrow.
+be shared across the dispatch layer without an exclusive borrow. The mutexes are taken
+through a small `lock()` helper that recovers a poisoned guard (`into_inner`) instead of
+`unwrap()`ing — a panic in one thread cannot turn every subsequent AOF write on the hot
+path into a cascading panic, and each critical section leaves the AOF state consistent.
+
+**Live server integration.** When `--appendonly` is set, the server opens an `AOF` at
+startup, replays any existing log through the real `CommandExecutor` path (identical
+semantics to a live client — there is no separate simplified replay function), and then
+appends every successful mutating command. The `everysec` fsync is driven from the event
+loop's periodic tick. `AOF::rewrite` compacts the log by serializing an owned
+`Database::snapshot()` of the current dataset; it no longer casts a `&Database` to
+`&mut Database` (the previous undefined behavior), so rewrite is fully safe code.
 
 ### Persistence: RDB
 
 The RDB component writes a compact point-in-time snapshot — a magic header, auxiliary
-fields, a database selector, then length-prefixed key/value pairs with optional expiry
-markers, terminated by an EOF byte and a CRC checksum. On load it verifies the header and
-reconstructs a `Database`. RDB is faster to load than replaying a long AOF and is the right
-tool for periodic backups, while AOF gives finer-grained durability — the same
+fields, a database selector, then length-prefixed key/value pairs, terminated by an EOF
+byte and an 8-byte CRC-64 checksum. `save` builds the entire file body in memory, computes
+a real CRC-64 (`crc` crate, `CRC_64_XZ`) over it, appends the little-endian checksum, and
+atomically renames a temp file into place; this replaces the earlier "just write 0s"
+placeholder and also removes a `&Database`→`&mut Database` cast (the dataset is now
+serialized from an owned `Database::snapshot()`). On load it reads the whole file, verifies
+the header, and recomputes the CRC over the body, rejecting a corrupted file with an
+`InvalidData` error (a stored checksum of zero means "checksum disabled" and is accepted
+for compatibility). The CRC is self-consistent and round-trips within this implementation
+but is not byte-compatible with upstream Redis's CRC-64-Jones. The snapshot serializes only
+database 0 and does not persist per-key TTLs. When `--appendonly` is off, the server loads
+any existing RDB at startup. RDB is faster to load than replaying a long AOF and is the
+right tool for periodic backups, while AOF gives finer-grained durability — the same
 complementary pairing Redis offers.
 
 ### Replication
@@ -784,10 +829,11 @@ none are claimed here).
 
 ## Testing Strategy
 
-Correctness is verified by 338 in-process unit tests (`#[test]` functions across `src/`),
-runnable with `cargo test` from the `src/` directory. No external services or a running
-server are required, because the command layer is a pure function over `RespValue` and a
-`Database`.
+Correctness is verified by 340 in-process unit tests (`#[test]` functions across `src/`)
+plus 5 integration tests in `tests/live_server.rs`, all runnable with `cargo test` from the
+`src/` directory. Most unit tests need no running server, because the command layer is a
+pure function over `RespValue` and a `Database`; the integration tests do start a real
+`Server` on an ephemeral port and speak RESP over TCP.
 
 - **Protocol round-trips.** `resp/value.rs` exhaustively tests serialization of every
   `RespValue` variant, including empty and null forms, nested arrays, and mixed arrays, and
@@ -806,11 +852,19 @@ server are required, because the command layer is a pure function over `RespValu
   replication manager's backlog feed, replica registration, and promotion
   (`replication/mod.rs` tests `feed_backlog`, `add_replica`, and `promote_to_master`).
 - **Edge cases.** Tests cover null encodings, empty arrays, integer overflow on `INCR`,
-  wrong-type errors (`WRONGTYPE`), and the `NoEviction` OOM error path.
+  wrong-type errors (`WRONGTYPE`), the `NoEviction` OOM error path, and RDB CRC verification
+  (a round-trip asserts the checksum is non-zero and values survive; a corruption test flips
+  a body byte and asserts load fails).
+- **Live-server integration** (`tests/live_server.rs`). Each test starts `Server::run` on a
+  background thread over a free port and drives it with a minimal RESP client:
+  `--maxmemory` with `noeviction` returns `OOM` once full; `allkeys-lru` keeps accepting
+  writes while bounding `DBSIZE`; `--appendonly` writes survive a simulated restart (a
+  second `Server` instance over the same directory) via the real replay path; `SELECT`
+  isolates keys across databases; and a TTL'd key is reclaimed by the active-expiration
+  cycle without being accessed again.
 
-The natural extensions to this strategy — protocol fuzzing of the RESP parser, end-to-end
-integration against a live socket, and `redis-cli`/client-library compatibility runs — are
-not part of the current suite.
+The natural extensions to this strategy — protocol fuzzing of the RESP parser and
+`redis-cli`/client-library compatibility runs — are not part of the current suite.
 
 ## References
 

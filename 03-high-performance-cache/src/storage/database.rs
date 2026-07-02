@@ -289,9 +289,91 @@ impl Database {
         self.data.iter_keys()
     }
 
+    /// Take an owned snapshot of all live (non-expired) key/value pairs.
+    ///
+    /// Used by RDB save and AOF rewrite so they can serialize the dataset from
+    /// an immutable borrow without any unsafe aliasing.
+    pub fn snapshot(&self) -> Vec<(String, RedisObject)> {
+        let now = Instant::now();
+        self.data
+            .iter_keys()
+            .into_iter()
+            .filter_map(|key| {
+                if let Some(&t) = self.expires.get(&key) {
+                    if t <= now {
+                        return None;
+                    }
+                }
+                self.data.get(&key).map(|obj| (key.clone(), obj.clone()))
+            })
+            .collect()
+    }
+
     /// Get number of keys with expiration
     pub fn expires_count(&self) -> usize {
         self.expires.len()
+    }
+
+    /// Approximate memory usage of this database in bytes.
+    ///
+    /// This is an estimate that accounts for key names, value payloads, and a
+    /// fixed per-entry overhead. It is used by the eviction manager to decide
+    /// when `maxmemory` has been exceeded. It is intentionally cheap to compute
+    /// on small/medium databases and does not claim to match Redis's exact
+    /// `used_memory` accounting.
+    pub fn memory_usage(&self) -> usize {
+        let mut total = 0usize;
+        for key in self.data.iter_keys() {
+            total += key.len() + 64; // key string + dict entry overhead
+            if let Some(obj) = self.data.get(&key) {
+                total += Self::object_memory(obj);
+            }
+        }
+        // Expire table overhead
+        total += self.expires.len() * 48;
+        total
+    }
+
+    /// Estimate the memory footprint of a single object.
+    pub(crate) fn object_memory(obj: &RedisObject) -> usize {
+        match obj {
+            RedisObject::String(s) => s.len() + 16,
+            RedisObject::List(l) => l.iter().map(|v| v.len() + 16).sum::<usize>() + 16,
+            RedisObject::Set(s) => s.iter().map(|v| v.len() + 16).sum::<usize>() + 16,
+            RedisObject::Hash(h) => {
+                h.iter().map(|(k, v)| k.len() + v.len() + 32).sum::<usize>() + 16
+            }
+            RedisObject::ZSet(z) => {
+                z.dict.iter().map(|(k, _)| k.len() + 32).sum::<usize>() + 32
+            }
+        }
+    }
+
+    /// Run one active-expiration cycle, sampling keys that have a TTL and
+    /// deleting those that have already expired. Returns the number of keys
+    /// removed. This complements lazy expiration (which only fires when a key
+    /// is accessed) so that keys with a TTL are reclaimed even if never touched.
+    pub fn active_expire_cycle(&mut self, sample_limit: usize) -> usize {
+        if self.expires.is_empty() {
+            return 0;
+        }
+
+        let now = Instant::now();
+        let expired: Vec<String> = self
+            .expires
+            .iter()
+            .filter(|(_, &t)| t <= now)
+            .take(sample_limit)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let mut removed = 0;
+        for key in expired {
+            if self.delete(&key) {
+                removed += 1;
+            }
+        }
+        removed
     }
 }
 

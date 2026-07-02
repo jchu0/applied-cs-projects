@@ -11,7 +11,7 @@ use redis_lite::config::Config;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Host to bind to
-    #[arg(short = 'h', long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
     /// Port to listen on

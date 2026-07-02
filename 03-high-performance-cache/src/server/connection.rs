@@ -11,6 +11,9 @@ pub struct Connection {
     parser: RespParser,
     write_buffer: BytesMut,
     closed: bool,
+    /// Index of the database this connection is currently operating on
+    /// (changed via the `SELECT` command; defaults to database 0).
+    selected_db: usize,
 }
 
 impl Connection {
@@ -22,7 +25,18 @@ impl Connection {
             parser: RespParser::new(),
             write_buffer: BytesMut::with_capacity(4096),
             closed: false,
+            selected_db: 0,
         }
+    }
+
+    /// Currently selected database index for this connection.
+    pub fn selected_db(&self) -> usize {
+        self.selected_db
+    }
+
+    /// Change the selected database index for this connection.
+    pub fn set_selected_db(&mut self, index: usize) {
+        self.selected_db = index;
     }
 
     /// Read data from the connection

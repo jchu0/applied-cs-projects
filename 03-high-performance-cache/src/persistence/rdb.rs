@@ -3,7 +3,16 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crc::{Crc, CRC_64_XZ};
+
 use crate::storage::{Database, RedisObject, StringObject, ZSetObject};
+
+/// CRC-64 used for the RDB trailing checksum. This is a real CRC over the
+/// entire file body (everything before the 8-byte checksum), so a corrupted
+/// file is detected on load. It is a standard CRC-64 and is self-consistent
+/// for this implementation's round-trips; it is not byte-compatible with the
+/// CRC-64-Jones variant that upstream Redis uses.
+const RDB_CRC: Crc<u64> = Crc::<u64>::new(&CRC_64_XZ);
 
 // RDB constants
 const RDB_MAGIC: &[u8] = b"REDIS0011";
@@ -36,52 +45,50 @@ impl RDB {
 
     /// Save database to RDB file
     pub fn save(&self, db: &Database) -> io::Result<()> {
-        let temp_path = format!("{}.temp", self.path);
-        let file = File::create(&temp_path)?;
-        let mut writer = BufWriter::new(file);
+        // Build the full file body in memory first so we can compute a real
+        // CRC-64 over it before appending the checksum. RDB files are small
+        // relative to available memory, and this avoids any unsafe aliasing of
+        // the database.
+        let mut body: Vec<u8> = Vec::new();
 
         // Write header
-        writer.write_all(RDB_MAGIC)?;
+        body.write_all(RDB_MAGIC)?;
 
         // Write aux fields
-        self.write_aux(&mut writer, "redis-ver", "0.1.0")?;
+        self.write_aux(&mut body, "redis-ver", "0.1.0")?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
-        self.write_aux(&mut writer, "ctime", &timestamp.to_string())?;
+        self.write_aux(&mut body, "ctime", &timestamp.to_string())?;
 
         // Write database selector (DB 0)
-        writer.write_all(&[RDB_OPCODE_SELECTDB])?;
-        self.write_length(&mut writer, 0)?;
+        body.write_all(&[RDB_OPCODE_SELECTDB])?;
+        self.write_length(&mut body, 0)?;
 
-        // Write key-value pairs
-        let keys = db.all_keys();
-
-        for key in keys {
-            // Get TTL (we'd need to expose expires in Database)
-            // For now, skip expiration writing
-
-            // Clone database to get immutable reference
-            // This is a workaround - real implementation needs better access
-            if let Some(_obj) = unsafe {
-                let db_ptr = db as *const Database as *mut Database;
-                (*db_ptr).get(&key)
-            } {
-                self.write_key_value(&mut writer, &key, _obj)?;
-            }
+        // Write key-value pairs. `snapshot` returns owned objects so we never
+        // need a mutable borrow of the database here.
+        for (key, obj) in db.snapshot() {
+            self.write_key_value(&mut body, &key, &obj)?;
         }
 
         // Write EOF
-        writer.write_all(&[RDB_OPCODE_EOF])?;
+        body.write_all(&[RDB_OPCODE_EOF])?;
 
-        // Write checksum (simplified - just write 0s)
-        writer.write_all(&[0u8; 8])?;
+        // Compute and append a real CRC-64 checksum over the body.
+        let checksum = RDB_CRC.checksum(&body);
+        body.write_all(&checksum.to_le_bytes())?;
 
-        writer.flush()?;
-        drop(writer);
+        // Write body to a temp file, then atomically rename into place.
+        let temp_path = format!("{}.temp", self.path);
+        {
+            let file = File::create(&temp_path)?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(&body)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
 
-        // Atomic rename
         std::fs::rename(&temp_path, &self.path)?;
 
         Ok(())
@@ -94,19 +101,47 @@ impl RDB {
             return Ok(Database::new());
         }
 
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut db = Database::new();
+        // Read the entire file so we can verify the trailing CRC-64 before
+        // parsing any of it.
+        let mut file = File::open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
 
-        // Verify header
-        let mut header = [0u8; 9];
-        reader.read_exact(&mut header)?;
-        if &header[..5] != b"REDIS" {
+        if bytes.len() < 9 || &bytes[..5] != b"REDIS" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid RDB file",
             ));
         }
+
+        // Verify checksum: last 8 bytes are the CRC-64 over the preceding body.
+        // A zero checksum means "checksum disabled" (as in Redis) and is
+        // accepted without verification for backward compatibility.
+        if bytes.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated RDB file",
+            ));
+        }
+        let split = bytes.len() - 8;
+        let (body, checksum_bytes) = bytes.split_at(split);
+        let stored = u64::from_le_bytes(checksum_bytes.try_into().unwrap());
+        if stored != 0 {
+            let computed = RDB_CRC.checksum(body);
+            if computed != stored {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "RDB checksum mismatch (file corrupted)",
+                ));
+            }
+        }
+
+        let mut db = Database::new();
+        let mut reader = BufReader::new(io::Cursor::new(body));
+
+        // Consume header
+        let mut header = [0u8; 9];
+        reader.read_exact(&mut header)?;
 
         // Parse RDB file
         loop {
@@ -144,7 +179,7 @@ impl RDB {
     }
 
     /// Write auxiliary field
-    fn write_aux(&self, writer: &mut BufWriter<File>, key: &str, value: &str) -> io::Result<()> {
+    fn write_aux<W: Write>(&self, writer: &mut W, key: &str, value: &str) -> io::Result<()> {
         writer.write_all(&[RDB_OPCODE_AUX])?;
         self.write_string(writer, key.as_bytes())?;
         self.write_string(writer, value.as_bytes())?;
@@ -152,7 +187,7 @@ impl RDB {
     }
 
     /// Write length encoding
-    fn write_length(&self, writer: &mut BufWriter<File>, len: usize) -> io::Result<()> {
+    fn write_length<W: Write>(&self, writer: &mut W, len: usize) -> io::Result<()> {
         if len < 64 {
             // 6-bit length
             writer.write_all(&[len as u8])?;
@@ -172,16 +207,16 @@ impl RDB {
     }
 
     /// Write string
-    fn write_string(&self, writer: &mut BufWriter<File>, data: &[u8]) -> io::Result<()> {
+    fn write_string<W: Write>(&self, writer: &mut W, data: &[u8]) -> io::Result<()> {
         self.write_length(writer, data.len())?;
         writer.write_all(data)?;
         Ok(())
     }
 
     /// Write key-value pair
-    fn write_key_value(
+    fn write_key_value<W: Write>(
         &self,
-        writer: &mut BufWriter<File>,
+        writer: &mut W,
         key: &str,
         obj: &RedisObject,
     ) -> io::Result<()> {
@@ -231,7 +266,7 @@ impl RDB {
     }
 
     /// Read length encoding
-    fn read_length(&self, reader: &mut BufReader<File>) -> io::Result<usize> {
+    fn read_length<R: Read>(&self, reader: &mut R) -> io::Result<usize> {
         let mut first = [0u8; 1];
         reader.read_exact(&mut first)?;
 
@@ -256,7 +291,7 @@ impl RDB {
     }
 
     /// Read string
-    fn read_string(&self, reader: &mut BufReader<File>) -> io::Result<Vec<u8>> {
+    fn read_string<R: Read>(&self, reader: &mut R) -> io::Result<Vec<u8>> {
         let len = self.read_length(reader)?;
         let mut data = vec![0u8; len];
         reader.read_exact(&mut data)?;
@@ -264,16 +299,16 @@ impl RDB {
     }
 
     /// Read key-value after expiration opcode
-    fn read_key_value(&self, reader: &mut BufReader<File>, db: &mut Database) -> io::Result<()> {
+    fn read_key_value<R: Read>(&self, reader: &mut R, db: &mut Database) -> io::Result<()> {
         let mut type_byte = [0u8; 1];
         reader.read_exact(&mut type_byte)?;
         self.read_object(reader, db, type_byte[0])
     }
 
     /// Read object by type
-    fn read_object(
+    fn read_object<R: Read>(
         &self,
-        reader: &mut BufReader<File>,
+        reader: &mut R,
         db: &mut Database,
         type_byte: u8,
     ) -> io::Result<()> {
@@ -606,6 +641,48 @@ mod tests {
         } else {
             panic!("Expected string");
         }
+    }
+
+    #[test]
+    fn test_rdb_checksum_roundtrip_values() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.rdb");
+        let rdb = RDB::new(path.to_string_lossy().to_string());
+
+        let mut db = Database::new();
+        db.set_string("a".to_string(), b"apple".to_vec());
+        db.set_string("b".to_string(), b"banana".to_vec());
+
+        rdb.save(&db).unwrap();
+
+        // A real (non-zero) checksum must have been written.
+        let bytes = std::fs::read(&path).unwrap();
+        let checksum = &bytes[bytes.len() - 8..];
+        assert_ne!(checksum, &[0u8; 8], "RDB checksum should be a real CRC, not zeros");
+
+        // Values round-trip exactly through save/load.
+        let mut loaded = rdb.load().unwrap();
+        assert_eq!(loaded.get_string("a"), Some(b"apple".to_vec()));
+        assert_eq!(loaded.get_string("b"), Some(b"banana".to_vec()));
+    }
+
+    #[test]
+    fn test_rdb_detects_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.rdb");
+        let rdb = RDB::new(path.to_string_lossy().to_string());
+
+        let mut db = Database::new();
+        db.set_string("key".to_string(), b"value".to_vec());
+        rdb.save(&db).unwrap();
+
+        // Flip a byte in the body; the CRC check must reject the file on load.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let idx = bytes.len() / 2;
+        bytes[idx] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(rdb.load().is_err(), "corrupted RDB must fail the checksum check");
     }
 
     #[test]

@@ -19,13 +19,24 @@ wire protocol.
   commands via `CommandExecutor`, extended with Lua scripting and streams via
   `ExtendedExecutor`.
 - **Eviction** — `EvictionManager` implements approximate LRU/LFU and random/TTL policies
-  using random sampling (default sample size 5), driven by `EvictionPolicy`.
+  using random sampling (default sample size 5), driven by `EvictionPolicy`. The live
+  server honors `--maxmemory` / `--maxmemory-policy`: before each write it recomputes the
+  database's approximate memory usage and either rejects the write (`noeviction`, replying
+  `OOM`) or frees keys per policy.
 - **Persistence** — append-only file with `Always` / `EverySecond` / `No` fsync policies
-  (`AOF` / `FsyncPolicy`) and RDB-style snapshotting (`RDB`).
+  (`AOF` / `FsyncPolicy`) and RDB snapshotting (`RDB`) with a real CRC-64 trailing
+  checksum that is verified on load. When `--appendonly` is set the live server appends
+  every mutating command to the AOF and, on startup, replays the AOF through the real
+  command-execution path. Otherwise it loads any existing RDB snapshot on startup.
+- **Multi-database** — `--databases N` allocates N independent keyspaces; each connection
+  tracks its own selected database via `SELECT <n>` (and `SWAPDB` swaps two), so keys are
+  isolated per database.
 - **Replication** — `ReplicationManager` with a ring-buffer replication backlog, replica
-  registry, offset tracking, partial-resync checks, and replica-to-master promotion.
-- **TTL and expiration** — per-key expiry with lazy deletion on access and `TTL`/`PTTL`/
-  `PERSIST` support (`storage/database.rs`).
+  registry, offset tracking, partial-resync checks, and replica-to-master promotion (the
+  module exists but is not wired into the running server; see "What's Real vs Simulated").
+- **TTL and expiration** — per-key expiry with lazy deletion on access plus an active
+  expiration cycle the server runs each event-loop tick, and `TTL`/`PTTL`/`PERSIST`
+  support (`storage/database.rs`).
 - **Streams** — `Stream`, `StreamId`, `StreamEntry`, and `ConsumerGroup` backing the
   `XADD`/`XREAD`/`XRANGE`/`XGROUP` command family.
 - **Transactions** — `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` queuing with optimistic
@@ -39,14 +50,13 @@ flowchart TD
     Client(Redis client / redis-cli) --> Server(Server event loop with mio)
     Server --> Conn(Connection read and write buffers)
     Conn --> Parser(RESP parser and serializer)
-    Parser --> Exec(ExtendedExecutor and CommandExecutor)
+    Parser --> Exec(CommandExecutor per selected DB)
     Exec --> DB(Database)
     DB --> Dict(Dict with incremental rehashing)
     DB --> Obj(RedisObject typed values)
-    Exec --> Evict(EvictionManager LRU and LFU)
-    Exec --> Persist(AOF and RDB persistence)
-    Exec --> Repl(ReplicationManager and backlog)
-    Exec --> Stream(Stream store and consumer groups)
+    Server --> Evict(EvictionManager per DB, on write path)
+    Server --> Persist(AOF append and startup RDB or AOF load)
+    Server --> Expire(Active expiration each tick)
 ```
 
 | Component | Module | Responsibility |
@@ -150,22 +160,40 @@ assert_eq!(bytes, b"+OK\r\n");
 
 ## What's Real vs Simulated
 
-**Real:** RESP2 parsing/serialization; the `Dict` hash table with incremental rehashing;
-the `Database` key-value store with expiration; string/list/set/hash/sorted-set/key/TTL
-command handlers; the `EvictionManager` sampling logic; AOF append with all three fsync
-policies and RDB snapshot save/load; the `ReplicationManager` backlog, offset tracking,
-and promotion; stream storage and consumer groups; transaction queuing; and the
-`rustls`-backed TLS acceptor. All of these are exercised by the unit test suite.
+**Real and wired into the live server:** RESP2 parsing/serialization; the `Dict` hash
+table with incremental rehashing; the `Database` key-value store with lazy + active
+expiration; string/list/set/hash/sorted-set/key/TTL command handlers; per-connection
+multi-database `SELECT`/`SWAPDB`; `--maxmemory` eviction enforcement on the write path
+(`noeviction` → `OOM`, plus `allkeys`/`volatile` LRU/LFU/random/TTL sampling); AOF append
+with all three fsync policies and startup replay through the real command path; and RDB
+snapshot save/load with a verified CRC-64 checksum. These are exercised by both the unit
+tests and the `tests/live_server.rs` integration tests that drive a real server over TCP.
+
+**Real but not wired into the running server** (library types exist and are unit-tested,
+but the event loop does not invoke them):
+- **Replication** — `ReplicationManager`, backlog, offset tracking, and promotion.
+- **Streams** — stream storage and consumer groups (reachable only via `ExtendedExecutor`,
+  which the server does not construct).
+- **Transactions / MULTI-EXEC** — queuing and WATCH logic exist but are not driven per
+  connection by the server.
+- **TLS** — the `rustls`-backed acceptor is implemented but not used by the plaintext
+  event loop.
+- **ThreadedIO** — the threaded I/O helper is standalone and unused by the server.
 
 **Simulated / partial:**
 - **Lua scripting** — `ScriptEngine` runs a small custom interpreter for a Lua-like
   subset (`scripting/mod.rs` notes that full Lua needs `mlua`/`rlua`); it is not a
-  complete Lua VM.
+  complete Lua VM, and is not wired into the server.
 - **Pub/Sub commands** — a full `PubSub` registry type exists, but the `PUBLISH`/`PUBSUB`
   command handlers are not wired to it and return placeholder values (`PUBLISH` returns 0)
   because cross-connection client state is not propagated at the command layer.
 - **Cluster mode** — `ClusterState` and slot mapping exist, but the executor invokes
   `CLUSTER` with no cluster state, so multi-node sharding and redirection are not active.
+- **RDB scope** — snapshots serialize only database 0 and do not persist per-key TTLs, so
+  a save/load round-trip preserves values but not expirations for keys outside DB 0.
+- **RDB CRC** — the trailing checksum is a standard CRC-64 (`crc` crate, `CRC_64_XZ`); it
+  detects corruption and round-trips within this implementation but is not byte-compatible
+  with the CRC-64-Jones variant upstream Redis uses.
 
 ## Testing
 
@@ -174,9 +202,12 @@ cd 03-high-performance-cache/src
 cargo test
 ```
 
-The suite contains 338 unit tests across the storage, RESP, command, eviction,
-persistence, replication, and supporting modules. No external services are required.
-Run with `cargo test -- --nocapture` to see test output.
+The suite contains 340 unit tests across the storage, RESP, command, eviction,
+persistence, replication, and supporting modules, plus 5 integration tests in
+`tests/live_server.rs` that start a real `Server` over TCP and verify eviction (`OOM`
+and `allkeys-lru`), AOF write-then-restart replay, `SELECT` database isolation, and
+active expiration. No external services are required. Run with `cargo test -- --nocapture`
+to see test output.
 
 ## Project Structure
 
@@ -200,6 +231,7 @@ Run with `cargo test -- --nocapture` to see test output.
     cluster/                 # Cluster slot mapping and node state
     server/                  # Event loop, connection, threaded IO, TLS
     config.rs                # Server configuration
+    tests/live_server.rs     # Integration tests driving a live server over TCP
 ```
 
 ## License

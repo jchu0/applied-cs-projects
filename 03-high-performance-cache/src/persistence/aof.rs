@@ -1,10 +1,21 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
+use crate::commands::CommandExecutor;
 use crate::resp::{RespParser, RespValue};
 use crate::storage::Database;
+
+/// Lock a mutex, recovering the guard if the lock was poisoned by a panic in
+/// another thread. AOF state (the buffered writer, pending bytes, and size
+/// counter) is always left consistent after each critical section, so it is
+/// safe to keep using it rather than propagating a poison panic onto the
+/// command hot path.
+#[inline]
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Fsync policy for AOF
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,12 +65,12 @@ impl AOF {
         // Serialize command to RESP
         let resp = self.command_to_resp(command);
 
-        let mut buffer = self.buffer.lock().unwrap();
+        let mut buffer = lock(&self.buffer);
         buffer.extend_from_slice(&resp);
 
         match self.policy {
             FsyncPolicy::Always => {
-                let mut file = self.file.lock().unwrap();
+                let mut file = lock(&self.file);
                 if let Some(f) = file.as_mut() {
                     f.write_all(&buffer)?;
                     f.flush()?;
@@ -71,7 +82,7 @@ impl AOF {
             FsyncPolicy::EverySecond | FsyncPolicy::No => {
                 // Flush if buffer is large enough
                 if buffer.len() > 4096 {
-                    let mut file = self.file.lock().unwrap();
+                    let mut file = lock(&self.file);
                     if let Some(f) = file.as_mut() {
                         f.write_all(&buffer)?;
                         f.flush()?;
@@ -81,7 +92,7 @@ impl AOF {
             }
         }
 
-        let mut size = self.current_size.lock().unwrap();
+        let mut size = lock(&self.current_size);
         *size += resp.len();
 
         Ok(())
@@ -89,12 +100,12 @@ impl AOF {
 
     /// Flush buffer to disk
     pub fn flush(&self) -> io::Result<()> {
-        let mut buffer = self.buffer.lock().unwrap();
+        let mut buffer = lock(&self.buffer);
         if buffer.is_empty() {
             return Ok(());
         }
 
-        let mut file = self.file.lock().unwrap();
+        let mut file = lock(&self.file);
         if let Some(f) = file.as_mut() {
             f.write_all(&buffer)?;
             f.flush()?;
@@ -106,7 +117,7 @@ impl AOF {
     /// Sync to disk
     pub fn sync(&self) -> io::Result<()> {
         self.flush()?;
-        let file = self.file.lock().unwrap();
+        let file = lock(&self.file);
         if let Some(f) = file.as_ref() {
             f.get_ref().sync_all()?;
         }
@@ -130,17 +141,16 @@ impl AOF {
         reader.read_to_end(&mut data)?;
         parser.feed(&data);
 
-        // Parse and execute commands
+        // Parse and replay commands through the real command execution path so
+        // that AOF replay has identical semantics to live command handling.
         loop {
             match parser.parse() {
                 Ok(Some(value)) => {
-                    // Execute the command
                     if let Some(args) = value.into_array() {
                         if !args.is_empty() {
                             if let Some(cmd_name) = args[0].as_str() {
                                 let cmd = cmd_name.to_uppercase();
-                                // Execute command (simplified - real implementation would use CommandExecutor)
-                                self.execute_aof_command(&cmd, &args[1..], &mut db);
+                                let _ = CommandExecutor::execute(&cmd, &args[1..], &mut db);
                             }
                         }
                     }
@@ -159,25 +169,14 @@ impl AOF {
         let file = File::create(&temp_path)?;
         let mut writer = BufWriter::new(file);
 
-        // Get all keys (simplified - real implementation needs proper iteration)
-        let keys = db.random_keys(db.len() * 2);
-        let mut seen = std::collections::HashSet::new();
-
-        for key in keys {
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-
-            // Get object and write appropriate command
-            if let Some(obj) = unsafe {
-                let db_ptr = db as *const Database as *mut Database;
-                (*db_ptr).get(&key)
-            } {
-                let commands = self.object_to_commands(&key, obj);
-                for cmd in commands {
-                    let resp = self.command_to_resp(&cmd);
-                    writer.write_all(&resp)?;
-                }
+        // Serialize the current dataset from an owned snapshot. This avoids the
+        // previous const-to-mut pointer cast (undefined behavior) and needs no
+        // deduplication since `snapshot` yields each live key exactly once.
+        for (key, obj) in db.snapshot() {
+            let commands = self.object_to_commands(&key, &obj);
+            for cmd in commands {
+                let resp = self.command_to_resp(&cmd);
+                writer.write_all(&resp)?;
             }
         }
 
@@ -186,7 +185,7 @@ impl AOF {
 
         // Close current file
         {
-            let mut file = self.file.lock().unwrap();
+            let mut file = lock(&self.file);
             *file = None;
         }
 
@@ -202,12 +201,12 @@ impl AOF {
         let size = file.metadata()?.len() as usize;
 
         {
-            let mut f = self.file.lock().unwrap();
+            let mut f = lock(&self.file);
             *f = Some(BufWriter::new(file));
         }
 
         {
-            let mut s = self.current_size.lock().unwrap();
+            let mut s = lock(&self.current_size);
             *s = size;
         }
 
@@ -219,12 +218,6 @@ impl AOF {
         let mut buf = bytes::BytesMut::with_capacity(64);
         RespValue::Array(Some(args.to_vec())).serialize_into(&mut buf);
         buf.to_vec()
-    }
-
-    /// Execute command during AOF load
-    fn execute_aof_command(&self, cmd: &str, args: &[RespValue], db: &mut Database) {
-        use crate::commands::CommandExecutor;
-        let _ = CommandExecutor::execute(cmd, args, db);
     }
 
     /// Convert object to commands for AOF rewrite
@@ -296,7 +289,7 @@ impl AOF {
 
     /// Get current AOF size
     pub fn size(&self) -> usize {
-        *self.current_size.lock().unwrap()
+        *lock(&self.current_size)
     }
 }
 
