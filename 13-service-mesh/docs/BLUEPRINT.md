@@ -22,9 +22,12 @@ webhooks rewrite pod specs to inject a sidecar.
 Scope is deliberately bounded. The proxy speaks HTTP/1.1, not HTTP/2 or gRPC framing.
 The xDS server and client exchange resources in-process rather than over a live gRPC
 stream. The Kubernetes integration generates the admission patch but does not talk to a
-real API server, and no iptables interception is performed locally. These boundaries are
-called out explicitly in "Performance" and in the README's "What's Real vs Simulated"
-section so the implemented surface is never overclaimed.
+real API server, and no iptables interception is performed locally. mTLS secures the
+inbound (ingress) hop of the data path — the sidecar terminates real rustls connections
+and enforces peer identity — but the outbound hop to upstream backends is still plaintext
+TCP today. These boundaries are called out explicitly in "Performance" and in the
+README's "What's Real vs Simulated" section so the implemented surface is never
+overclaimed.
 
 A few design choices shape the whole codebase. First, the proxy treats HTTP as a
 line-and-header protocol it can parse incrementally off a buffered reader, which keeps the
@@ -58,7 +61,7 @@ flowchart TD
         Registry[ServiceRegistry]
         LB[LoadBalancer]
         Policy[CircuitBreaker RetryPolicy TimeoutPolicy]
-        TLS[TlsManager mTLS]
+        TLS[TlsManager inbound mTLS termination]
         Metrics[ProxyMetrics]
         Tracer[Tracer W3C context]
     end
@@ -67,13 +70,13 @@ flowchart TD
         Webhook[WebhookServer]
         Injector[SidecarInjector]
     end
-    App[Local application] -->|outbound 15001| Proxy
-    Peer[Peer sidecar] -->|inbound 15006| Proxy
+    App[Local application] -->|outbound 15001 plaintext| Proxy
+    Peer[Peer sidecar] -->|inbound 15006 mTLS| TLS
+    TLS -->|verified peer SPIFFE id| Proxy
     Proxy -->|admin 15000| Metrics
     Proxy --> Registry
     Proxy --> LB
     Proxy --> Policy
-    Proxy --> TLS
     Proxy --> Tracer
     TLS --> Cert[CertificateAuthority CertManager]
     XdsServer -->|push config| XdsClient[XdsClient]
@@ -84,8 +87,11 @@ flowchart TD
 Traffic flows through three listeners that the proxy binds on startup:
 
 - **Inbound (15006)** — connections arriving from peer sidecars, destined for the local
-  application. The proxy reads the HTTP request, optionally extracts the W3C trace
-  context, forwards to the application on its app port, and relays the response.
+  application. When `mtls_mode` is `Permissive`/`Strict` the proxy first terminates a
+  rustls TLS connection and extracts the peer SPIFFE identity; it then reads the HTTP
+  request over that encrypted stream, optionally extracts the W3C trace context, forwards
+  to the application on its app port (adding an `x-forwarded-client-cert` header for the
+  peer identity), and relays the response.
 - **Outbound (15001)** — connections originating from the local application. The proxy
   resolves the target service from the `Host` header, filters to healthy endpoints via
   the registry, selects one with the load balancer, injects trace context, and forwards
@@ -182,9 +188,12 @@ not the listener.
 `CertificateAuthority::new(cert_ttl: Duration)` builds a self-signed root certificate
 using `rcgen` (`IsCa::Ca`, common name "Mesh Root CA"). `issue_certificate(identity)`
 mints a leaf certificate whose subject is the service account and whose Subject
-Alternative Name is the SPIFFE URI `spiffe://cluster.local/ns/<ns>/sa/<sa>`. The leaf is
-signed by the root via `serialize_pem_with_signer`, and the returned `IssuedCert` carries
-the PEM cert chain (leaf + root), the PEM private key, and an expiry of `now + cert_ttl`.
+Alternative Names are the SPIFFE URI `spiffe://cluster.local/ns/<ns>/sa/<sa>` (identity)
+plus a DNS name `<sa>.<ns>.mesh` (`ServiceIdentity::tls_server_name`). The DNS SAN lets a
+client dial the upstream by workload name so rustls' WebPKI hostname check passes, while
+authorization still reads the SPIFFE URI. The leaf is signed by the root via
+`serialize_pem_with_signer`, and the returned `IssuedCert` carries the PEM cert chain
+(leaf + root), the PEM private key, and an expiry of `now + cert_ttl`.
 
 `CertManager::new(identity, cert, cert_ttl)` holds the current certificate behind a
 `parking_lot::RwLock`. `needs_rotation()` returns true once the remaining lifetime drops
@@ -216,6 +225,25 @@ and a control loop can issue a fresh certificate and call `update_cert` so the n
 uses it — all without restarting the proxy. Because the leaf is short-lived by design, a
 compromised key is only useful until the next rotation.
 
+**mTLS on the data path.** This identity machinery is wired into the sidecar's inbound
+listener rather than left unused. `ProxyConfig::mtls_mode` (`MtlsMode`) selects the
+enforcement level: `Disabled` keeps the inbound path plaintext; `Permissive` and `Strict`
+terminate TLS. When enabled, `handle_inbound` builds one `TlsManager` from the sidecar's
+`CertManager` and, for each accepted TCP connection, calls `TlsManager::accept` to run the
+rustls server handshake using the CA-issued cert/key. The resulting `TlsStream::Server` is
+wrapped so `peer_spiffe_id()` can read the client certificate's SPIFFE URI, and the same
+encrypted stream (which implements `AsyncRead`/`AsyncWrite`) is then used to read and
+forward the HTTP request — so the proxied bytes are genuinely encrypted, not plaintext. In
+`Strict` mode a connection that omits a SPIFFE-bearing client certificate is rejected with
+`Error::Unauthorized`, and because a plaintext client cannot complete the TLS handshake at
+all, `TlsManager::accept` rejects it up front. The verified peer identity is propagated to
+the local application through an `x-forwarded-client-cert` header (mirroring Envoy's XFCC),
+letting the app authorize on the mTLS peer. The request-processing function is generic over
+the stream type, so the plaintext and TLS paths share one code path. Outbound (upstream)
+connections still use plaintext TCP today; the client-side `TlsManager::connect` and a
+SPIFFE-bearing client cert exist (and are exercised by `tests/mtls_test.rs`), so extending
+mTLS to the upstream hop is incremental.
+
 ### Service discovery and load balancing (`discovery`)
 
 `ServiceRegistry` wraps a `DashMap<ServiceKey, ServiceEndpoints>` for lock-free concurrent
@@ -230,8 +258,23 @@ filters to healthy endpoints and returns `None` if none remain. RoundRobin advan
 atomic index (`fetch_add` modulo the healthy count), giving even distribution without a
 lock; LeastConnections picks the address with the fewest tracked open connections,
 maintained via `connection_opened`/`connection_closed` over a `DashMap<SocketAddr, usize>`;
-Random and RingHash currently pick uniformly at random. The four strategies are exposed
-through `LoadBalancerType {RoundRobin, LeastConnections, Random, RingHash}`.
+Random picks uniformly at random. The four strategies are exposed through
+`LoadBalancerType {RoundRobin, LeastConnections, Random, RingHash}`.
+
+RingHash is a real consistent-hash ring, not random selection. `ConsistentHashRing`
+places each backend at `DEFAULT_VNODES` (128) virtual-node positions on a 64-bit ring,
+hashing `(addr, i)` with `DefaultHasher` so a backend's ownership is scattered into many
+small arcs (keeping the load balanced). A key is routed by hashing it and walking
+clockwise to the first ring position `>=` the key's hash, wrapping to the smallest
+position at the end — implemented with a `BTreeMap` range query. Because ownership is
+positional, adding or removing a backend only reassigns the keys that fell in that
+backend's arcs — about `1/N` of keys — rather than reshuffling everything as a modulo
+scheme would. The keyed entry point is `LoadBalancer::select_with_key(endpoints, key)`,
+which builds a ring over the healthy endpoints and returns the owning `Endpoint`; the
+same key maps to the same backend across calls. The keyless `select` has no routing key,
+so for RingHash it falls back to round-robin to still return a valid healthy endpoint.
+The ring properties (stability, distribution, bounded reassignment) are verified in
+`tests/discovery_test.rs` and the inline `discovery` tests.
 
 Health is a property of the endpoint, not the balancer, so the same registry entry can be
 shared across callers while a separate health-checking process flips endpoints between
@@ -609,9 +652,10 @@ ServiceIdentity::new(namespace: &str, service_account: &str) -> Self
 
 ```
 TlsManager::from_cert_manager(&CertManager) -> Result<Self>
-TlsManager::acceptor(&self) -> TlsAcceptor
-TlsManager::connector(&self) -> TlsConnector
+TlsManager::accept(&self, TcpStream) -> Result<ServerTlsStream<TcpStream>>   // inbound handshake
+TlsManager::connect(&self, TcpStream, server_name: &str) -> Result<ClientTlsStream<TcpStream>>
 TlsStream::peer_spiffe_id(&self) -> Option<String>
+// ProxyConfig::mtls_mode: MtlsMode { Disable, Permissive, Strict } gates inbound TLS.
 ```
 
 **Discovery and load balancing** (`discovery`):
@@ -622,6 +666,9 @@ ServiceRegistry::register(&self, ServiceKey, ServiceEndpoints)
 ServiceRegistry::get_by_name(&self, name: &str) -> Option<ServiceEndpoints>
 LoadBalancer::new(LoadBalancerType) -> Self
 LoadBalancer::select(&self, &[Endpoint]) -> Option<Endpoint>
+LoadBalancer::select_with_key(&self, &[Endpoint], key: &K) -> Option<Endpoint>  // consistent-hash routing for RingHash
+ConsistentHashRing::new(&[SocketAddr]) -> Self          // 128 virtual nodes/backend
+ConsistentHashRing::lookup(&self, key: &K) -> Option<SocketAddr>
 ```
 
 **Policies** (`policy`):

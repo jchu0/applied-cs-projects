@@ -2,9 +2,11 @@
 
 use crate::cert::CertManager;
 use crate::config::ProxyConfig;
+use crate::policy::MtlsMode;
 use crate::discovery::{EndpointHealth, LoadBalancer, LoadBalancerType, ServiceKey, ServiceRegistry};
 use crate::metrics::ProxyMetrics;
 use crate::policy::{CircuitBreaker, RetryPolicy};
+use crate::tls::TlsManager;
 use crate::tracing_mesh::{SpanContext, Tracer};
 use crate::{Error, Result};
 
@@ -15,7 +17,7 @@ use parking_lot::RwLock;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
@@ -281,7 +283,35 @@ impl SidecarProxy {
     }
 
     /// Handle inbound traffic (from mesh to local application).
+    ///
+    /// When mTLS is enabled ([`MtlsMode::Permissive`] or [`MtlsMode::Strict`])
+    /// each accepted TCP connection is first terminated as a rustls server
+    /// connection using the sidecar's CA-issued certificate. The peer's SPIFFE
+    /// identity is extracted from its client certificate and passed to the
+    /// request-processing logic. In [`MtlsMode::Strict`] a connection that does
+    /// not present a SPIFFE-bearing certificate is rejected.
     async fn handle_inbound(&self, listener: TcpListener) -> Result<()> {
+        let mtls_mode = self.config().mtls_mode;
+
+        // Build the TLS terminator once from the existing cert machinery.
+        let tls_manager = if mtls_mode.tls_enabled() {
+            match TlsManager::from_cert_manager(&self.cert_manager) {
+                Ok(tm) => Some(Arc::new(tm)),
+                Err(e) => {
+                    return Err(Error::Tls(format!(
+                        "mTLS enabled but TLS manager could not be built: {}",
+                        e
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        if tls_manager.is_some() {
+            info!("Inbound mTLS enabled (mode: {:?})", mtls_mode);
+        }
+
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             debug!("Inbound connection from {}", peer_addr);
@@ -289,34 +319,89 @@ impl SidecarProxy {
             let config = self.config();
             let app_port = config.app_port;
             let metrics = Arc::clone(&self.metrics);
+            let tls_manager = tls_manager.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = Self::process_inbound_static(stream, peer_addr, app_port, metrics).await {
+                let result = match tls_manager {
+                    Some(tm) => {
+                        Self::process_inbound_tls(stream, peer_addr, app_port, mtls_mode, tm, metrics)
+                            .await
+                    }
+                    None => {
+                        Self::process_inbound_plaintext(stream, peer_addr, app_port, metrics).await
+                    }
+                };
+                if let Err(e) = result {
                     error!("Inbound processing error from {}: {}", peer_addr, e);
                 }
             });
         }
     }
 
-    /// Process a single inbound connection.
-    async fn process_inbound_static(
-        mut stream: TcpStream,
+    /// Terminate TLS on an inbound connection, verify the peer identity, then
+    /// process the request over the encrypted stream.
+    async fn process_inbound_tls(
+        stream: TcpStream,
         peer_addr: SocketAddr,
         app_port: u16,
+        mtls_mode: MtlsMode,
+        tls_manager: Arc<TlsManager>,
         metrics: Arc<ProxyMetrics>,
     ) -> Result<()> {
-        Self::process_inbound_with_tracing(stream, peer_addr, app_port, metrics, None).await
+        // Perform the rustls server handshake using the sidecar's cert/key.
+        // A plaintext client cannot complete this handshake and is rejected
+        // here, which is exactly the behavior we want in Strict mode.
+        let server_stream = tls_manager.accept(stream).await?;
+
+        // Wrap in the unified stream so we can read the peer certificate's
+        // SPIFFE identity and then proxy over the same encrypted channel.
+        let tls_stream = crate::tls::TlsStream::Server(server_stream);
+        let peer_identity = tls_stream.peer_spiffe_id();
+
+        // In Strict mode a verified SPIFFE identity is mandatory.
+        if mtls_mode.requires_peer_identity() && peer_identity.is_none() {
+            return Err(Error::Unauthorized);
+        }
+
+        Self::process_inbound_with_tracing(
+            tls_stream,
+            peer_addr,
+            app_port,
+            peer_identity,
+            metrics,
+            None,
+        )
+        .await
     }
 
-    /// Process inbound connection with optional tracing.
-    async fn process_inbound_with_tracing(
-        mut stream: TcpStream,
+    /// Process a single plaintext inbound connection (mTLS disabled).
+    async fn process_inbound_plaintext(
+        stream: TcpStream,
         peer_addr: SocketAddr,
         app_port: u16,
         metrics: Arc<ProxyMetrics>,
-        tracer: Option<&Tracer>,
     ) -> Result<()> {
+        Self::process_inbound_with_tracing(stream, peer_addr, app_port, None, metrics, None).await
+    }
+
+    /// Process inbound connection over any stream, with optional peer identity
+    /// and optional tracing.
+    async fn process_inbound_with_tracing<S>(
+        mut stream: S,
+        peer_addr: SocketAddr,
+        app_port: u16,
+        peer_identity: Option<String>,
+        metrics: Arc<ProxyMetrics>,
+        tracer: Option<&Tracer>,
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let start = Instant::now();
+
+        if let Some(ref id) = peer_identity {
+            debug!("Inbound peer SPIFFE identity: {}", id);
+        }
 
         // Read HTTP request from incoming stream
         let mut buf_reader = BufReader::new(&mut stream);
@@ -351,6 +436,15 @@ impl SidecarProxy {
         if let (Some(t), Some(ref s)) = (tracer, &span) {
             let ctx = s.context();
             TraceContextHelper::inject_into_request(t, &ctx, &mut forward_request);
+        }
+        // Propagate the verified peer identity to the local application via an
+        // XFCC-style header (mirrors Envoy's x-forwarded-client-cert), so the
+        // app can make authorization decisions based on the mTLS peer.
+        if let Some(ref id) = peer_identity {
+            forward_request.set_header(
+                "x-forwarded-client-cert".to_string(),
+                format!("URI={}", id),
+            );
         }
         Self::forward_http_request(&mut app_stream, &forward_request).await?;
 
@@ -775,7 +869,10 @@ impl SidecarProxy {
     }
 
     /// Forward an HTTP request to a stream.
-    async fn forward_http_request(stream: &mut TcpStream, request: &HttpRequest) -> Result<()> {
+    async fn forward_http_request<W: AsyncWriteExt + Unpin>(
+        stream: &mut W,
+        request: &HttpRequest,
+    ) -> Result<()> {
         // Write request line
         stream
             .write_all(format!("{} {} {}\r\n", request.method, request.path, request.version).as_bytes())
@@ -799,7 +896,10 @@ impl SidecarProxy {
     }
 
     /// Send an HTTP response to a stream.
-    async fn send_http_response(stream: &mut TcpStream, response: &HttpResponse) -> Result<()> {
+    async fn send_http_response<W: AsyncWriteExt + Unpin>(
+        stream: &mut W,
+        response: &HttpResponse,
+    ) -> Result<()> {
         // Write status line
         stream
             .write_all(

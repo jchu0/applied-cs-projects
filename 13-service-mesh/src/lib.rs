@@ -29,8 +29,8 @@ pub use discovery::{Endpoint, EndpointHealth, LoadBalancer, ServiceEndpoints, Se
 pub use k8s::{SidecarInjector, WebhookServer};
 pub use metrics::ProxyMetrics;
 pub use policy::{
-    AuthorizationPolicy, CircuitBreaker, CircuitBreakerConfig, CircuitState, RetryCondition,
-    RetryPolicy, ServicePolicy, TimeoutPolicy,
+    AuthorizationPolicy, CircuitBreaker, CircuitBreakerConfig, CircuitState, MtlsMode,
+    RetryCondition, RetryPolicy, ServicePolicy, TimeoutPolicy,
 };
 pub use proxy::SidecarProxy;
 pub use tls::{SecureConnection, TlsManager, TlsStream};

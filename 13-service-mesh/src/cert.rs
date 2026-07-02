@@ -50,10 +50,16 @@ impl CertificateAuthority {
         dn.push(DnType::OrganizationName, "mesh");
         params.distinguished_name = dn;
 
-        // Add SPIFFE ID as SAN
+        // Add SPIFFE ID as a URI SAN (used for identity/authorization) and a
+        // DNS SAN (used for WebPKI hostname verification during the TLS
+        // handshake, since the client connects by service identity rather than
+        // by IP). Both are anchored to the same CA so the chain validates.
         params
             .subject_alt_names
             .push(SanType::URI(identity.spiffe_id.clone()));
+        params
+            .subject_alt_names
+            .push(SanType::DnsName(identity.tls_server_name()));
 
         let cert =
             Certificate::from_params(params).map_err(|e| Error::Certificate(e.to_string()))?;

@@ -11,14 +11,22 @@ tracing, and a Kubernetes mutating webhook for sidecar injection.
 - **Sidecar proxy** — inbound (15006) / outbound (15001) / admin (15000) TCP listeners
   that parse and forward HTTP/1.1 with retry and load balancing (`SidecarProxy`).
 - **mTLS with SPIFFE identity** — an `rcgen`-based `CertificateAuthority` issues
-  `spiffe://cluster.local/ns/<ns>/sa/<sa>` SAN certificates; `CertManager` tracks
-  rotation at 80% of lifetime.
-- **TLS transport** — `tokio-rustls` `TlsManager` builds acceptor/connector with client
-  auth; `TlsStream::peer_spiffe_id()` extracts the peer SPIFFE ID via `x509-parser`.
+  certificates carrying a `spiffe://cluster.local/ns/<ns>/sa/<sa>` URI SAN (for identity)
+  and a DNS SAN (for handshake hostname verification); `CertManager` tracks rotation at
+  80% of lifetime.
+- **mTLS on the proxied data path** — when `ProxyConfig::mtls_mode` is `Permissive` or
+  `Strict`, the sidecar terminates a real `tokio-rustls` TLS connection on its inbound
+  listener using the CA-issued cert, extracts the peer's SPIFFE ID from its client
+  certificate, and propagates it to the local app via an `x-forwarded-client-cert`
+  header. In `Strict` mode, plaintext or untrusted-CA clients are rejected. (Outbound
+  hops remain plaintext today — see *Real vs. simulated*.)
 - **Service discovery** — concurrent `ServiceRegistry` (DashMap) keyed by
   `ServiceKey{name, namespace, port}` holding `ServiceEndpoints` with health state.
-- **Load balancing** — `LoadBalancer` with RoundRobin, LeastConnections, Random, and
-  RingHash strategies, filtering to healthy endpoints (`LoadBalancerType`).
+- **Load balancing** — `LoadBalancer` with RoundRobin, LeastConnections, Random, and a
+  real consistent-hash **RingHash** (`ConsistentHashRing`, 128 virtual nodes per
+  backend). `select_with_key(endpoints, key)` maps a key to a stable backend and
+  reassigns only ~`1/N` of keys when membership changes; all strategies filter to
+  healthy endpoints first (`LoadBalancerType`).
 - **Traffic management** — `CircuitBreaker` (Closed / Open / HalfOpen), `RetryPolicy`
   with exponential backoff and jitter, and `TimeoutPolicy`.
 - **xDS control plane** — `XdsServer` / `XdsClient` with CDS, EDS, LDS, and RDS handlers
@@ -32,13 +40,13 @@ tracing, and a Kubernetes mutating webhook for sidecar injection.
 
 ```mermaid
 flowchart TD
-    App[Local application] -->|outbound 15001| Proxy[SidecarProxy]
-    Peer[Peer sidecar] -->|inbound 15006| Proxy
+    App[Local application] -->|outbound 15001 plaintext| Proxy[SidecarProxy]
+    Peer[Peer sidecar] -->|inbound 15006 mTLS| TLS[TlsManager: rustls termination]
+    TLS -->|verified peer SPIFFE id| Proxy
     Proxy -->|admin 15000 metrics, health| Admin[Admin endpoint]
     Proxy --> Registry[ServiceRegistry]
     Proxy --> LB[LoadBalancer]
     Proxy --> CB[CircuitBreaker and RetryPolicy]
-    Proxy --> TLS[TlsManager mTLS]
     Proxy --> Tracer[Tracer W3C context]
     TLS --> Cert[CertificateAuthority and CertManager]
     XdsServer[XdsServer control plane] -->|CDS EDS LDS RDS| XdsClient[XdsClient]
@@ -50,7 +58,7 @@ flowchart TD
 |-----------|--------|----------------|
 | Sidecar proxy | `proxy` | Inbound/outbound/admin listeners, HTTP/1.1 forwarding, retries |
 | Certificates | `cert` | rcgen CA, SPIFFE SAN cert issuance, rotation tracking |
-| TLS transport | `tls` | rustls acceptor/connector, SPIFFE extraction from peer cert |
+| TLS transport | `tls` | rustls acceptor/connector, inbound TLS termination, SPIFFE extraction from peer cert |
 | Discovery & LB | `discovery` | Service registry, endpoint health, load-balancer strategies |
 | Policies | `policy` | Circuit breaker, retry/backoff, timeout, authorization |
 | Metrics | `metrics` | Counters/gauges/histograms, Prometheus text export |
@@ -147,17 +155,28 @@ cb.record_success();                             // closes the circuit
 
 ## What's Real vs Simulated
 
-- **Real:** rcgen-based certificate issuance with SPIFFE SANs; mTLS transport via
-  `tokio-rustls`; circuit-breaker, retry/backoff and timeout logic; load-balancer
-  strategies and the concurrent service registry; HTTP/1.1 sidecar proxying over real
-  TCP listeners; W3C trace-context propagation; the hand-written Prometheus exporter;
-  xDS CDS/EDS/LDS/RDS resource handling; and webhook JSON-patch generation.
-- **Simulated / in-process:** there is no live Kubernetes cluster connection — the
-  webhook operates on `AdmissionReview` values directly. The xDS server and client share
-  resources in-memory rather than over a real gRPC streaming transport (`tonic`/`hyper`
-  are dependencies but the xDS exchange is in-process). No iptables interception is
-  performed; the init-container/iptables redirection is described for Kubernetes but not
-  run locally.
+- **Real:** rcgen-based certificate issuance with SPIFFE SANs; **inbound mTLS on the
+  proxied data path** via `tokio-rustls` — the sidecar performs a genuine rustls server
+  handshake, verifies the client certificate chains to the CA, extracts the peer SPIFFE
+  identity, and rejects plaintext/untrusted clients in `Strict` mode; a real
+  consistent-hash **RingHash** ring (virtual nodes, stable key→backend mapping, bounded
+  reassignment on membership change); circuit-breaker, retry/backoff and timeout logic;
+  the other load-balancer strategies and the concurrent service registry; HTTP/1.1
+  sidecar proxying over real TCP listeners; W3C trace-context propagation; the
+  hand-written Prometheus exporter; xDS CDS/EDS/LDS/RDS resource handling; and webhook
+  JSON-patch generation.
+- **Simulated / in-process / out of scope:**
+  - **Outbound (upstream) mTLS** is not yet wired: the inbound listener terminates TLS
+    and surfaces the verified peer identity, but connections the sidecar makes *to*
+    upstream backends still use plaintext TCP. The client-side `TlsManager::connect` and
+    a SPIFFE-bearing client cert exist and are exercised by the mTLS tests, so extending
+    the outbound hop is incremental; today the data path is encrypted on ingress only.
+  - There is no live Kubernetes cluster connection — the webhook operates on
+    `AdmissionReview` values directly, and no iptables interception is performed.
+  - The xDS server and client share resources in-memory rather than over a real gRPC
+    streaming transport (`tonic`/`hyper` are dependencies but the xDS exchange is
+    in-process).
+  - HTTP/2 is not implemented; proxying is HTTP/1.1 only.
 
 ## Testing
 
@@ -166,10 +185,14 @@ cargo test
 ```
 
 Integration tests under `tests/` cover the proxy, certificate authority, service
-discovery and load balancing, circuit-breaker behaviour, retry policy, concurrent
-registry access, tracing, and a network simulator. Inline `#[cfg(test)]` modules cover
-each component (cert, discovery, policy, proxy, tls, tracing, xDS, k8s). No external
-services are required.
+discovery and load balancing (including consistent-hash RingHash stability, key
+distribution, and bounded reassignment), circuit-breaker behaviour, retry policy,
+concurrent registry access, tracing, and a network simulator. `tests/mtls_test.rs`
+drives the sidecar end-to-end: a TLS client negotiates mTLS and the app observes the
+client's SPIFFE identity, a plaintext client is rejected in `Strict` mode, and an
+untrusted-CA client is rejected. Inline `#[cfg(test)]` modules cover each component
+(cert, discovery, policy, proxy, tls, tracing, xDS, k8s). No external services are
+required.
 
 ## Project Structure
 

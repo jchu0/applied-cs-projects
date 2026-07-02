@@ -237,12 +237,31 @@ impl Default for ServicePolicy {
 /// mTLS mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MtlsMode {
-    /// Disable mTLS.
+    /// Disable mTLS; the inbound data path is accepted as plaintext.
     Disable,
     /// Accept both plaintext and mTLS.
+    ///
+    /// This implementation terminates a TLS handshake on every inbound
+    /// connection when enabled (true byte-sniffing dual-mode is out of scope),
+    /// but unlike `Strict` it does not reject peers that omit a SPIFFE-bearing
+    /// client certificate.
     Permissive,
-    /// mTLS only.
+    /// mTLS only: the inbound connection must complete the TLS handshake and
+    /// present a certificate carrying a SPIFFE identity; plaintext or anonymous
+    /// clients are rejected.
     Strict,
+}
+
+impl MtlsMode {
+    /// Whether TLS should be terminated on the inbound data path.
+    pub fn tls_enabled(&self) -> bool {
+        matches!(self, MtlsMode::Permissive | MtlsMode::Strict)
+    }
+
+    /// Whether a verified peer SPIFFE identity is required.
+    pub fn requires_peer_identity(&self) -> bool {
+        matches!(self, MtlsMode::Strict)
+    }
 }
 
 /// Authorization policy.

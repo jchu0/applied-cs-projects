@@ -1,6 +1,6 @@
 //! Configuration for the service mesh proxy.
 
-use crate::policy::{CircuitBreakerConfig, RetryPolicy};
+use crate::policy::{CircuitBreakerConfig, MtlsMode, RetryPolicy};
 use std::time::{Duration, SystemTime};
 
 /// Proxy configuration.
@@ -24,6 +24,8 @@ pub struct ProxyConfig {
 
     /// TLS configuration.
     pub tls_config: TlsConfig,
+    /// mTLS mode for the inbound (server-side) data path.
+    pub mtls_mode: MtlsMode,
 
     /// Retry policy.
     pub retry_policy: RetryPolicy,
@@ -47,6 +49,7 @@ impl Default for ProxyConfig {
             admin_port: 15000,
             app_port: 8080,
             tls_config: TlsConfig::default(),
+            mtls_mode: MtlsMode::Disable,
             retry_policy: RetryPolicy::default(),
             timeout: Duration::from_secs(30),
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -104,6 +107,24 @@ impl ServiceIdentity {
             service_account: service_account.to_string(),
             namespace: namespace.to_string(),
         }
+    }
+
+    /// DNS name embedded in the workload's certificate for TLS hostname
+    /// verification. Clients dial the upstream by this name so WebPKI
+    /// validation succeeds while identity is still asserted via the SPIFFE URI
+    /// SAN. Falls back to a placeholder when the identity is empty.
+    pub fn tls_server_name(&self) -> String {
+        let sa = if self.service_account.is_empty() {
+            "workload"
+        } else {
+            &self.service_account
+        };
+        let ns = if self.namespace.is_empty() {
+            "default"
+        } else {
+            &self.namespace
+        };
+        format!("{}.{}.mesh", sa, ns)
     }
 }
 
