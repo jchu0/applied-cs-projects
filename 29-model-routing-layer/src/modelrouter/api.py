@@ -3,11 +3,12 @@
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .router import ModelRouter, create_router
 from .schemas import InferenceRequest, Priority, CongestionThrottled, generate_id
+from .security import install_middleware, log_auth_status, require_api_key
 
 
 # --- Request/Response models ---
@@ -50,11 +51,18 @@ def create_app(router: ModelRouter | None = None) -> FastAPI:
     app = FastAPI(title="Model Routing Layer", version="0.1.0")
     app.state.router = router
 
+    # HTTP-layer hardening: rate limiting + request timeout (opt-in via env).
+    install_middleware(app)
+    log_auth_status()
+
+    # Auth dependency applied to every protected route; health/root/docs stay open.
+    protected = Depends(require_api_key)
+
     @app.get("/health")
     async def health():
         return {"status": "ok"}
 
-    @app.post("/v1/inference")
+    @app.post("/v1/inference", dependencies=[protected])
     async def submit_inference(body: InferenceSubmitRequest):
         try:
             priority = Priority[body.priority]
@@ -96,7 +104,7 @@ def create_app(router: ModelRouter | None = None) -> FastAPI:
             "model": response.model,
         }
 
-    @app.post("/workers/register")
+    @app.post("/workers/register", dependencies=[protected])
     async def register_worker(body: WorkerRegisterRequest):
         worker_id = await app.state.router.register_worker(
             worker_id=body.worker_id,
@@ -107,7 +115,7 @@ def create_app(router: ModelRouter | None = None) -> FastAPI:
         )
         return {"worker_id": worker_id}
 
-    @app.get("/workers")
+    @app.get("/workers", dependencies=[protected])
     async def list_workers():
         workers = await app.state.router.registry.get_workers(status=None)
         return {
@@ -124,21 +132,21 @@ def create_app(router: ModelRouter | None = None) -> FastAPI:
             ]
         }
 
-    @app.get("/capacity/{model}")
+    @app.get("/capacity/{model}", dependencies=[protected])
     async def get_model_capacity(model: str):
         capacity = await app.state.router.get_capacity(model)
         return asdict(capacity)
 
-    @app.get("/capacity")
+    @app.get("/capacity", dependencies=[protected])
     async def get_all_capacity():
         capacity = await app.state.router.get_capacity()
         return {model: asdict(info) for model, info in capacity.items()}
 
-    @app.get("/queue/stats")
+    @app.get("/queue/stats", dependencies=[protected])
     async def get_queue_stats():
         return await app.state.router.get_queue_stats()
 
-    @app.get("/metrics")
+    @app.get("/metrics", dependencies=[protected])
     async def get_metrics(limit: int = 100):
         return app.state.router.get_metrics(limit=limit)
 

@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from feature_platform import __version__
 from feature_platform.core.models import Entity, Feature, FeatureView, DataType
 from feature_platform.store.feature_store import FeatureStore
+from feature_platform.api.security import configure_hardening
 from feature_platform.api.models import (
     HealthResponse,
     HealthStatus,
@@ -116,6 +117,10 @@ def create_app(
 
     # Register routes
     _register_routes(app)
+
+    # Wire production hardening (auth / rate limiting / timeouts).
+    # All three are opt-in via env; defaults keep health + docs open.
+    configure_hardening(app)
 
     return app
 

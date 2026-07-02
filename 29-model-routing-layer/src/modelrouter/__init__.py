@@ -58,6 +58,7 @@ from .optimization import (
     CongestionPredictor,
 )
 from .router import ModelRouter, create_router, EXAMPLE_REQUEST
+from .security import require_api_key, SlidingWindowRateLimiter
 from .api import create_app
 
 __version__ = "0.1.0"
@@ -118,6 +119,9 @@ __all__ = [
     "ModelRouter",
     "create_router",
     "EXAMPLE_REQUEST",
+    # Security
+    "require_api_key",
+    "SlidingWindowRateLimiter",
     # API
     "create_app",
 ]

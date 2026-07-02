@@ -96,6 +96,31 @@ curl -X POST localhost:8000/v1/inference \
   -d '{"model":"gpt-4","prompt":"Hello","priority":"NORMAL"}'
 ```
 
+### Security & limits
+
+The HTTP layer ships with opt-in, stdlib-only hardening (`src/modelrouter/security.py`),
+configured entirely through environment variables:
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `API_KEYS` | *(unset)* | Comma-separated valid keys. When unset/empty, auth is **disabled** (a single startup warning is logged). When set, every endpoint except `/health`, `/`, and the docs (`/docs`, `/redoc`, `/openapi.json`) requires a key via `Authorization: Bearer <key>` or `X-API-Key: <key>`; missing/invalid returns 401. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | In-process sliding-window limit keyed by API key (or client IP if none). `0` disables. Over-limit returns 429 with a `Retry-After` header. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout; on expiry returns 504. `0` disables. There are no streaming/SSE/websocket endpoints, so none are exempted from the timeout. |
+
+```bash
+API_KEYS=secret-key uvicorn modelrouter.api:create_app --factory --port 8000 &
+
+curl -X POST localhost:8000/v1/inference \
+  -H 'content-type: application/json' \
+  -H 'Authorization: Bearer secret-key' \
+  -d '{"model":"gpt-4","prompt":"Hello","priority":"NORMAL"}'
+```
+
+This HTTP-layer auth/rate-limit is separate from the per-tenant `Gateway`/`RateLimiter`
+(which key off `Tenant.api_key` and feed the scheduler's quota logic). The served
+endpoints route through `ModelRouter.submit` directly; the `Gateway` class is exercised by
+its own tests and the `handle_request` path but is not currently on the HTTP request path.
+
 ## Usage
 
 ```python
@@ -129,11 +154,18 @@ asyncio.run(main())
 
 ## What's Real vs Simulated
 
-- **Real:** Gateway authentication, priority/SLA assignment, token-bucket rate limiting,
-  per-model priority queueing, all six routing strategies, the DQN RL router and replay
-  buffer, the congestion-prediction network, quota enforcement, preemption, canary
-  traffic splitting, capacity aggregation, and the cost/latency models. All are pure Python
-  + NumPy and fully exercised by the test suite.
+- **Real:** Opt-in HTTP API-key auth (`API_KEYS`), in-process sliding-window rate limiting
+  (`RATE_LIMIT_PER_MINUTE`), and per-request timeouts (`REQUEST_TIMEOUT_SECONDS`) enforced
+  on every served endpoint (see [Security & limits](#security--limits)); the per-tenant
+  Gateway authentication and token-bucket rate limiter, priority/SLA assignment, per-model
+  priority queueing, all six routing strategies, the DQN RL router and replay buffer, the
+  congestion-prediction network, quota enforcement, preemption, canary traffic splitting,
+  capacity aggregation, and the cost/latency models. All are pure Python + NumPy and fully
+  exercised by the test suite.
+- **Layering note:** The FastAPI endpoints enforce auth/limits at the HTTP boundary and
+  call `ModelRouter.submit` directly. The `Gateway`/`TenantAuthenticator`/`RateLimiter`
+  per-tenant path (`handle_request`) is tested independently but is not wired into the HTTP
+  request path.
 - **Simulated / requires credentials:** Worker execution is mocked — `_execute_on_worker`
   sleeps briefly and returns a synthetic `InferenceResponse` rather than calling a real
   inference backend. GPU metrics in `GPUMonitor.collect_metrics` and the worker ping in
@@ -147,10 +179,11 @@ asyncio.run(main())
 pytest tests/ -v
 ```
 
-The suite (182 tests across `test_router.py`, `test_scheduler.py`, `test_gateway.py`,
-`test_model_router.py`, `test_optimization.py`, `test_api.py`) covers each routing strategy,
-queue ordering, rate limiting, quota and preemption logic, the RL and congestion networks,
-and the FastAPI endpoints. No external services are needed.
+The suite (190 tests across `test_router.py`, `test_scheduler.py`, `test_gateway.py`,
+`test_model_router.py`, `test_optimization.py`, `test_api.py`, `test_security.py`) covers
+each routing strategy, queue ordering, rate limiting, quota and preemption logic, the RL and
+congestion networks, the FastAPI endpoints, and the HTTP-layer auth/rate-limit hardening.
+No external services are needed.
 
 ## Project Structure
 
@@ -166,7 +199,8 @@ and the FastAPI endpoints. No external services are needed.
     registry/                   # Worker registry, health, GPU monitor
     enterprise/                 # Quotas, preemption, traffic splitting
     optimization/               # RL router, congestion prediction
-  tests/                        # Pytest suite (182 tests)
+    security.py                 # HTTP-layer API-key auth, rate limit, timeout
+  tests/                        # Pytest suite (190 tests)
   docs/
     BLUEPRINT.md                # Full architecture and design
     SETUP.md                    # Environment setup

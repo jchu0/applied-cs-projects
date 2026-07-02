@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from ..engine import WorkflowEngine
 from ..enterprise import to_mermaid, to_dot
+from .security import install_security
 
 
 # --------------------------------------------------------------- request models
@@ -187,6 +188,7 @@ def create_app(engine: Optional[WorkflowEngine] = None) -> FastAPI:
     def reject_review(review_id: str, decision: ReviewDecision) -> dict:
         return _resolve_review(engine, review_id, "reject", decision)
 
+    install_security(app)
     return app
 
 

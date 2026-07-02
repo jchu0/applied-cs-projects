@@ -4,13 +4,14 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..schemas import Document, generate_id
 from ..pipeline import create_pipeline, RAGPipeline
+from .security import install_hardening, require_api_key
 
 
 # =============================================================================
@@ -92,6 +93,8 @@ def create_app(
         title="Advanced RAG API",
         description="Production-grade Retrieval-Augmented Generation with neural reranking",
         version="1.0.0",
+        # Global API-key auth (opt-in via API_KEYS); open paths self-exempt.
+        dependencies=[Depends(require_api_key)],
     )
 
     # CORS
@@ -102,6 +105,9 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Production hardening: auth warning, rate limiting, request timeouts.
+    install_hardening(app)
 
     # Initialize pipeline
     pipeline = create_pipeline()

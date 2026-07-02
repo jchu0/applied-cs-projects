@@ -65,6 +65,25 @@ uvicorn feature_platform.api.main:app --reload
 # Interactive docs at http://localhost:8000/docs
 ```
 
+### Security & limits
+
+Three opt-in hardening controls are configured via environment variables. All
+default to a safe posture and leave `/health`, `/`, and the docs
+(`/docs`, `/redoc`, `/openapi.json`) open.
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `API_KEYS` | *(unset)* | Comma-separated valid keys. Unset disables auth. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Requests/minute per key or client IP; `0` disables. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout; `504` on exceed; `0` disables. |
+
+When `API_KEYS` is set, pass a key via `Authorization: Bearer <key>` or `X-API-Key: <key>`:
+
+```bash
+API_KEYS=my-secret uvicorn feature_platform.api.main:app
+curl -H "Authorization: Bearer my-secret" http://localhost:8000/feature-views
+```
+
 ## Usage
 
 Transform features with the library:
@@ -129,7 +148,8 @@ print(result.is_drifted, result.score)
   materialization and point-in-time retrieval; the DAG engine (cycle detection, topological
   sort, parallel levels, retries); schema/statistical validation; PSI/KS/Chi-squared/JS/
   Wasserstein drift and the streaming DDM/ADWIN/CUSUM detectors; discovery search, similarity,
-  and recommendations; and the full FastAPI surface.
+  and recommendations; and the full FastAPI surface with opt-in API-key auth,
+  in-process rate limiting, and request timeouts (see Security & limits).
 - **Simulated / requires credentials:** The Redis online store and DuckDB offline store require
   those services/packages (the in-memory and Parquet implementations are the defaults). There
   are no scikit-learn `Pipeline` adapters or PyTorch/TensorFlow dataset connectors — the

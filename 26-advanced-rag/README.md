@@ -91,6 +91,27 @@ uvicorn advancedrag.api.main:app --reload
 # -> http://localhost:8000  (health at /health, docs at /docs)
 ```
 
+### Security & limits
+
+Three cross-cutting protections are opt-in via environment variables (stdlib only,
+no extra dependencies). All default to a safe, dev-friendly posture:
+
+| Env var | Default | Behavior |
+|---------|---------|----------|
+| `API_KEYS` | *(unset)* | Comma-separated valid keys. Unset/empty **disables auth** (a startup warning is logged). When set, requests need `Authorization: Bearer <key>` or `X-API-Key: <key>`; missing/invalid returns 401. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Per-caller sliding-window limit (keyed by API key, else client IP). `0` disables. Over-limit returns 429 with `Retry-After`. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout. `0` disables. On timeout returns 504 JSON. |
+
+Health/readiness/root and docs (`/docs`, `/redoc`, `/openapi.json`) stay open regardless.
+
+```bash
+API_KEYS=my-secret-key uvicorn advancedrag.api.main:app
+curl -H "Authorization: Bearer my-secret-key" \
+     -H "Content-Type: application/json" \
+     -d '{"query": "What is Python?"}' \
+     http://localhost:8000/v1/query
+```
+
 ## Usage
 
 The default pipeline runs entirely in process with mock embeddings, an in-memory vector
@@ -141,7 +162,9 @@ pipeline = create_pipeline(
   context dedup/compression/assembly, citation extraction, rule-based hallucination checks,
   confidence scoring, all evaluation metrics and bootstrap CIs, A/B t-test analysis, caching,
   metrics, batching, and the FastAPI endpoints. These run with no external services and are
-  covered by the test suite.
+  covered by the test suite. The API ships opt-in production hardening (API-key auth,
+  in-process rate limiting, request timeouts) that is **disabled by default** — see
+  [Security & limits](#security--limits) — so the quick-start and tests need no credentials.
 - **Simulated / requires credentials:** The default `MockEmbedding` produces deterministic
   random vectors and `MockReranker` passes results through unchanged — both are for testing.
   LLM-dependent stages (`LLMQueryRewriter`, `SLMReranker`, LLM compression, LLM-based

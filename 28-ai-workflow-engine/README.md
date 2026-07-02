@@ -66,6 +66,23 @@ Run a flow programmatically (see Usage below), or serve the REST API:
 uvicorn aiworkflow.api:app --reload
 ```
 
+### Security & limits
+
+The REST API ships with opt-in production hardening, all configured via environment variables (stdlib only, no extra deps):
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `API_KEYS` | *(unset)* | Comma-separated valid keys. Unset/empty disables auth (a startup warning is logged). |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Per-client request cap (by API key, else client IP). `0` disables. Over-limit returns `429` with `Retry-After`. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request wall-clock budget. `0` disables. On timeout returns `504`. |
+
+When auth is enabled, send the key as `Authorization: Bearer <key>` or `X-API-Key: <key>`. `/health`, `/`, and the docs (`/docs`, `/redoc`, `/openapi.json`) stay open. There are no streaming/SSE/websocket endpoints, so nothing is exempt from the timeout.
+
+```bash
+API_KEYS=mysecret uvicorn aiworkflow.api:app
+curl -H "Authorization: Bearer mysecret" http://localhost:8000/flows
+```
+
 ## Usage
 
 Define a flow with the schema types and run it. LLM and retrieval executors return deterministic mock output (see What's Real vs Simulated):
@@ -123,7 +140,7 @@ engine.node_registry.register("doubler", DoubleExecutor())
 
 ## What's Real vs Simulated
 
-- **Real:** parsing (YAML/JSON/DSL/dict), validation, DAG construction with cycle detection, topological sort and level grouping, the flow optimizer, the level-parallel async scheduler with semaphore-bounded concurrency and `{{...}}` input resolution, retry strategies and the circuit breaker, flow versioning/diff/migration, the human-in-the-loop review store and its `asyncio.Event` wait, secret resolution and masking, Mermaid/Graphviz export, and the FastAPI app. All of this is exercised by the test suite.
+- **Real:** parsing (YAML/JSON/DSL/dict), validation, DAG construction with cycle detection, topological sort and level grouping, the flow optimizer, the level-parallel async scheduler with semaphore-bounded concurrency and `{{...}}` input resolution, retry strategies and the circuit breaker, flow versioning/diff/migration, the human-in-the-loop review store and its `asyncio.Event` wait, secret resolution and masking, Mermaid/Graphviz export, the FastAPI app, and its opt-in API-key auth, in-process rate limiting, and request timeouts (see Security & limits). All of this is exercised by the test suite.
 - **Simulated / requires credentials:** the LLM executor returns a templated placeholder string and the retrieval executor returns synthetic documents — no model API is called. The `DataNode`, `ModelNode`, and similar helpers import `pandas`/`sqlalchemy`/`sklearn`/`aiohttp` lazily and need those optional dependencies and real data sources to do anything. Run history, the version store, and the review store are in-memory only (no persistence backend).
 
 ## Testing
@@ -134,7 +151,7 @@ pytest --cov=aiworkflow     # with coverage
 pytest tests/test_engine.py -v
 ```
 
-The suite has 215 tests across 14 files covering the compiler, DAG edge cases, scheduler under load, node executors, retry strategy scenarios, error propagation, subflows, enterprise features, the API, and end-to-end integration. No external services are required — LLM/retrieval calls are mocked in-process.
+The suite has 219 tests across 15 files covering the compiler, DAG edge cases, scheduler under load, node executors, retry strategy scenarios, error propagation, subflows, enterprise features, the API and its hardening layer, and end-to-end integration. No external services are required — LLM/retrieval calls are mocked in-process.
 
 ## Project Structure
 
