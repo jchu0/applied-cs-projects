@@ -27,6 +27,53 @@ const SSTABLE_VERSION: u32 = 1;
 /// Footer size in bytes (u64 + u64 + i64 + i64 + u32 + u32 + u32 = 44)
 const FOOTER_SIZE: usize = 44;
 
+/// Read a fixed-size little-endian value out of a byte slice at `*offset`,
+/// advancing the offset. Returns a `Corruption` error instead of panicking if
+/// the slice is too short (e.g. a truncated or corrupted SSTable index).
+macro_rules! read_le {
+    ($ty:ty, $buf:expr, $offset:expr, $what:expr) => {{
+        const N: usize = std::mem::size_of::<$ty>();
+        let start: usize = $offset;
+        let end = start
+            .checked_add(N)
+            .ok_or_else(|| TsdbError::corruption(concat!("SSTable index offset overflow reading ", $what)))?;
+        let bytes = $buf.get(start..end).ok_or_else(|| {
+            TsdbError::corruption(format!(
+                concat!("Truncated SSTable index: need {} bytes for ", $what, " at offset {}, have {}"),
+                N,
+                start,
+                $buf.len()
+            ))
+        })?;
+        $offset = end;
+        // Slice is guaranteed to be exactly N bytes, so try_into cannot fail.
+        <$ty>::from_le_bytes(bytes.try_into().expect("slice length checked above"))
+    }};
+}
+
+/// Take `len` bytes from `buf` starting at `*offset`, advancing the offset.
+/// Returns a `Corruption` error instead of panicking on an out-of-bounds range
+/// (e.g. a length field that points past the end of a corrupted data block).
+macro_rules! take_bytes {
+    ($buf:expr, $offset:expr, $len:expr, $what:expr) => {{
+        let start: usize = $offset;
+        let want = $len as usize;
+        let end = start
+            .checked_add(want)
+            .ok_or_else(|| TsdbError::corruption(concat!("SSTable offset overflow reading ", $what)))?;
+        let slice = $buf.get(start..end).ok_or_else(|| {
+            TsdbError::corruption(format!(
+                concat!("Truncated SSTable block: need {} bytes for ", $what, " at offset {}, have {}"),
+                want,
+                start,
+                $buf.len()
+            ))
+        })?;
+        $offset = end;
+        slice
+    }};
+}
+
 /// SSTable file format:
 /// [Data Blocks] [Index Block] [Footer]
 ///
@@ -280,25 +327,42 @@ impl SSTableReader {
             )));
         }
 
+        // Validate the index region lies within the file body (before the
+        // footer) so a corrupt footer can't drive a huge allocation or seek.
+        let body_size = file_size - FOOTER_SIZE as u64;
+        if index_offset > body_size || index_length > body_size - index_offset {
+            return Err(TsdbError::corruption(format!(
+                "SSTable index region out of bounds: offset {} length {} (body size {})",
+                index_offset, index_length, body_size
+            )));
+        }
+
         // Read index
         file.seek(SeekFrom::Start(index_offset))?;
         let mut index_data = vec![0u8; index_length as usize];
         file.read_exact(&mut index_data)?;
 
         let (count, mut offset) = decode_varint(&index_data)?;
+
+        // A valid index has 36 bytes per entry (u64 + u64 + u32 + i64 + i64);
+        // reject a count that cannot possibly fit in the index bytes rather
+        // than pre-allocating an attacker-controlled amount of memory.
+        const ENTRY_SIZE: u64 = 8 + 8 + 4 + 8 + 8;
+        let remaining = (index_data.len() - offset) as u64;
+        if count > remaining / ENTRY_SIZE {
+            return Err(TsdbError::corruption(format!(
+                "SSTable index entry count {} exceeds available bytes {}",
+                count, remaining
+            )));
+        }
         let mut index = Vec::with_capacity(count as usize);
 
         for _ in 0..count {
-            let series_key = u64::from_le_bytes(index_data[offset..offset + 8].try_into().unwrap());
-            offset += 8;
-            let entry_offset = u64::from_le_bytes(index_data[offset..offset + 8].try_into().unwrap());
-            offset += 8;
-            let length = u32::from_le_bytes(index_data[offset..offset + 4].try_into().unwrap());
-            offset += 4;
-            let entry_min_ts = i64::from_le_bytes(index_data[offset..offset + 8].try_into().unwrap());
-            offset += 8;
-            let entry_max_ts = i64::from_le_bytes(index_data[offset..offset + 8].try_into().unwrap());
-            offset += 8;
+            let series_key = read_le!(u64, index_data, offset, "index series key");
+            let entry_offset = read_le!(u64, index_data, offset, "index entry offset");
+            let length = read_le!(u32, index_data, offset, "index entry length");
+            let entry_min_ts = read_le!(i64, index_data, offset, "index entry min timestamp");
+            let entry_max_ts = read_le!(i64, index_data, offset, "index entry max timestamp");
 
             index.push(IndexEntry {
                 series_key,
@@ -337,43 +401,58 @@ impl SSTableReader {
 
         let mut offset = 0;
 
+        // Bounds-checked view into `data` starting at the current offset; used
+        // to feed the varint decoder without risking an out-of-range panic on a
+        // corrupted or truncated data block.
+        macro_rules! rest {
+            () => {
+                data.get(offset..).ok_or_else(|| {
+                    TsdbError::corruption(format!(
+                        "Truncated SSTable block: offset {} past end {}",
+                        offset,
+                        data.len()
+                    ))
+                })?
+            };
+        }
+
         // Read series key
-        let _key = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        offset += 8;
+        let _key = read_le!(u64, data, offset, "series key");
 
         // Read metric name
-        let (name_len, bytes_read) = decode_varint(&data[offset..])?;
+        let (name_len, bytes_read) = decode_varint(rest!())?;
         offset += bytes_read;
-        let name = String::from_utf8(data[offset..offset + name_len as usize].to_vec())
+        let name_bytes = take_bytes!(data, offset, name_len, "metric name");
+        let name = String::from_utf8(name_bytes.to_vec())
             .map_err(|e| TsdbError::corruption(format!("Invalid metric name: {}", e)))?;
-        offset += name_len as usize;
 
         // Read tags
-        let (tags_count, bytes_read) = decode_varint(&data[offset..])?;
+        let (tags_count, bytes_read) = decode_varint(rest!())?;
         offset += bytes_read;
 
         let mut tags = std::collections::BTreeMap::new();
         for _ in 0..tags_count {
-            let (key_len, bytes_read) = decode_varint(&data[offset..])?;
+            let (key_len, bytes_read) = decode_varint(rest!())?;
             offset += bytes_read;
-            let key = String::from_utf8(data[offset..offset + key_len as usize].to_vec())
+            let key_bytes = take_bytes!(data, offset, key_len, "tag key");
+            let key = String::from_utf8(key_bytes.to_vec())
                 .map_err(|e| TsdbError::corruption(format!("Invalid tag key: {}", e)))?;
-            offset += key_len as usize;
 
-            let (value_len, bytes_read) = decode_varint(&data[offset..])?;
+            let (value_len, bytes_read) = decode_varint(rest!())?;
             offset += bytes_read;
-            let value = String::from_utf8(data[offset..offset + value_len as usize].to_vec())
+            let value_bytes = take_bytes!(data, offset, value_len, "tag value");
+            let value = String::from_utf8(value_bytes.to_vec())
                 .map_err(|e| TsdbError::corruption(format!("Invalid tag value: {}", e)))?;
-            offset += value_len as usize;
 
             tags.insert(key, value);
         }
 
         // Read compressed data
-        let (data_len, bytes_read) = decode_varint(&data[offset..])?;
+        let (data_len, bytes_read) = decode_varint(rest!())?;
         offset += bytes_read;
 
-        let points = decompress_points(&data[offset..offset + data_len as usize])?;
+        let compressed = take_bytes!(data, offset, data_len, "compressed data");
+        let points = decompress_points(compressed)?;
 
         let metric = Metric::with_tags(name, tags);
         let mut series = Series::new(metric);
@@ -661,6 +740,63 @@ mod tests {
         assert_eq!(meta.point_count, 100);
         assert_eq!(meta.min_timestamp, 1000);
         assert_eq!(meta.max_timestamp, 1000 + 99 * 60);
+    }
+
+    #[test]
+    fn test_sstable_truncated_index_returns_err() {
+        // A valid SSTable whose index bytes are truncated on disk must surface
+        // a clean error instead of panicking.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("truncated.sst");
+
+        let series = create_test_series("cpu.usage", 100);
+        let meta = SSTable::create(&path, &[series]).unwrap();
+
+        // Cut the file so the footer's index region no longer fits. Keeping a
+        // few bytes of the index means index_offset stays valid but the region
+        // is short -> read_exact / bounds checks must catch it, not panic.
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(meta.file_size - FOOTER_SIZE as u64 - 4).unwrap();
+        drop(file);
+
+        let result = std::panic::catch_unwind(|| SSTable::open(&path));
+        assert!(result.is_ok(), "opening a truncated SSTable must not panic");
+        assert!(result.unwrap().is_err(), "truncated SSTable must return Err");
+    }
+
+    #[test]
+    fn test_sstable_corrupt_index_bytes_returns_err() {
+        // Corrupting the index region (without touching the footer) should be
+        // rejected as corruption/decode failure rather than panicking.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt.sst");
+
+        let series = create_test_series("cpu.usage", 100);
+        let meta = SSTable::create(&path, &[series]).unwrap();
+
+        // Read footer to locate the index region.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let footer_start = bytes.len() - FOOTER_SIZE;
+        let index_offset = u64::from_le_bytes(
+            bytes[footer_start..footer_start + 8].try_into().unwrap(),
+        ) as usize;
+
+        // Overwrite the index count/entry bytes with garbage that decodes to a
+        // huge entry count / out-of-range offsets.
+        for b in bytes[index_offset..footer_start].iter_mut() {
+            *b = 0xFF;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(bytes.len() as u64, meta.file_size);
+
+        let result = std::panic::catch_unwind(|| {
+            let table = SSTable::open(&path)?;
+            // If open somehow succeeds, reading must also not panic.
+            table.read_series(0)?;
+            Ok::<_, TsdbError>(())
+        });
+        assert!(result.is_ok(), "corrupt SSTable must not panic");
+        assert!(result.unwrap().is_err(), "corrupt SSTable must return Err");
     }
 
     #[test]
