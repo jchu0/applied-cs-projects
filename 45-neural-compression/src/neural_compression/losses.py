@@ -3,7 +3,7 @@
 This module implements:
 - MSELoss: Standard mean squared error
 - MS_SSIM: Multi-scale structural similarity
-- LPIPS: Learned perceptual image patch similarity
+- LPIPSLoss: A VGG-feature perceptual approximation (NOT calibrated LPIPS; see class)
 - RateDistortionLoss: Combined R-D loss
 """
 
@@ -283,37 +283,51 @@ class VGGPerceptualLoss(nn.Module):
 
 
 class LPIPSLoss(nn.Module):
-    """Learned Perceptual Image Patch Similarity (LPIPS) loss.
+    """VGG-feature perceptual loss (an approximation, NOT calibrated LPIPS).
 
-    A simplified implementation using VGG features with learned weights.
+    IMPORTANT: This is *not* the true LPIPS metric of Zhang et al. (2018). Real
+    LPIPS uses linear layers calibrated on a large human-perceptual-judgment
+    dataset (BAPPS) on top of channelwise-normalized deep features. This class
+    is a lightweight stand-in that simply delegates to :class:`VGGPerceptualLoss`
+    (feature-space MSE over selected VGG-19 layers) with uniform, *non-learned*
+    layer weights. It is a reasonable perceptual training signal but its values
+    are not comparable to published LPIPS scores and must not be reported as
+    LPIPS. For calibrated LPIPS, install and use the ``lpips`` package.
 
     Args:
-        net: Network to use for features ('vgg' or 'alex')
-        normalize: Whether to normalize input
+        net: Kept for API familiarity with LPIPS; only ``'vgg'`` is supported
+            (the underlying feature extractor is always VGG-19).
+        normalize: Whether to apply ImageNet input normalization before features.
     """
 
     def __init__(self, net: str = "vgg", normalize: bool = True):
         super().__init__()
+        if net != "vgg":
+            raise ValueError(
+                f"Unsupported net {net!r}: this VGG-feature approximation only "
+                "supports net='vgg'."
+            )
         self.net = net
         self.normalize = normalize
 
         # Use VGG features
         self.vgg_loss = VGGPerceptualLoss(normalize_input=normalize)
 
-        # Learned scaling factors (simplified - in full LPIPS these are learned)
+        # Uniform per-layer weights. NOTE: real LPIPS learns these on human
+        # perceptual judgments; here they are fixed to 1.0 (i.e. not learned).
         self.register_buffer(
             "scales", torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32)
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Compute LPIPS loss.
+        """Compute the VGG-feature perceptual distance.
 
         Args:
             x: Predicted image [B, C, H, W]
             y: Target image [B, C, H, W]
 
         Returns:
-            LPIPS distance
+            Scalar perceptual distance (VGG-feature MSE; not calibrated LPIPS).
         """
         return self.vgg_loss(x, y)
 

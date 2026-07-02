@@ -456,8 +456,10 @@ class MultiRateCodec(nn.Module):
 `losses.py` provides the distortion and perceptual measures: `SSIMLoss` (windowed SSIM via a
 Gaussian kernel), `MS_SSIMLoss` (multi-scale SSIM with the standard five-scale weights
 `[0.0448, 0.2856, 0.3001, 0.2363, 0.1333]`), `VGGPerceptualLoss` (feature MSE over selected
-VGG-19 layers, lazily loaded and frozen), `LPIPSLoss` (a simplified LPIPS built on those VGG
-features), and `CharbonnierLoss` (a robust smooth-L1 variant). `RateDistortionLoss` is the
+VGG-19 layers, lazily loaded and frozen), `LPIPSLoss` (a VGG-feature perceptual *approximation*
+that delegates to `VGGPerceptualLoss` with fixed, non-learned layer weights — it is **not**
+calibrated LPIPS and its values are not comparable to published LPIPS scores; use the `lpips`
+package for the real metric), and `CharbonnierLoss` (a robust smooth-L1 variant). `RateDistortionLoss` is the
 optimization objective: it computes bits-per-pixel from the `y`/`z` likelihoods, selects a
 distortion term (`mse`, `ms_ssim`, `lpips`, or `mixed`), and returns
 `distortion + lambda_rd * bpp` with a metrics dict including PSNR.
@@ -491,7 +493,8 @@ raise `NotImplementedError` and defer to `NeuralCompressionCodec`.
 `losses.py` provides the distortion and perceptual measures: `SSIMLoss` (windowed SSIM via a
 Gaussian kernel), `MS_SSIMLoss` (multi-scale SSIM with the standard five-scale weights),
 `VGGPerceptualLoss` (feature MSE over selected VGG-19 layers, lazily loaded),
-`LPIPSLoss` (a simplified LPIPS built on the VGG features), and `CharbonnierLoss` (a robust
+`LPIPSLoss` (a VGG-feature *approximation* of LPIPS, not the calibrated metric — see the
+Losses subsection above), and `CharbonnierLoss` (a robust
 smooth-L1 variant). `RateDistortionLoss` is the optimization objective: it computes
 bits-per-pixel from the `y`/`z` likelihoods, selects a distortion term
 (`mse`, `ms_ssim`, `lpips`, or `mixed`), and returns `distortion + lambda_rd * bpp` with a
@@ -526,8 +529,11 @@ self.scheduler = optim.lr_scheduler.MultiStepLR(
 
 `ImageFolderDataset` recursively loads images (Pillow, with an OpenCV fallback) as `[C, H, W]`
 tensors in `[0, 1]`. `RandomCropTransform`, `CenterCropTransform`, `RandomHorizontalFlip`, and
-`ComposeTransform` provide augmentation. `KodakDataset` downloads and serves the 24-image Kodak
-benchmark. `create_dataloaders` wires train/val loaders with the standard crop+flip pipeline.
+`ComposeTransform` provide augmentation. `KodakDataset` serves the 24-image Kodak benchmark
+from a local cache; downloading is opt-in (`download=True`) and each fetched file is
+downloaded to a temporary path, validated as a decodable image, and only then atomically
+moved into place, so partial or corrupt downloads raise a clear error instead of being
+silently served. `create_dataloaders` wires train/val loaders with the standard crop+flip pipeline.
 
 ## Data Structures
 

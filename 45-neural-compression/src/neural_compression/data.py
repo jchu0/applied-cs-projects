@@ -219,18 +219,23 @@ class RandomHorizontalFlip:
 class KodakDataset(Dataset):
     """Kodak test dataset (24 images).
 
-    Standard test set for image compression evaluation.
+    Standard test set for image compression evaluation. Images are cached in
+    ``root``; downloading is opt-in via ``download=True``. Each downloaded file
+    is fetched to a temporary path, validated as a decodable image, and only
+    then moved into place, so partial or corrupt downloads are never left behind
+    and never silently accepted.
 
     Args:
-        root: Root directory (will download if needed)
-        download: Whether to download if not present
+        root: Root directory used to cache the images.
+        download: If True, download any images not already cached. If False,
+            the images must already be present in ``root``.
     """
 
     KODAK_URLS = [
         f"http://r0k.us/graphics/kodak/kodak/kodim{i:02d}.png" for i in range(1, 25)
     ]
 
-    def __init__(self, root: Union[str, Path], download: bool = True):
+    def __init__(self, root: Union[str, Path], download: bool = False):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -239,22 +244,66 @@ class KodakDataset(Dataset):
         if download:
             self._download()
 
-        # Check all images exist
+        # Check all images exist and are usable.
         missing = [p for p in self.image_paths if not p.exists()]
         if missing:
-            raise ValueError(f"Missing Kodak images: {missing}")
+            raise FileNotFoundError(
+                f"Missing {len(missing)} Kodak image(s) in {self.root}: "
+                f"{[p.name for p in missing]}. Pass download=True to fetch them, "
+                "or place the kodim01..kodim24 PNGs in this directory."
+            )
+
+    @staticmethod
+    def _validate_image(path: Path) -> None:
+        """Raise a clear error if ``path`` is not a decodable image."""
+        try:
+            from PIL import Image
+
+            with Image.open(path) as img:
+                img.verify()  # detects truncated/corrupt files without full decode
+        except ImportError:
+            # No PIL: fall back to a minimal PNG signature + non-empty check.
+            data = path.read_bytes()
+            if len(data) < 8 or data[:8] != b"\x89PNG\r\n\x1a\n":
+                raise ValueError(
+                    f"Downloaded file {path} is not a valid PNG "
+                    f"(size={len(data)} bytes)."
+                )
+        except Exception as e:  # PIL raised on a corrupt/truncated image
+            raise ValueError(f"Downloaded file {path} is not a valid image: {e}")
 
     def _download(self):
-        """Download Kodak dataset."""
-        try:
-            import urllib.request
+        """Download any missing Kodak images with integrity validation.
 
-            for url, path in zip(self.KODAK_URLS, self.image_paths):
-                if not path.exists():
-                    print(f"Downloading {url}...")
-                    urllib.request.urlretrieve(url, path)
-        except Exception as e:
-            print(f"Warning: Could not download Kodak images: {e}")
+        Each file is downloaded to a temporary path in ``root``, validated as a
+        decodable image, and then atomically moved into place. A failed or
+        corrupt download raises a clear error rather than leaving a partial file.
+        """
+        import tempfile
+        import urllib.error
+        import urllib.request
+
+        for url, path in zip(self.KODAK_URLS, self.image_paths):
+            if path.exists():
+                continue
+
+            print(f"Downloading {url}...")
+            fd, tmp_name = tempfile.mkstemp(
+                dir=self.root, prefix=path.name, suffix=".part"
+            )
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            try:
+                urllib.request.urlretrieve(url, tmp_path)
+                if tmp_path.stat().st_size == 0:
+                    raise ValueError("downloaded file is empty (0 bytes)")
+                self._validate_image(tmp_path)
+                tmp_path.replace(path)  # atomic move into cache
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                tmp_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Failed to download a valid Kodak image from {url}: {e}"
+                ) from e
 
     def __len__(self) -> int:
         return 24

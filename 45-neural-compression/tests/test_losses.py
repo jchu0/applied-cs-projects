@@ -12,6 +12,8 @@ from neural_compression.losses import (
     MS_SSIMLoss,
     RateDistortionLoss,
     CharbonnierLoss,
+    LPIPSLoss,
+    VGGPerceptualLoss,
 )
 
 
@@ -117,6 +119,28 @@ class TestRateDistortionLoss:
 
         # Higher lambda = higher loss (rate is non-zero)
         assert loss_high > loss_low
+
+
+class TestLPIPSLoss:
+    """Tests for the VGG-feature LPIPS approximation."""
+
+    def test_rejects_unsupported_net(self):
+        """Only net='vgg' is supported; anything else must raise."""
+        with pytest.raises(ValueError):
+            LPIPSLoss(net="alex")
+
+    def test_constructs_with_vgg(self):
+        """net='vgg' constructs and wraps a VGGPerceptualLoss."""
+        loss_fn = LPIPSLoss(net="vgg")
+        assert isinstance(loss_fn.vgg_loss, VGGPerceptualLoss)
+        # Uniform, non-learned scales (documented as not calibrated).
+        assert torch.allclose(loss_fn.scales, torch.ones(4))
+
+    def test_docstring_is_honest(self):
+        """Docstring must not claim to be calibrated/true LPIPS."""
+        doc = LPIPSLoss.__doc__ or ""
+        assert "not calibrated" in doc.lower() or "NOT calibrated" in doc
+        assert "approximation" in doc.lower()
 
 
 class TestCharbonnierLoss:

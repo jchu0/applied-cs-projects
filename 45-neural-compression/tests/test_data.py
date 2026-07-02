@@ -179,3 +179,86 @@ class TestImageFolderDataset:
 
             except ImportError:
                 pytest.skip("PIL not available")
+
+
+class TestKodakDataset:
+    """Tests for KodakDataset integrity handling (no real network)."""
+
+    def _make_kodak_png(self, path):
+        from PIL import Image
+        import numpy as np
+        img = Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8))
+        img.save(path)
+
+    def test_download_is_opt_in(self):
+        """Default download=False: missing images raise, no network access."""
+        from neural_compression.data import KodakDataset
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(FileNotFoundError):
+                KodakDataset(tmpdir)  # download defaults to False
+
+    def test_serves_cached_images(self):
+        """A fully populated cache loads without downloading."""
+        pytest.importorskip("PIL")
+        from neural_compression.data import KodakDataset
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(1, 25):
+                self._make_kodak_png(os.path.join(tmpdir, f"kodim{i:02d}.png"))
+            ds = KodakDataset(tmpdir, download=False)
+            assert len(ds) == 24
+            img = ds[0]
+            assert img.shape[0] == 3
+
+    def test_download_validates_and_moves(self, monkeypatch):
+        """A mocked download writes valid PNGs; files are validated and cached."""
+        pytest.importorskip("PIL")
+        import urllib.request
+        from neural_compression.data import KodakDataset
+
+        def fake_urlretrieve(url, dest):
+            self._make_kodak_png(dest)
+
+        monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ds = KodakDataset(tmpdir, download=True)
+            assert len(ds) == 24
+            # No leftover partial files.
+            assert not list(Path(tmpdir).glob("*.part"))
+            assert all((Path(tmpdir) / f"kodim{i:02d}.png").exists() for i in range(1, 25))
+
+    def test_corrupt_download_raises_and_cleans_up(self, monkeypatch):
+        """A corrupt download raises a clear error and leaves no partial file."""
+        pytest.importorskip("PIL")
+        import urllib.request
+        from neural_compression.data import KodakDataset
+
+        def fake_urlretrieve(url, dest):
+            # Write garbage that is not a decodable image.
+            with open(dest, "wb") as f:
+                f.write(b"not a real png")
+
+        monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(RuntimeError):
+                KodakDataset(tmpdir, download=True)
+            # Cleaned up: no partial files and no bogus final image.
+            assert not list(Path(tmpdir).glob("*.part"))
+            assert not (Path(tmpdir) / "kodim01.png").exists()
+
+    def test_empty_download_raises(self, monkeypatch):
+        """A zero-byte download is rejected."""
+        import urllib.request
+        from neural_compression.data import KodakDataset
+
+        def fake_urlretrieve(url, dest):
+            open(dest, "wb").close()  # empty file
+
+        monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(RuntimeError):
+                KodakDataset(tmpdir, download=True)

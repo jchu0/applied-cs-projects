@@ -23,8 +23,9 @@ models, and arithmetic/range entropy coders.
 - **Multi-rate compression** — a single model spanning several rate points via learnable
   per-channel gain units (`MultiRateCodec`, `GainUnit`, `ScaleHyperpriorCodec` in
   `multirate.py`).
-- **Perceptual and distortion losses** — MSE, SSIM, MS-SSIM, VGG/LPIPS perceptual loss,
-  Charbonnier, and a combined `RateDistortionLoss` (`losses.py`).
+- **Perceptual and distortion losses** — MSE, SSIM, MS-SSIM, a VGG-feature perceptual loss
+  (`VGGPerceptualLoss`; `LPIPSLoss` is a VGG-feature *approximation*, not calibrated LPIPS —
+  see below), Charbonnier, and a combined `RateDistortionLoss` (`losses.py`).
 - **Training loop** — Adam with a higher learning rate for entropy-model parameters,
   multi-step LR decay, gradient clipping, checkpointing, and a multi-rate trainer
   (`CompressionTrainer`, `MultiRateTrain` in `training.py`).
@@ -76,10 +77,10 @@ flowchart TD
 pip install -e ".[dev]"
 ```
 
-For Pillow image I/O and the FastAPI extras:
+For Pillow-based image I/O (`ImageFolderDataset`, `KodakDataset`):
 
 ```bash
-pip install -e ".[full]"
+pip install -e ".[images]"
 ```
 
 ### Running
