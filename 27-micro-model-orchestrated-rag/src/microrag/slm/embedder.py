@@ -91,14 +91,13 @@ class EmbedderSLM(BaseSLM, EmbeddingModelMixin):
 
             return embeddings
 
-        except Exception as e:
-            logger.error(f"Failed to encode texts: {str(e)}")
-            # Return random embeddings as fallback
-            embeddings = np.random.randn(len(texts), self.embedding_dim).astype(np.float32)
-            if self.normalize_embeddings:
-                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-                embeddings = embeddings / (norms + 1e-9)
-            return embeddings
+        except Exception:
+            # Re-raise instead of fabricating embeddings: random vectors would
+            # silently corrupt retrieval quality.
+            logger.exception(
+                f"Failed to encode {len(texts)} texts with model {self.model_name}"
+            )
+            raise
 
     async def embed_batch(self, texts: List[str], **kwargs) -> np.ndarray:
         """Embed a batch of texts efficiently.

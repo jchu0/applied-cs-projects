@@ -146,7 +146,9 @@ pipeline = create_pipeline(use_mock=False)   # requires the ml extras
   real models download from Hugging Face on first use. The `HallucinationGuardrail` uses a
   keyword heuristic rather than an NLI model. ChromaDB, Redis, and Jaeger in
   `docker-compose.yml` are optional and not wired into the default in-process pipeline;
-  LLM-fallback API keys in `.env.example` are unused by the core path.
+  LLM-fallback API keys in `.env.example` are unused by the core path. If pipeline
+  execution fails, `query()` degrades gracefully to a zero-confidence error answer —
+  the underlying exception is logged with a full traceback rather than raised.
 
 ## Testing
 

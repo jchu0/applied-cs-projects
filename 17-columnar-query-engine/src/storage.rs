@@ -201,6 +201,19 @@ impl Table {
         self.scan(&indices)
     }
 
+    /// Scan a disjoint partition of the table's row groups.
+    ///
+    /// Row groups are assigned to partitions round-robin, so the union of
+    /// all `num_partitions` scanners covers every row exactly once.
+    pub fn scan_partition(
+        &self,
+        column_indices: &[usize],
+        partition: usize,
+        num_partitions: usize,
+    ) -> TableScanner {
+        TableScanner::new_partition(self, column_indices.to_vec(), partition, num_partitions)
+    }
+
     /// Get column index by name.
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.schema.column_index(name)
@@ -223,6 +236,30 @@ impl TableScanner {
     /// Create new scanner.
     fn new(table: &Table, column_indices: Vec<usize>) -> Self {
         let row_groups = table.row_groups.read().clone();
+        Self {
+            row_groups,
+            column_indices,
+            current_rg: 0,
+            current_offset: 0,
+        }
+    }
+
+    /// Create a scanner over a disjoint subset of the table's row groups.
+    fn new_partition(
+        table: &Table,
+        column_indices: Vec<usize>,
+        partition: usize,
+        num_partitions: usize,
+    ) -> Self {
+        let num_partitions = num_partitions.max(1);
+        let row_groups = table
+            .row_groups
+            .read()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % num_partitions == partition)
+            .map(|(_, rg)| Arc::clone(rg))
+            .collect();
         Self {
             row_groups,
             column_indices,

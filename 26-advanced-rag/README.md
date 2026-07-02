@@ -146,7 +146,9 @@ pipeline = create_pipeline(
   random vectors and `MockReranker` passes results through unchanged — both are for testing.
   LLM-dependent stages (`LLMQueryRewriter`, `SLMReranker`, LLM compression, LLM-based
   hallucination verification, answer generation) require you to supply an async LLM client;
-  without one the pipeline returns a templated mock answer. `SentenceTransformerEmbedding` and
+  without one the pipeline returns a templated mock answer. If `SLMReranker` cannot parse
+  the LLM's score JSON it logs a warning and falls back to neutral relevance scores, marking
+  each result with `fallback: true` in its features. `SentenceTransformerEmbedding` and
   `CrossEncoderReranker` require the `ml` extra (PyTorch + sentence-transformers).
 - **Not implemented in code:** The `vectordb` extra, `.env.example`, and `docker-compose.yml`
   reference ChromaDB, Qdrant, Pinecone, Weaviate, and Redis, but the library ships only the

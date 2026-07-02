@@ -1,10 +1,13 @@
 """Quality scoring using LLM-as-judge."""
 
 import json
+import logging
 from typing import Optional, Union
 
 from .schemas import RAGExample, InstructionExample, ConversationExample
 from .provider import ModelProvider, MockProvider
+
+logger = logging.getLogger(__name__)
 
 
 class QualityScorer:
@@ -20,6 +23,11 @@ class QualityScorer:
         self.model = model_provider or MockProvider()
         self.min_score = min_score
         self.check_diversity = check_diversity
+        # Count of judge failures (model errors or unparseable/incomplete
+        # verdicts) that fell back to the neutral 0.5 score. Surfaced via
+        # evaluate() so a fully-broken judge is visible instead of silently
+        # producing a wall of 0.5s.
+        self.judge_error_count = 0
         self.criteria = criteria or [
             "accuracy",
             "relevance",
@@ -27,6 +35,16 @@ class QualityScorer:
             "clarity",
             "naturalness",
         ]
+
+    def _record_judge_error(self, context: str, error) -> None:
+        """Log a judge failure and count it so broken judges are visible."""
+        self.judge_error_count += 1
+        logger.warning(
+            "Judge failure during %s; falling back to neutral score 0.5: %s",
+            context,
+            error,
+            exc_info=isinstance(error, BaseException),
+        )
 
     async def score(
         self,
@@ -76,11 +94,18 @@ Output format (JSON):
                 temperature=0.1,
                 max_tokens=500,
             )
-
-            scores = self._parse_json(response)
-            return scores.get("overall_score", 0.5)
-        except Exception:
+        except Exception as exc:
+            self._record_judge_error("RAG QA scoring", exc)
             return 0.5
+
+        scores = self._parse_json(response)
+        if "overall_score" not in scores:
+            self._record_judge_error(
+                "RAG QA scoring",
+                f"judge response missing 'overall_score': {response!r:.200}",
+            )
+            return 0.5
+        return scores["overall_score"]
 
     async def _score_instruction(self, example: InstructionExample) -> float:
         """Score instruction example."""
@@ -114,11 +139,18 @@ Output format (JSON):
                 temperature=0.1,
                 max_tokens=500,
             )
-
-            scores = self._parse_json(response)
-            return scores.get("overall_score", 0.5)
-        except Exception:
+        except Exception as exc:
+            self._record_judge_error("instruction scoring", exc)
             return 0.5
+
+        scores = self._parse_json(response)
+        if "overall_score" not in scores:
+            self._record_judge_error(
+                "instruction scoring",
+                f"judge response missing 'overall_score': {response!r:.200}",
+            )
+            return 0.5
+        return scores["overall_score"]
 
     async def _score_conversation(self, example: ConversationExample) -> float:
         """Score conversation example."""
@@ -155,11 +187,18 @@ Output format (JSON):
                 temperature=0.1,
                 max_tokens=500,
             )
-
-            scores = self._parse_json(response)
-            return scores.get("overall_score", 0.5)
-        except Exception:
+        except Exception as exc:
+            self._record_judge_error("conversation scoring", exc)
             return 0.5
+
+        scores = self._parse_json(response)
+        if "overall_score" not in scores:
+            self._record_judge_error(
+                "conversation scoring",
+                f"judge response missing 'overall_score': {response!r:.200}",
+            )
+            return 0.5
+        return scores["overall_score"]
 
     async def compare_pair(
         self,
@@ -198,34 +237,54 @@ Output format (JSON):
                 temperature=0.1,
                 max_tokens=500,
             )
-
-            result = self._parse_json(response)
-            return (result.get("score_a", 5) / 10, result.get("score_b", 5) / 10)
-        except Exception:
+        except Exception as exc:
+            self._record_judge_error("pairwise comparison", exc)
             return (0.5, 0.5)
 
+        result = self._parse_json(response)
+        if "score_a" not in result or "score_b" not in result:
+            self._record_judge_error(
+                "pairwise comparison",
+                f"judge response missing 'score_a'/'score_b': {response!r:.200}",
+            )
+        return (result.get("score_a", 5) / 10, result.get("score_b", 5) / 10)
+
     def _parse_json(self, response: str) -> dict:
-        """Parse JSON from response."""
+        """Parse JSON from response, returning {} if no JSON object is found."""
         try:
-            return json.loads(response)
+            parsed = json.loads(response)
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             import re
             match = re.search(r'\{.*\}', response, re.DOTALL)
             if match:
                 try:
-                    return json.loads(match.group())
+                    parsed = json.loads(match.group())
+                    if isinstance(parsed, dict):
+                        return parsed
                 except json.JSONDecodeError:
                     pass
         return {}
 
     async def evaluate(self, dataset) -> dict:
         """Evaluate overall quality of a dataset."""
+        errors_before = self.judge_error_count
         total_score = 0.0
         scores = []
         for sample in dataset.samples:
             score = await self.score(sample)
             scores.append(score)
             total_score += score
+
+        judge_errors = self.judge_error_count - errors_before
+        if judge_errors:
+            logger.warning(
+                "evaluate: %d of %d samples fell back to the neutral 0.5 score "
+                "due to judge failures; aggregate statistics may be unreliable",
+                judge_errors,
+                len(dataset.samples),
+            )
 
         avg_score = total_score / len(dataset.samples) if dataset.samples else 0.0
         return {
@@ -234,6 +293,7 @@ Output format (JSON):
             "max_score": max(scores) if scores else 0.0,
             "num_samples": len(dataset.samples),
             "samples_above_threshold": sum(1 for s in scores if s >= self.min_score),
+            "judge_errors": judge_errors,
         }
 
     def generate_feedback(self, dataset) -> dict:
@@ -284,11 +344,23 @@ Output format (JSON):
                 temperature=0.1,
                 max_tokens=1000,
             )
-
             result = json.loads(response)
-            return result.get("hallucination_score", 0.5)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Judge failure during hallucination detection; falling back "
+                "to neutral score 0.5: %s",
+                exc,
+                exc_info=True,
+            )
             return 0.5
+
+        if "hallucination_score" not in result:
+            logger.warning(
+                "Hallucination judge response missing 'hallucination_score'; "
+                "falling back to neutral score 0.5: %.200r",
+                response,
+            )
+        return result.get("hallucination_score", 0.5)
 
 
 class AutoCurationPipeline:

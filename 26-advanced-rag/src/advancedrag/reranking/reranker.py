@@ -1,10 +1,14 @@
 """Neural reranking implementations."""
 
+import json
+import logging
 from abc import ABC, abstractmethod
 from typing import Optional
 import numpy as np
 
 from ..schemas import RetrievalResult, RerankResult
+
+logger = logging.getLogger(__name__)
 
 
 class BaseReranker(ABC):
@@ -144,12 +148,31 @@ Return scores as JSON array: [{{"relevance": score}}, ...]"""
 
         # Parse scores (simplified)
         try:
-            import json
             scores = json.loads(response)
+            if (
+                not isinstance(scores, list)
+                or len(scores) != len(batch)
+                or not all(
+                    isinstance(s, dict) and isinstance(s.get("relevance"), (int, float))
+                    for s in scores
+                )
+            ):
+                raise ValueError(
+                    f"expected a JSON array of {len(batch)} objects with a "
+                    f"numeric 'relevance' key, got: {response[:200]!r}"
+                )
             return scores
-        except:
-            # Default scores
-            return [{"relevance": 5.0} for _ in batch]
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            # Fall back to neutral scores, but surface the failure: reranking
+            # is effectively disabled for this batch.
+            logger.warning(
+                "SLMReranker failed to parse LLM relevance scores (%s); "
+                "falling back to neutral relevance 5.0 for %d candidates "
+                "(results marked with fallback=True)",
+                e,
+                len(batch),
+            )
+            return [{"relevance": 5.0, "fallback": True} for _ in batch]
 
 
 class MultiStageReranker(BaseReranker):

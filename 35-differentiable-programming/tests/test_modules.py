@@ -273,6 +273,64 @@ class TestLayerNorm:
 
         assert x.grad is not None
         assert x.grad.shape == x.shape
+        assert layer.gamma.grad is not None
+        assert layer.beta.grad is not None
+        assert layer.gamma.grad.shape == layer.gamma.shape
+        assert layer.beta.grad.shape == layer.beta.shape
+
+    def test_layernorm_numerical_gradient(self):
+        """Test LayerNorm input gradient with numerical gradient checking."""
+        np.random.seed(42)
+        layer = LayerNorm(6)
+        # Non-trivial affine parameters so the mean/variance terms matter
+        layer.gamma.data = np.random.randn(6).astype(np.float32)
+        layer.beta.data = np.random.randn(6).astype(np.float32)
+
+        x_data = np.random.randn(3, 6).astype(np.float32)
+        x = Tensor(x_data.copy(), requires_grad=True)
+
+        y = layer(x)
+        loss = y.sum()
+        loss.backward()
+
+        def f(inp):
+            return layer(inp)
+        num_grad = numerical_gradient(f, x_data)
+        np.testing.assert_allclose(x.grad, num_grad, rtol=0.05, atol=0.01)
+
+    def test_layernorm_parameter_numerical_gradient(self):
+        """Test LayerNorm gamma/beta gradients with numerical gradient checking."""
+        np.random.seed(42)
+        x_data = np.random.randn(3, 6).astype(np.float32)
+
+        layer = LayerNorm(6)
+        x = Tensor(x_data.copy(), requires_grad=True)
+        y = layer(x)
+        loss = y.sum()
+        loss.backward()
+
+        assert layer.gamma.grad is not None
+        assert layer.beta.grad is not None
+
+        # Numerical gradient w.r.t. gamma
+        def f_gamma(gamma):
+            probe = LayerNorm(6)
+            probe.gamma.data = gamma.data
+            probe.beta.data = layer.beta.data.copy()
+            return probe(Tensor(x_data.copy()))
+
+        num_dgamma = numerical_gradient(f_gamma, layer.gamma.data)
+        np.testing.assert_allclose(layer.gamma.grad, num_dgamma, rtol=0.05, atol=0.01)
+
+        # Numerical gradient w.r.t. beta
+        def f_beta(beta):
+            probe = LayerNorm(6)
+            probe.gamma.data = layer.gamma.data.copy()
+            probe.beta.data = beta.data
+            return probe(Tensor(x_data.copy()))
+
+        num_dbeta = numerical_gradient(f_beta, layer.beta.data)
+        np.testing.assert_allclose(layer.beta.grad, num_dbeta, rtol=0.05, atol=0.01)
 
 
 class TestDropout:

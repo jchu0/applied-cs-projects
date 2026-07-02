@@ -2,6 +2,7 @@
 
 use columnar_query_engine::executor::*;
 use columnar_query_engine::expression::*;
+use columnar_query_engine::parallel::ParallelConfig;
 use columnar_query_engine::plan::*;
 use columnar_query_engine::storage::*;
 use columnar_query_engine::types::*;
@@ -1082,4 +1083,74 @@ fn test_operator_next_returns_none_when_exhausted() {
 
     // Next call should return None
     assert!(operator.next().unwrap().is_none());
+}
+
+// ============================================================================
+// Parallel Scan Tests
+// ============================================================================
+
+/// Collect all (id) values from scan results as a sorted multiset.
+fn collect_ids(chunks: &[DataChunk]) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for chunk in chunks {
+        for i in 0..chunk.len() {
+            match chunk.vectors[0].get(i).unwrap() {
+                Value::Int64(v) => ids.push(v),
+                other => panic!("unexpected value: {:?}", other),
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn test_parallel_scan_matches_sequential_scan() {
+    let catalog = create_test_catalog();
+
+    let schema = Schema::new(vec![
+        Column::new("id", DataType::Int64, false),
+        Column::new("value", DataType::Float64, false),
+    ]);
+    let table = catalog
+        .create_table("numbers", schema, StorageConfig::default())
+        .unwrap();
+
+    // Insert several chunks so the table has multiple row groups.
+    let mut next_id = 0i64;
+    for _ in 0..7 {
+        let ids: Vec<i64> = (next_id..next_id + 100).collect();
+        let values: Vec<f64> = ids.iter().map(|&i| i as f64 * 1.5).collect();
+        next_id += 100;
+        let chunk = DataChunk::new(vec![create_int_vector(ids), create_float_vector(values)]);
+        table.insert(chunk).unwrap();
+    }
+
+    let seq_executor = Executor::new(catalog.clone());
+    let seq_plan = PhysicalPlan::SeqScan {
+        table_name: "numbers".to_string(),
+        projection: vec![0, 1],
+        filter: None,
+    };
+    let seq_ids = collect_ids(&seq_executor.collect(&seq_plan).unwrap());
+    assert_eq!(seq_ids.len(), 700);
+
+    // Parallel scan must return exactly the same row multiset, with more
+    // partitions than row groups and fewer alike.
+    for num_partitions in [1, 3, 4, 16] {
+        let par_executor =
+            Executor::with_parallelism(catalog.clone(), ParallelConfig::with_threads(4));
+        let par_plan = PhysicalPlan::ParallelScan {
+            table_name: "numbers".to_string(),
+            projection: vec![0, 1],
+            filter: None,
+            num_partitions,
+        };
+        let par_ids = collect_ids(&par_executor.collect(&par_plan).unwrap());
+        assert_eq!(
+            par_ids, seq_ids,
+            "parallel scan with {} partitions returned wrong row multiset",
+            num_partitions
+        );
+    }
 }

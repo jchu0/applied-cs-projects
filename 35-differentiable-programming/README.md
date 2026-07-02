@@ -129,7 +129,7 @@ print(df(Tensor([2.0, 3.0])))   # [4. 6.]
   verified gradients; `Linear`, `BatchNorm1d`, `LayerNorm`, and `Dropout` forward and
   backward passes; `MSELoss` and `CrossEntropyLoss`; the `SGD`, `Adam`, `AdamW`, and
   `RMSprop` optimizers; `grad` / `value_and_grad`; and the `no_grad` / `enable_grad`
-  context managers. All of these are exercised by the 138-test suite, including numerical
+  context managers. All of these are exercised by the 140-test suite, including numerical
   gradient checks.
 - **Simulated / incomplete:** `Conv2d.forward` computes a real im2col convolution, but its
   `backward` returns a zero gradient — it is a forward-only layer for inference, not
@@ -144,7 +144,7 @@ print(df(Tensor([2.0, 3.0])))   # [4. 6.]
 pytest tests/ -v
 ```
 
-The suite contains 138 tests across operations, modules, and optimizers. Operation tests
+The suite contains 140 tests across operations, modules, and optimizers. Operation tests
 include central-difference numerical gradient checks (`tests/test_operations.py`); module
 tests cover layers, losses, and a small deep network; optimizer tests cover convergence and
 edge cases. No external services are required.
@@ -160,7 +160,7 @@ edge cases. No external services are required.
     ops/operations.py           # Differentiable operations and their gradients
     nn/modules.py               # Module base, layers, activations, losses
     nn/optim.py                 # SGD, Adam, AdamW, RMSprop
-  tests/                        # 138 tests: operations, modules, optimizers
+  tests/                        # 140 tests: operations, modules, optimizers
   docs/BLUEPRINT.md             # Full architecture and design
 ```
 

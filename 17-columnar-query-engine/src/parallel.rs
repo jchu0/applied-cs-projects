@@ -11,7 +11,7 @@ use crate::types::{AggregateFunction, DataType, JoinType, SortOrder, Value};
 use crate::vector::{DataChunk, Vector};
 use crate::{Error, Result, VECTOR_SIZE};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
@@ -141,10 +141,11 @@ impl ParallelScanOperator {
             .get_table(table_name)
             .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
 
-        // Create one scanner per partition
-        // In a real implementation, each scanner would handle a different row group
+        // Create one scanner per partition, each covering a disjoint subset
+        // of the table's row groups so rows are scanned exactly once.
+        let num_partitions = num_partitions.max(1);
         let scanners: Vec<TableScanner> = (0..num_partitions)
-            .map(|_| table.scan(&projection.to_vec()))
+            .map(|i| table.scan_partition(projection, i, num_partitions))
             .collect();
 
         Ok(Self {
@@ -165,14 +166,14 @@ impl ParallelScanOperator {
         let results = self.results.clone();
         let filter = self.filter.clone();
         let num_scanners = self.scanners.len();
-        let counter = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(num_scanners);
 
-        // Process each scanner in parallel
-        // Note: This is simplified - real impl would need to handle scanner ownership
+        // Process each scanner in parallel; each scanner owns a disjoint
+        // partition of the table's row groups.
         for scanner in self.scanners.drain(..) {
             let results = results.clone();
             let filter = filter.clone();
-            let counter = counter.clone();
+            let done_tx = done_tx.clone();
 
             pool.execute(move || {
                 let mut scanner = scanner;
@@ -198,13 +199,17 @@ impl ParallelScanOperator {
                         results.lock().unwrap().push(c);
                     }
                 }
-                counter.fetch_add(1, Ordering::Relaxed);
+                let _ = done_tx.send(());
             });
         }
+        drop(done_tx);
 
-        // Wait for all scanners to complete
-        while counter.load(Ordering::Relaxed) < num_scanners {
-            thread::sleep(std::time::Duration::from_millis(1));
+        // Wait for all scanners to complete. If a worker panics, its sender
+        // is dropped and recv returns an error instead of hanging forever.
+        for _ in 0..num_scanners {
+            done_rx.recv().map_err(|_| {
+                Error::Execution("parallel scan worker terminated unexpectedly".to_string())
+            })?;
         }
 
         self.done = true;

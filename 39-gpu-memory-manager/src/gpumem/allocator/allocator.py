@@ -60,6 +60,10 @@ class CachingAllocator(Allocator):
         self._pools: Dict[int, MemoryPool] = {}  # stream -> pool
         self._default_pool = MemoryPool(self.config)
 
+        # Allocator-level high-water marks across all pools
+        self._peak_allocated = 0
+        self._peak_reserved = 0
+
         # Small/large allocation split
         self._small_threshold = 1024 * 1024  # 1MB
         self._small_pools: Dict[int, List[MemoryBlock]] = defaultdict(list)
@@ -78,6 +82,7 @@ class CachingAllocator(Allocator):
             if size <= self._small_threshold:
                 block = self._allocate_small(size, stream)
                 if block:
+                    self._update_peak_stats()
                     return block
 
             # Use pool allocation
@@ -89,6 +94,9 @@ class CachingAllocator(Allocator):
                 logger.info("OOM, attempting cache flush")
                 self.empty_cache()
                 block = pool.allocate(request)
+
+            if block is not None:
+                self._update_peak_stats()
 
             return block
 
@@ -140,6 +148,18 @@ class CachingAllocator(Allocator):
             self._pools[stream] = MemoryPool(self.config)
         return self._pools[stream]
 
+    def _update_peak_stats(self):
+        """Update high-water marks from current totals across all pools."""
+        allocated = 0
+        reserved = 0
+        for pool in list(self._pools.values()) + [self._default_pool]:
+            pool_stats = pool.get_stats()
+            allocated += pool_stats.allocated
+            reserved += pool_stats.reserved
+
+        self._peak_allocated = max(self._peak_allocated, allocated)
+        self._peak_reserved = max(self._peak_reserved, reserved)
+
     def get_stats(self) -> MemoryStats:
         """Get combined statistics."""
         stats = MemoryStats()
@@ -163,11 +183,11 @@ class CachingAllocator(Allocator):
         stats.inactive += default_stats.inactive
 
         stats.peak_allocated = max(
-            stats.peak_allocated,
+            self._peak_allocated,
             default_stats.peak_allocated
         )
         stats.peak_reserved = max(
-            stats.peak_reserved,
+            self._peak_reserved,
             default_stats.peak_reserved
         )
 
@@ -225,6 +245,10 @@ class PoolAllocator(Allocator):
                 )
                 self._next_ptr += size_class
                 self._stats.reserved += size_class
+                self._stats.peak_reserved = max(
+                    self._stats.peak_reserved,
+                    self._stats.reserved
+                )
 
             block.allocated = True
             block.timestamp = time.time()
@@ -233,6 +257,10 @@ class PoolAllocator(Allocator):
             self._stats.allocated += size_class
             self._stats.active += size_class
             self._stats.num_allocs += 1
+            self._stats.peak_allocated = max(
+                self._stats.peak_allocated,
+                self._stats.allocated
+            )
 
             return block
 
@@ -300,6 +328,7 @@ class BuddyAllocator(Allocator):
         self._allocated: Dict[int, Tuple[int, int]] = {}  # ptr -> (size, order)
         self._stats = MemoryStats()
         self._stats.reserved = total_size
+        self._stats.peak_reserved = total_size
 
     def allocate(self, size: int, stream: int = 0) -> Optional[MemoryBlock]:
         """Allocate using buddy system."""
@@ -325,6 +354,10 @@ class BuddyAllocator(Allocator):
             self._stats.allocated += block_size
             self._stats.active += block_size
             self._stats.num_allocs += 1
+            self._stats.peak_allocated = max(
+                self._stats.peak_allocated,
+                self._stats.allocated
+            )
 
             return block
 
@@ -467,6 +500,10 @@ class SlabAllocator(Allocator):
             self._stats.allocated += self._object_size
             self._stats.active += self._object_size
             self._stats.num_allocs += 1
+            self._stats.peak_allocated = max(
+                self._stats.peak_allocated,
+                self._stats.allocated
+            )
 
             return block
 
@@ -507,6 +544,10 @@ class SlabAllocator(Allocator):
         self._partial_slabs.append(slab_idx)
         self._next_ptr += self._slab_size
         self._stats.reserved += self._slab_size
+        self._stats.peak_reserved = max(
+            self._stats.peak_reserved,
+            self._stats.reserved
+        )
 
         return slab_idx
 

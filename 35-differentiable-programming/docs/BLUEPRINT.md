@@ -445,7 +445,9 @@ def grad_fn(g):
   parameters are not produced by a tracked op, the closure accumulates their gradients by
   hand (respecting the same `None`-or-accumulate convention the autograd engine uses) and
   returns only the gradient with respect to its input, which the engine then propagates.
-- **`LayerNorm`** normalizes across the feature axis with a simplified backward.
+- **`LayerNorm`** normalizes across the feature axis with a full backward: the input
+  gradient carries the mean and variance terms, and the `gamma`/`beta` gradients are
+  accumulated by hand inside the closure, following the same convention as `BatchNorm1d`.
 - **`Dropout`** applies an inverted dropout mask during training and is a no-op in eval
   mode; its backward simply reapplies the mask.
 - **Activation modules** (`ReLU`, `Sigmoid`, `Tanh`, `Softmax`) wrap the corresponding ops.
@@ -713,7 +715,7 @@ inference-only until a real gradient is implemented.
 
 ## Testing Strategy
 
-Correctness is verified by a 138-test pytest suite spanning three files, with numerical
+Correctness is verified by a 140-test pytest suite spanning three files, with numerical
 gradient checking as the backbone for the autodiff layer.
 
 ### Numerical gradient checking
@@ -755,7 +757,7 @@ to the argmax, tensor slicing and `squeeze`/`unsqueeze`/`flatten` gradients, the
 
 ### Module tests
 
-`tests/test_modules.py` (42 tests) exercises every layer and loss: `Linear`, `Conv2d`,
+`tests/test_modules.py` (44 tests) exercises every layer and loss: `Linear`, `Conv2d`,
 `BatchNorm1d`, `LayerNorm`, `Dropout`, the activation modules, `Sequential`, `MSELoss`,
 `CrossEntropyLoss`, the `Module` base (parameter collection, train/eval, zero_grad), and a
 small multi-layer "deep network" that checks end-to-end forward and backward through stacked
@@ -791,7 +793,7 @@ operation's gradient or a module's behavior is expected to be.
 ### Running
 
 ```bash
-pytest tests/ -v          # full suite, 138 tests
+pytest tests/ -v          # full suite, 140 tests
 pytest tests/test_operations.py -v
 ```
 

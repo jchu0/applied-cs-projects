@@ -236,17 +236,33 @@ class InferenceEngine:
         input_ids: np.ndarray,
         max_length: int = 100
     ) -> Iterator[np.ndarray]:
-        """Stream token generation."""
+        """Stream token generation.
+
+        Requires a ``generate_token(current_ids, past_kvs)`` implementation
+        (provided by a subclass or assigned to the instance) that is backed by
+        a real model. There is no fallback: emitting fabricated tokens from a
+        documented API would silently produce meaningless output.
+        """
+        if not hasattr(self, 'generate_token'):
+            raise RuntimeError(
+                "InferenceEngine.stream_generate requires a 'generate_token' "
+                "implementation backed by real model weights (define it on a "
+                "subclass or assign a callable to the engine instance). "
+                "Refusing to fall back to random placeholder tokens."
+            )
+
+        return self._stream_generate(input_ids, max_length)
+
+    def _stream_generate(
+        self,
+        input_ids: np.ndarray,
+        max_length: int
+    ) -> Iterator[np.ndarray]:
         current_ids = input_ids.copy()
         past_kvs = None
 
         for _ in range(max_length):
-            if hasattr(self, 'generate_token'):
-                next_token, past_kvs = self.generate_token(current_ids, past_kvs)
-            else:
-                # Default token generation
-                next_token = np.random.randint(0, 1000, size=(input_ids.shape[0], 1))
-
+            next_token, past_kvs = self.generate_token(current_ids, past_kvs)
             yield next_token
             current_ids = np.concatenate([current_ids, next_token], axis=1)
 

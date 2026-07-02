@@ -475,6 +475,90 @@ class TestAllocatorStatistics:
         assert hasattr(stats, 'allocated')
         assert hasattr(stats, 'num_allocs')
 
+    def test_caching_allocator_peak_allocated(self):
+        """Regression: peak_allocated was 0 with live allocations (README example)."""
+        allocator = CachingAllocator()
+
+        blocks = [allocator.allocate(1024 * 1024) for _ in range(4)]
+        stats = allocator.get_stats()
+
+        # Peak must reflect the high-water mark of live allocations
+        assert stats.peak_allocated > 0
+        assert stats.peak_allocated >= stats.allocated
+        assert stats.peak_allocated >= 4 * 1024 * 1024
+
+        peak = stats.peak_allocated
+        for block in blocks:
+            allocator.free(block)
+
+        # Peak is a high-water mark: it must not drop after frees
+        stats = allocator.get_stats()
+        assert stats.peak_allocated == peak
+
+    def test_caching_allocator_peak_updated_per_allocation(self):
+        """Peak grows as the high-water mark rises across allocations."""
+        allocator = CachingAllocator()
+
+        allocator.allocate(2 * 1024 * 1024)
+        first_peak = allocator.get_stats().peak_allocated
+        assert first_peak >= 2 * 1024 * 1024
+
+        allocator.allocate(2 * 1024 * 1024)
+        second_peak = allocator.get_stats().peak_allocated
+        assert second_peak >= first_peak + 2 * 1024 * 1024
+
+    def test_caching_allocator_peak_across_streams(self):
+        """Peak accounts for allocations on multiple streams."""
+        allocator = CachingAllocator()
+
+        allocator.allocate(2 * 1024 * 1024, stream=1)
+        allocator.allocate(2 * 1024 * 1024, stream=2)
+
+        stats = allocator.get_stats()
+        assert stats.peak_allocated >= 4 * 1024 * 1024
+
+    def test_pool_allocator_peak_allocated(self):
+        """Regression: PoolAllocator never updated peak_allocated."""
+        allocator = PoolAllocator()
+
+        blocks = [allocator.allocate(1024) for _ in range(3)]
+        stats = allocator.get_stats()
+        assert stats.peak_allocated == 3 * 1024
+        assert stats.peak_reserved == 3 * 1024
+
+        for block in blocks:
+            allocator.free(block)
+
+        stats = allocator.get_stats()
+        assert stats.peak_allocated == 3 * 1024
+
+    def test_buddy_allocator_peak_allocated(self):
+        """Regression: BuddyAllocator never updated peak_allocated."""
+        allocator = BuddyAllocator(total_size=1024 * 1024)
+
+        block = allocator.allocate(1024)
+        stats = allocator.get_stats()
+        assert stats.peak_allocated >= 1024
+        assert stats.peak_reserved == 1024 * 1024
+
+        peak = stats.peak_allocated
+        allocator.free(block)
+        assert allocator.get_stats().peak_allocated == peak
+
+    def test_slab_allocator_peak_allocated(self):
+        """Regression: SlabAllocator never updated peak_allocated."""
+        allocator = SlabAllocator(object_size=64)
+
+        blocks = [allocator.allocate() for _ in range(5)]
+        stats = allocator.get_stats()
+        assert stats.peak_allocated == 5 * 64
+        assert stats.peak_reserved > 0
+
+        for block in blocks:
+            allocator.free(block)
+
+        assert allocator.get_stats().peak_allocated == 5 * 64
+
     def test_pool_allocator_stats(self):
         """Test PoolAllocator statistics."""
         allocator = PoolAllocator()

@@ -315,16 +315,20 @@ example type to a type-specific method, each of which builds a rubric prompt ask
 model to rate five criteria (accuracy, relevance/clarity, completeness, etc.) on a 0–10
 scale and emit an `overall_score` in `[0, 1]`. The scorer reads back the `overall_score`
 field and returns it, defaulting to `0.5` on any parse or model error — so a flaky judge
-degrades to a neutral score rather than crashing the pipeline. `compare_pair` runs a
-pairwise A-vs-B comparison and returns normalized scores for preference-data generation.
+degrades to a neutral score rather than crashing the pipeline. Every such fallback is
+logged as a warning (with the underlying exception or offending response) and counted in
+`judge_error_count`, so a fully-broken judge is visible rather than silently producing a
+wall of neutral scores. `compare_pair` runs a pairwise A-vs-B comparison and returns
+normalized scores for preference-data generation.
 
 `QualityScorer` also offers `evaluate(dataset)`, which scores every sample and returns
-aggregate statistics (average/min/max score, count, samples above threshold), and
+aggregate statistics (average/min/max score, count, samples above threshold, and a
+`judge_errors` count of samples that fell back to the neutral score during that run), and
 `generate_feedback(dataset)`, which returns improvement suggestions.
 
 The scoring methods share a defensive structure: build a rubric, ask for a structured
 verdict, read the single field that matters, and never let a bad judge response propagate
-as an exception.
+as an exception — but each failure is logged and counted, never swallowed silently.
 
 ```python
 async def _score_rag_qa(self, example: RAGExample) -> float:
@@ -341,15 +345,19 @@ Output JSON with per-criterion scores plus "overall_score" (0-1) and "issues".""
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,           # low temperature for stable judging
             max_tokens=500)
-        scores = self._parse_json(response)
-        return scores.get("overall_score", 0.5)
-    except Exception:
-        return 0.5                     # neutral fallback, never crash the pipeline
+    except Exception as exc:
+        self._record_judge_error("RAG QA scoring", exc)   # warn + count, never crash
+        return 0.5
+    scores = self._parse_json(response)
+    if "overall_score" not in scores:
+        self._record_judge_error("RAG QA scoring", "missing 'overall_score'")
+        return 0.5
+    return scores["overall_score"]
 ```
 
 `HallucinationDetector.detect(answer, context)` asks the model to check each claim in an
 answer against the supplied context and return a `hallucination_score` in `[0, 1]`,
-again defaulting to `0.5` on error. `AutoCurationPipeline.curate(examples)` ties the two
+again defaulting to `0.5` on error (with a warning logged for each fallback). `AutoCurationPipeline.curate(examples)` ties the two
 together: it scores each example, rejects those below `min_quality` with a reason string,
 runs hallucination detection on RAG examples (when a detector is wired in) and rejects
 those above `max_hallucination_score`, and returns the `(accepted, rejected)` split.

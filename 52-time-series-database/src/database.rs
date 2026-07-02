@@ -106,6 +106,8 @@ pub struct TimeSeriesDB {
     bg_sender: Option<Sender<BackgroundMessage>>,
     /// Shutdown flag
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Count of errors encountered by background flush/compact/retention tasks
+    bg_error_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl TimeSeriesDB {
@@ -134,11 +136,13 @@ impl TimeSeriesDB {
 
         // Setup background tasks
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bg_error_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let bg_sender = if config.enable_background_tasks {
             let (sender, receiver) = bounded::<BackgroundMessage>(100);
             let storage_clone = storage.clone();
             let retention_clone = retention.clone();
             let shutdown_clone = shutdown.clone();
+            let error_count_clone = bg_error_count.clone();
             let flush_interval = config.flush_interval;
             let compaction_interval = config.compaction_interval;
             let retention_interval = config.retention_check_interval;
@@ -152,6 +156,7 @@ impl TimeSeriesDB {
                     flush_interval,
                     compaction_interval,
                     retention_interval,
+                    error_count_clone,
                 );
             });
 
@@ -167,6 +172,7 @@ impl TimeSeriesDB {
             config,
             bg_sender,
             shutdown,
+            bg_error_count,
         };
 
         // Replay WAL if enabled
@@ -339,6 +345,9 @@ impl TimeSeriesDB {
             sstable_count: storage_stats.sstable_count,
             total_size_bytes: storage_stats.total_size,
             wal_sequence: self.wal.as_ref().map(|w| w.sequence()).unwrap_or(0),
+            background_error_count: self
+                .bg_error_count
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -381,10 +390,19 @@ fn background_worker(
     flush_interval: Duration,
     compaction_interval: Duration,
     retention_interval: Duration,
+    error_count: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut last_flush = std::time::Instant::now();
     let mut last_compact = std::time::Instant::now();
     let mut last_retention = std::time::Instant::now();
+
+    // Log a background task error and record it in the error counter.
+    // The worker keeps running: a failed flush/compact/retention pass will
+    // be retried on the next interval, but the failure must be visible.
+    let report_error = |task: &str, err: &dyn std::fmt::Display| {
+        error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[tsdb::background] {} failed: {}", task, err);
+    };
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -395,11 +413,15 @@ fn background_worker(
         match receiver.recv_timeout(Duration::from_secs(1)) {
             Ok(BackgroundMessage::Shutdown) => break,
             Ok(BackgroundMessage::Flush) => {
-                let _ = storage.flush();
+                if let Err(e) = storage.flush() {
+                    report_error("requested flush", &e);
+                }
                 last_flush = std::time::Instant::now();
             }
             Ok(BackgroundMessage::Compact) => {
-                let _ = storage.compact();
+                if let Err(e) = storage.compact() {
+                    report_error("requested compaction", &e);
+                }
                 last_compact = std::time::Instant::now();
             }
             Ok(BackgroundMessage::CheckRetention) => {
@@ -408,7 +430,9 @@ fn background_worker(
                     .unwrap()
                     .as_nanos() as i64;
                 let drop_before = retention.calculate_drop_before(None, now);
-                let _ = storage.drop_before(drop_before);
+                if let Err(e) = storage.drop_before(drop_before) {
+                    report_error("requested retention check", &e);
+                }
                 last_retention = std::time::Instant::now();
             }
             Err(_) => {
@@ -418,13 +442,17 @@ fn background_worker(
 
         // Periodic flush
         if last_flush.elapsed() >= flush_interval {
-            let _ = storage.flush();
+            if let Err(e) = storage.flush() {
+                report_error("periodic flush", &e);
+            }
             last_flush = std::time::Instant::now();
         }
 
         // Periodic compaction
         if last_compact.elapsed() >= compaction_interval {
-            let _ = storage.compact();
+            if let Err(e) = storage.compact() {
+                report_error("periodic compaction", &e);
+            }
             last_compact = std::time::Instant::now();
         }
 
@@ -435,7 +463,9 @@ fn background_worker(
                 .unwrap()
                 .as_nanos() as i64;
             let drop_before = retention.calculate_drop_before(None, now);
-            let _ = storage.drop_before(drop_before);
+            if let Err(e) = storage.drop_before(drop_before) {
+                report_error("periodic retention check", &e);
+            }
             last_retention = std::time::Instant::now();
         }
     }
@@ -456,6 +486,8 @@ pub struct DatabaseStats {
     pub total_size_bytes: u64,
     /// Current WAL sequence number
     pub wal_sequence: u64,
+    /// Number of errors encountered by background flush/compact/retention tasks
+    pub background_error_count: u64,
 }
 
 #[cfg(test)]

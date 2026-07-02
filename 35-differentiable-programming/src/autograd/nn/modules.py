@@ -248,7 +248,27 @@ class LayerNorm(Module):
 
         if x.requires_grad:
             def grad_fn(g):
-                return g * self.gamma.data / np.sqrt(var + self.eps)
+                N = x.data.shape[-1]
+                std = np.sqrt(var + self.eps)
+                x_hat = (x.data - mean) / std
+
+                # Parameter gradients: reduce over all leading (batch) axes
+                reduce_axes = tuple(range(g.ndim - 1))
+                dgamma = (g * x_hat).sum(axis=reduce_axes)
+                dbeta = g.sum(axis=reduce_axes)
+
+                # Input gradient with mean/variance terms
+                dx_hat = g * self.gamma.data
+                dx = (1 / (N * std)) * (
+                    N * dx_hat
+                    - dx_hat.sum(axis=-1, keepdims=True)
+                    - x_hat * (dx_hat * x_hat).sum(axis=-1, keepdims=True)
+                )
+
+                self.gamma.grad = dgamma if self.gamma.grad is None else self.gamma.grad + dgamma
+                self.beta.grad = dbeta if self.beta.grad is None else self.beta.grad + dbeta
+
+                return dx
             result._set_grad_fn(grad_fn, [x])
 
         return result

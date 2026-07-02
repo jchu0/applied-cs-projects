@@ -241,7 +241,9 @@ class MicroRAGPipeline:
             return answer
 
         except Exception as e:
-            logger.error(f"Pipeline error: {str(e)}")
+            # Graceful degradation: return a zero-confidence error answer, but
+            # log the full traceback so the failure is never silent.
+            logger.exception(f"Pipeline error while processing query: {str(e)}")
             self.metrics.record_request(success=False)
 
             # Return error response
