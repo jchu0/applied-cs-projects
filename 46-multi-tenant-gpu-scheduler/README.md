@@ -134,7 +134,7 @@ print(monitor.export_metrics("prometheus"))
 ## What's Real vs Simulated
 
 - **Real:** the scheduling pipeline (filtering, weighted scoring, best-node selection), gang scheduling, queue fair-sharing, preemption candidate selection, NVLink/NUMA topology analysis and communication-cost scoring, all four allocation modes with MIG-profile fitting, quota admission, and the monitoring/metrics/alert logic. All of this runs purely in memory and is exercised by the test suite.
-- **Simulated / requires credentials:** there is no real GPU or driver integration. GPU utilization, temperature, and power are read from in-memory fields (defaulting to 0) rather than NVML; the optional `gpu` extra (`pynvml`, `gputil`) and `observability` extra (`prometheus-client`) are declared but not wired into live collection. Preemption "stops" jobs by mutating state, not by signalling real processes. Cluster state is in-process only — there is no persistence, networking, or leader election.
+- **Simulated / requires credentials:** there is no real GPU or driver integration. GPU utilization, temperature, and power are read from in-memory fields (defaulting to 0) rather than NVML — the scheduler simulates GPU telemetry and never talks to real hardware. The optional `gpu` extra (`pynvml`, `gputil`) and `observability` extra (`prometheus-client`) are **declared as scaffolding for a future live-collection backend and are not imported anywhere in the library**; installing them changes nothing about the metrics you get. Preemption "stops" jobs by mutating state, not by signalling real processes. Cluster state is in-process only — there is no persistence, networking, or leader election.
 
 ## Testing
 

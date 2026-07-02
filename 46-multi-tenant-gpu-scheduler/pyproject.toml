@@ -24,6 +24,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# NOTE: the `gpu` and `observability` extras are scaffolding for a future
+# live-collection backend. They are NOT imported anywhere in the library today
+# — the scheduler simulates GPU telemetry (see "What's Real vs Simulated" in the
+# README). Installing them does not change the metrics the library produces.
 gpu = [
     "pynvml>=11.5.0",
     "gputil>=1.4.0",
