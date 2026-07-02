@@ -24,6 +24,7 @@ from .lineage import LineageGraph
 from .pii import PIIDetector, PIIRegistry
 from .alerting import AlertingEngine
 from .collectors import InMemoryCollector
+from .security import install_hardening
 
 # Create FastAPI app
 app = FastAPI(
@@ -31,6 +32,10 @@ app = FastAPI(
     description="Monitor data quality, detect anomalies, and track lineage",
     version="1.0.0",
 )
+
+# Wire opt-in production hardening (auth / rate limiting / request timeout).
+# All three are disabled by default so tests and the quick-start keep working.
+install_hardening(app)
 
 # In-memory storage for demo/testing
 _tables: dict[str, TableMetadata] = {}

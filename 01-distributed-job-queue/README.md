@@ -128,10 +128,29 @@ await schedule_delayed(broker, task_name="add", delay_seconds=10,
                        payload={"a": 1, "b": 1})
 ```
 
+## Security & limits
+
+The API ships with an opt-in production hardening baseline (stdlib only, no extra
+deps). All three controls are configured via environment variables and default to
+being permissive so the quick-start keeps working:
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `API_KEYS` | _(unset)_ | Comma-separated valid keys. Unset/empty disables auth (a startup warning is logged). When set, every route except health/readiness/root, `/metrics`, and docs (`/docs`, `/redoc`, `/openapi.json`) requires a key — including the worker-facing `/internal/*` routes. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | In-process sliding-window limit, keyed by API key (or client IP if none). `0` disables it. Over-limit requests get `429` with a `Retry-After` header. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout via `asyncio.wait_for`. `0` disables it. On timeout the API returns `504`. There are no streaming/SSE/websocket endpoints, so nothing is exempted from the timeout. |
+
+Send the key as either `Authorization: Bearer <key>` or `X-API-Key: <key>`:
+
+```bash
+API_KEYS=my-secret-key uvicorn jobqueue.api:app
+curl -H "Authorization: Bearer my-secret-key" http://localhost:8000/queues
+```
+
 ## What's Real vs Simulated
 
-- **Real:** the broker abstraction, `InMemoryBroker` (priority heaps, visibility locks, idempotency-key dedup), workers with concurrent slots and graceful shutdown, retry/backoff, the circuit breaker state machine, cron/interval scheduling via croniter, the deduplication layer, and the full FastAPI surface with Prometheus counters. All of this is exercised by the test suite with no external services.
-- **Simulated / requires credentials:** `RedisBroker` needs a running Redis and is only imported when the `redis` package is present. The example handlers (email, report generation) are stubs that sleep and return fake payloads — there is no real email or storage integration. Prometheus metrics are exported in-process; there is no bundled Grafana/Prometheus deployment.
+- **Real:** the broker abstraction, `InMemoryBroker` (priority heaps, visibility locks, idempotency-key dedup), workers with concurrent slots and graceful shutdown, retry/backoff, the circuit breaker state machine, cron/interval scheduling via croniter, the deduplication layer, and the full FastAPI surface with Prometheus counters — plus an opt-in hardening layer (API-key auth, in-process rate limiting, and request timeouts; see **Security & limits**). All of this is exercised by the test suite with no external services.
+- **Simulated / requires credentials:** `RedisBroker` needs a running Redis and is only imported when the `redis` package is present. The example handlers (email, report generation) are stubs that sleep and return fake payloads — there is no real email or storage integration. Prometheus metrics are exported in-process; there is no bundled Grafana/Prometheus deployment. Auth is opt-in and off by default (set `API_KEYS` to enable); keys are checked in-process against the `API_KEYS` list, not an external identity provider.
 
 ## Testing
 

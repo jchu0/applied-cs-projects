@@ -90,6 +90,23 @@ mlorchestrator serve --host 0.0.0.0 --port 8000
 uvicorn ml_orchestrator.api.app:app --reload
 ```
 
+### Security & limits
+
+The gateway ships a production hardening baseline that is opt-in via environment
+variables (all stdlib, no extra deps). Health checks and the docs/OpenAPI
+endpoints are always open; the `/api/v1/*` routers are protected when auth is on.
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `API_KEYS` | *(unset)* | Comma-separated valid keys. Unset/empty ⇒ auth disabled (a startup warning is logged). When set, `/api/v1/*` requires `Authorization: Bearer <key>` or `X-API-Key: <key>`; missing/invalid ⇒ 401. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Per-client sliding-window limit (keyed by API key, else client IP). `0` disables. Over-limit ⇒ 429 with `Retry-After`. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout. `0` disables. On timeout ⇒ 504 JSON. |
+
+```bash
+API_KEYS=my-secret-key mlorchestrator serve &
+curl -H "Authorization: Bearer my-secret-key" http://localhost:8000/api/v1/jobs
+```
+
 ## Usage
 
 The managers are async. The example below submits a job, drives it through its lifecycle, and
@@ -133,7 +150,9 @@ asyncio.run(main())
   allocation policies, GPU pool tracking, node management, quota enforcement, checkpoint manager
   with keep-last-N cleanup, local-filesystem checkpoint storage, the barrier-based checkpoint
   coordinator, collective-op coordination logic, the experiment tracker, and the FastAPI gateway.
-  These are exercised directly by the test suite.
+  These are exercised directly by the test suite. The gateway also has a real, opt-in hardening
+  baseline — API-key auth, in-process rate limiting, and request timeouts (see **Security &
+  limits**) — off by default so the quick-start needs no configuration.
 - **Simulated / requires credentials:** the distributed layer
   (`distributed/collective.py`, `distributed/coordinator.py`, `distributed/elastic.py`)
   coordinates collective operations and membership purely in-process — there is no real

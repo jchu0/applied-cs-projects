@@ -144,6 +144,29 @@ from syntheticdata.provider import OpenAIProvider
 provider = OpenAIProvider(api_key="sk-...", model="gpt-4")  # requires `openai`
 ```
 
+## Security & limits
+
+The FastAPI service (`create_api`) ships with opt-in production hardening (stdlib
+only, no extra deps). All three controls are off by default so the quick-start and
+tests work unchanged:
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `API_KEYS` | *(unset)* | Comma-separated valid keys. Unset/empty disables auth (a startup warning is logged). When set, every endpoint requires a key. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Sliding-window requests/minute, keyed by API key or client IP. `0` disables. Over the limit returns `429` with `Retry-After`. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout. `0` disables. On timeout returns `504`. |
+
+When auth is enabled, pass `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+Missing/invalid keys return `401` with a `WWW-Authenticate` header. Health/readiness/root
+(`/`, `/health`) and docs (`/docs`, `/redoc`, `/openapi.json`) stay open and are exempt
+from rate limiting. There are no SSE/websocket endpoints, so the timeout applies to all
+routes.
+
+```bash
+API_KEYS=my-secret uvicorn "syntheticdata.api:create_api" --factory
+curl -H "Authorization: Bearer my-secret" http://localhost:8000/domains
+```
+
 ## What's Real vs Simulated
 
 - **Real:** All schemas, the generation engine, difficulty distribution math, prompt
@@ -155,8 +178,10 @@ provider = OpenAIProvider(api_key="sk-...", model="gpt-4")  # requires `openai`
   API keys and the `openai`/`anthropic` packages; without them the pipeline runs on
   `MockProvider`, which returns canned JSON. The `MockProvider` does not call a model, so
   quality and difficulty scores reflect template/parse behavior, not real model judgment.
-  Parquet/CSV export needs `pandas`/`pyarrow`; the FastAPI service needs `fastapi`;
-  DVC versioning (`use_dvc=True`) shells out to the `dvc` CLI if installed.
+  Parquet/CSV export needs `pandas`/`pyarrow`; the FastAPI service needs `fastapi`
+  (install the `api` extra). The service supports opt-in API-key auth, rate limiting,
+  and request timeouts (see [Security & limits](#security--limits)); all are disabled
+  by default. DVC versioning (`use_dvc=True`) shells out to the `dvc` CLI if installed.
 
 ## Testing
 

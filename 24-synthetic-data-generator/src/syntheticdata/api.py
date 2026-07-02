@@ -171,15 +171,21 @@ def create_api(
         FastAPI application
     """
     try:
-        from fastapi import FastAPI, HTTPException, BackgroundTasks
+        from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
     except ImportError:
         raise ImportError("FastAPI required. Install with: pip install fastapi uvicorn")
+
+    from .security import build_auth_dependency, install_hardening
 
     app = FastAPI(
         title="Synthetic Data Generator API",
         description="Production API for generating high-quality synthetic training data",
         version="0.1.0",
+        dependencies=[Depends(build_auth_dependency())],
     )
+
+    # Rate limiting + request timeout middleware (opt-in via env).
+    install_hardening(app)
 
     # Initialize components
     dataset_manager = DatasetManager(output_dir)

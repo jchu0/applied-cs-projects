@@ -98,6 +98,30 @@ uvicorn ragbaseline.api:app --reload
 python -m ragbaseline.api
 ```
 
+### Security & limits
+
+The API ships with opt-in production hardening (all stdlib, configured via env vars,
+implemented in `security.py`). Everything is off by default so the keyless quick-start
+still works:
+
+| Env var | Default | Behaviour |
+|---------|---------|-----------|
+| `API_KEYS` | *(unset)* | Comma-separated valid keys. Unset/empty → auth disabled (a startup warning is logged). When set, every endpoint except `/health`, `/`, and the docs (`/docs`, `/redoc`, `/openapi.json`) requires a key. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | In-process sliding-window limit, keyed by API key (or client IP). `0` disables. Over-limit requests get `429` with a `Retry-After` header. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout; on expiry the handler is cancelled and a `504` JSON is returned. `0` disables. The SSE streaming endpoint `/query/stream` is exempt. |
+
+Auth accepts either `Authorization: Bearer <key>` or `X-API-Key: <key>` (keys are
+compared in constant time). This layers *in front of* the existing per-tenant
+isolation — the caller-supplied `tenant_id` still selects the tenant index.
+
+```bash
+API_KEYS=my-secret-key uvicorn ragbaseline.api:app
+curl -X POST http://localhost:8000/query \
+  -H "Authorization: Bearer my-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is RAG?", "tenant_id": "default"}'
+```
+
 ## Usage
 
 The example below uses the fully local stack (`MockEmbedding`, `SimpleVectorStore`,
@@ -148,7 +172,11 @@ Anthropic / sentence-transformers equivalents) to run against real models.
   cosine search with metadata filtering, `RAGIndex`, `RAGPipeline` (sync + streaming),
   the from-scratch `BM25` scorer, `HybridRetriever` RRF fusion, fusion/MMR retrievers,
   `MultiIndexManager`, `MetadataFilter`, and the enterprise logging/usage trackers. The
-  FastAPI app defaults to the mock LLM provider, so it runs without keys.
+  FastAPI app defaults to the mock LLM provider, so it runs without keys. The opt-in
+  API-key auth, in-process rate limiting, and request timeout (see
+  [Security & limits](#security--limits)) are real and stdlib-only; they are disabled
+  unless their env vars are set, so tenant isolation still relies on the caller-supplied
+  `tenant_id`, now optionally gated behind an API key.
 - **Simulated / requires credentials or optional deps:** `OpenAIEmbedding` /
   `OpenAIProvider` (OpenAI key), `AnthropicProvider` (Anthropic key), `CohereReranker`
   (Cohere key), `ChromaVectorStore` / `QdrantVectorStore` / `PineconeVectorStore` (their

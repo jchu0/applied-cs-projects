@@ -20,6 +20,16 @@ from .index import RAGIndex
 from .pipeline import RAGPipeline, get_llm_provider
 from .enterprise import TenantManager, RetrievalLogger, UsageTracker
 from .retrieval import HybridRetriever, get_reranker, MetadataFilter
+from .security import (
+    RateLimitMiddleware,
+    SlidingWindowRateLimiter,
+    TimeoutMiddleware,
+    auth_enabled,
+    logger as security_logger,
+    rate_limit_per_minute,
+    request_timeout_seconds,
+    require_api_key,
+)
 
 
 # =============================================================================
@@ -126,6 +136,23 @@ def create_app(
         title="RAG Baseline API",
         description="Production-ready Retrieval-Augmented Generation API",
         version="1.0.0",
+        dependencies=[Depends(require_api_key)],
+    )
+
+    # Warn once at startup when auth is disabled (no API_KEYS configured).
+    if not auth_enabled():
+        security_logger.warning("API auth disabled (set API_KEYS to enable)")
+
+    # Production hardening middleware (opt-in via env; see security.py).
+    # Order matters: outermost added last. We add timeout first (inner) then
+    # rate limiting (outer) so rejected requests never consume a handler slot.
+    app.add_middleware(
+        TimeoutMiddleware,
+        timeout_seconds=request_timeout_seconds(),
+    )
+    app.add_middleware(
+        RateLimitMiddleware,
+        limiter=SlidingWindowRateLimiter(rate_limit_per_minute()),
     )
 
     # CORS

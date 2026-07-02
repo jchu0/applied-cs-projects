@@ -101,6 +101,25 @@ uvicorn observability.api:app --reload
 
 The API serves interactive docs at http://localhost:8000/docs.
 
+### Security & limits
+
+The API ships with an opt-in hardening baseline (all stdlib, no extra deps). All three
+are **off by default** so the quick-start and tests work with no configuration.
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `API_KEYS` | _unset_ | Comma-separated valid keys. When set, all routes require a key via `Authorization: Bearer <key>` or `X-API-Key: <key>` (401 otherwise). Unset ⇒ auth disabled. |
+| `RATE_LIMIT_PER_MINUTE` | `120` | Per-minute request cap, keyed by API key (or client IP). `0` disables. Over-limit ⇒ 429 with `Retry-After`. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Per-request timeout. `0` disables. Exceeded ⇒ 504. |
+
+`/health`, `/`, and the docs (`/docs`, `/redoc`, `/openapi.json`) stay open and exempt
+from auth and rate limiting.
+
+```bash
+API_KEYS=my-secret-key uvicorn observability.api:app
+curl -H "Authorization: Bearer my-secret-key" http://localhost:8000/tables
+```
+
 ## Usage
 
 ### Detecting anomalies
@@ -151,8 +170,11 @@ engine.add_rule(FRESHNESS_ALERT_RULE)
 
 - **Real:** the anomaly monitors, the statistical and Isolation Forest detectors
   (scikit-learn), the SQL lineage parser and graph, health scoring, PII detection,
-  alert-rule matching and escalation, forecasting, and the FastAPI gateway. The
-  `InMemoryCollector` backs the full test suite with no external dependencies.
+  alert-rule matching and escalation, forecasting, and the FastAPI gateway. The gateway
+  ships with a real, opt-in hardening baseline — API-key auth, in-process rate limiting,
+  and request timeouts (see [Security & limits](#security--limits)), all disabled by
+  default. The `InMemoryCollector` backs the full test suite with no external
+  dependencies.
 - **Simulated / requires credentials:** the warehouse collectors (Snowflake, BigQuery,
   Redshift, Databricks, Postgres) are adapters written against each vendor's client
   library and need real connections and drivers to run against live data — they are not
@@ -166,8 +188,8 @@ engine.add_rule(FRESHNESS_ALERT_RULE)
 pytest tests/ -v
 ```
 
-15 test modules cover collectors, the detectors, channels, alerting, lineage, health,
-config, and the API. No warehouse or network access is required.
+16 test modules cover collectors, the detectors, channels, alerting, lineage, health,
+config, the API, and the security hardening. No warehouse or network access is required.
 
 ## Project Structure
 

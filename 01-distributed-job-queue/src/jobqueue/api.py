@@ -13,6 +13,7 @@ from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_
 from starlette.responses import Response
 
 from jobqueue.broker import Broker, InMemoryBroker
+from jobqueue.security import install_hardening
 from jobqueue.models import (
     Task,
     TaskCreate,
@@ -231,6 +232,11 @@ def create_app() -> FastAPI:
         broker = get_broker()
         await broker.heartbeat(worker_id, current_task)
         return {"status": "ok"}
+
+    # Production hardening: API-key auth, rate limiting, request timeout.
+    # Health/readiness/root, /metrics, and docs stay open; everything else
+    # (including the worker-facing /internal/* routes) is protected.
+    install_hardening(app)
 
     return app
 
