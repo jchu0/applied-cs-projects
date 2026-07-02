@@ -60,8 +60,8 @@ flowchart TD
 
 ### Prerequisites
 
-- Python 3.9+
-- `numpy` and `pydantic` (installed below). No GPU or CUDA toolkit is required — kernel
+- Python 3.10+
+- `numpy` (installed below). No GPU or CUDA toolkit is required — kernel
   execution is simulated. CuPy/pynvml are optional extras and are not exercised by the tests.
 
 ### Installation
@@ -132,7 +132,8 @@ print(f"pipeline efficiency: {pipe.efficiency:.2%}, bubble {pipe.bubble_ratio:.2
 
 - **Real:** All scheduling, optimization, and analysis logic is fully implemented and tested —
   topological sort, critical-path DP, parallel grouping, the three scheduler policies, stream
-  and memory-transfer scheduling, kernel fusion and dead-code elimination, memory liveness
+  and memory-transfer scheduling, kernel fusion, dead-code elimination, constant folding of
+  compile-time-constant subgraphs, memory liveness
   planning, pipeline partitioning with GPipe/1F1B microbatch timing, the roofline and
   communication cost models, per-device memory accounting, profiling, and the speculative
   execution commit/rollback bookkeeping.

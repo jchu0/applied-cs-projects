@@ -260,19 +260,25 @@ problem, so a fast greedy heuristic is the right teaching choice.
 
 **`DeadCodeEliminator`** keeps only kernels that produce a tensor consumed by a dependency or by a
 graph output (or that have no dependents), and prunes dependencies to the surviving set.
-`ConstantFolder` is a pass-through placeholder.
+`ConstantFolder` folds compile-time-constant subgraphs: it marks a kernel constant if it carries an
+`is_constant` attribute (e.g. a weight/initializer) or if every kernel it depends on is already
+constant, propagating constant-ness transitively in topological order, then collapses each *derived*
+constant compute kernel into a single materialized `MEMORY` node and drops its now-redundant incoming
+edges. On ordinary graphs (no marked constants) it is an equivalent-graph no-op.
 
-`create_default_pipeline()` wires DCE → fusion → memory planning; `optimize_graph(graph)` is the
-one-call convenience wrapper.
+`create_default_pipeline()` wires DCE → fusion → constant folding → memory planning;
+`optimize_graph(graph)` is the one-call convenience wrapper.
 
 **Pass ordering matters.** Dead-code elimination runs first so the fuser and allocator never waste
 work on unreachable kernels. Fusion runs before memory planning because fusion changes which
 tensors are live — a fused GEMM+bias+activation eliminates the intermediate bias and activation
 outputs, so the allocator should see the post-fusion graph to compute correct liveness and offsets.
-`ConstantFolder` is a deliberate no-op placeholder: it exists so the pipeline's pass list mirrors a
-real compiler's shape, and its inertness is documented rather than hidden. The `KernelFuser`
-`_fuse_layer_norm` and `_fuse_attention` hooks are the same — recognized patterns that return
-`False` today, kept as explicit extension points rather than pretending the fusion set is complete.
+`ConstantFolder` runs on the post-fusion graph so it folds the fused constant subgraphs rather than
+their pre-fusion pieces. It is a real but deliberately minimal pass: because the analytic IR stores
+tensor *shapes*, not values, folding means proving a kernel's output is compile-time-determined and
+replacing the compute with a materialized constant — it does not evaluate arithmetic. The `KernelFuser`
+`_fuse_layer_norm` and `_fuse_attention` hooks remain recognized patterns that return `False` today,
+kept as explicit extension points rather than pretending the fusion set is complete.
 
 **Copy-on-write graphs.** Each pass returns a *new* `ComputeGraph`; the fuser calls `_copy_graph`
 (shallow-copying kernel references and cloning the dependency list) before mutating, so the caller's

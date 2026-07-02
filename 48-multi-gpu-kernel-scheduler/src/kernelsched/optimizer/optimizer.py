@@ -367,12 +367,83 @@ class MemoryOptimizer(GraphOptimizer):
 
 
 class ConstantFolder(GraphOptimizer):
-    """Fold constant expressions."""
+    """Fold compile-time-constant subgraphs into single constant nodes.
+
+    A kernel is treated as *constant* if it is explicitly marked with the
+    ``is_constant`` attribute (e.g. a weight/initializer node) or if every
+    kernel it depends on has already been proven constant. Such a kernel's
+    output is fully determined at compile time, so the whole compute kernel is
+    replaced by a single ``MEMORY`` "materialized constant" node that carries
+    the same outputs. This is a real (if minimal) constant-folding pass: it
+    propagates constant-ness transitively and collapses folded compute, without
+    executing anything (the analytic IR stores shapes, not values).
+
+    Kernels with no marked constants are left untouched, so on ordinary graphs
+    (the common case) the pass is a safe no-op that returns an equivalent graph.
+    """
+
+    def __init__(self):
+        self.folded_count = 0
 
     def optimize(self, graph: ComputeGraph) -> ComputeGraph:
-        """Fold constants in graph."""
-        # Simplified: return as-is
-        return graph
+        """Fold constant kernels in the graph."""
+        self.folded_count = 0
+
+        optimized = ComputeGraph()
+        optimized.kernels = dict(graph.kernels)
+        optimized.dependencies = list(graph.dependencies)
+        optimized.input_tensors = graph.input_tensors
+        optimized.output_tensors = graph.output_tensors
+
+        # Propagate constant-ness in topological order: a kernel is constant if
+        # it is explicitly marked, or all of its predecessors are constant.
+        constant_ids: set[str] = set()
+        for kernel_id in optimized.topological_sort():
+            kernel = optimized.kernels[kernel_id]
+            if kernel.attributes.get("is_constant"):
+                constant_ids.add(kernel_id)
+                continue
+
+            deps = optimized.get_dependencies(kernel_id)
+            if deps and all(d in constant_ids for d in deps):
+                constant_ids.add(kernel_id)
+
+        # Fold each derived constant compute kernel (one that has inputs from
+        # other kernels) into a materialized MEMORY constant node.
+        for kernel_id in list(constant_ids):
+            kernel = optimized.kernels[kernel_id]
+            # Leaf constants (no predecessors) are already just data; skip.
+            if not optimized.get_dependencies(kernel_id):
+                continue
+            if kernel.kernel_type == KernelType.MEMORY and kernel.attributes.get("folded"):
+                continue
+
+            folded = Kernel(
+                kernel_id=kernel.kernel_id,
+                name=f"const_{kernel.name}",
+                kernel_type=KernelType.MEMORY,
+                inputs=[],
+                outputs=kernel.outputs.copy(),
+                device_id=kernel.device_id,
+                estimated_time_us=0.0,
+                attributes={"is_constant": True, "folded": True,
+                            "original_type": kernel.kernel_type.value},
+            )
+            optimized.kernels[kernel_id] = folded
+            self.folded_count += 1
+
+        # Incoming dependencies of a folded kernel are now redundant (its value
+        # is materialized), so drop edges that target a folded node.
+        folded_ids = {
+            kid for kid in constant_ids
+            if optimized.kernels[kid].attributes.get("folded")
+        }
+        optimized.dependencies = [
+            dep for dep in optimized.dependencies
+            if dep.target_id not in folded_ids
+        ]
+
+        return optimized
 
 
 class DeadCodeEliminator(GraphOptimizer):
@@ -456,6 +527,7 @@ def create_default_pipeline() -> OptimizationPipeline:
     pipeline = OptimizationPipeline()
     pipeline.add_pass("dead_code", DeadCodeEliminator())
     pipeline.add_pass("fusion", KernelFuser())
+    pipeline.add_pass("constant_folding", ConstantFolder())
     pipeline.add_pass("memory", MemoryOptimizer())
     return pipeline
 
