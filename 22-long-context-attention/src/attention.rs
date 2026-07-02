@@ -14,6 +14,87 @@ pub struct AttentionOutput {
     pub attention_weights: Option<Vec<f32>>,
 }
 
+/// Validate that query/key/value (and optional mask) buffers match their
+/// declared tensor shapes before any indexing occurs.
+///
+/// This guards the public `forward` entry points: a caller-supplied buffer
+/// whose length disagrees with its declared shape would otherwise cause
+/// out-of-bounds indexing (a panic, or worse). Instead we return a clean
+/// [`Error::ShapeMismatch`] / [`Error::DimensionMismatch`].
+///
+/// Checks performed:
+/// - `query.len() == q_shape.num_elements()`
+/// - `key.len() == value.len() == kv_shape.num_elements()`
+/// - query and KV share `num_heads` and `head_dim` (per-head invariants)
+/// - the mask, if provided, has at least `q_len * kv_len` entries
+pub fn validate_forward_inputs(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    q_shape: TensorShape,
+    kv_shape: TensorShape,
+    attention_mask: Option<&[f32]>,
+) -> Result<()> {
+    // Per-head invariants: query and KV must agree on head count and dim,
+    // otherwise the shared index arithmetic reads out of the other buffer.
+    if q_shape.num_heads != kv_shape.num_heads {
+        return Err(Error::DimensionMismatch {
+            expected: q_shape.num_heads,
+            actual: kv_shape.num_heads,
+        });
+    }
+    if q_shape.head_dim != kv_shape.head_dim {
+        return Err(Error::DimensionMismatch {
+            expected: q_shape.head_dim,
+            actual: kv_shape.head_dim,
+        });
+    }
+    if q_shape.batch != kv_shape.batch {
+        return Err(Error::DimensionMismatch {
+            expected: q_shape.batch,
+            actual: kv_shape.batch,
+        });
+    }
+
+    let q_expected = q_shape.num_elements();
+    if query.len() != q_expected {
+        return Err(Error::ShapeMismatch {
+            name: "query",
+            expected: q_expected,
+            actual: query.len(),
+        });
+    }
+
+    let kv_expected = kv_shape.num_elements();
+    if key.len() != kv_expected {
+        return Err(Error::ShapeMismatch {
+            name: "key",
+            expected: kv_expected,
+            actual: key.len(),
+        });
+    }
+    if value.len() != kv_expected {
+        return Err(Error::ShapeMismatch {
+            name: "value",
+            expected: kv_expected,
+            actual: value.len(),
+        });
+    }
+
+    if let Some(mask) = attention_mask {
+        let mask_expected = q_shape.seq_len * kv_shape.seq_len;
+        if mask.len() < mask_expected {
+            return Err(Error::ShapeMismatch {
+                name: "attention_mask",
+                expected: mask_expected,
+                actual: mask.len(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Standard O(n^2) attention implementation.
 pub struct StandardAttention {
     config: AttentionConfig,
@@ -41,13 +122,8 @@ impl StandardAttention {
         let num_heads = q_shape.num_heads;
         let head_dim = q_shape.head_dim;
 
-        // Validate dimensions
-        if q_shape.num_heads != kv_shape.num_heads {
-            return Err(Error::DimensionMismatch {
-                expected: q_shape.num_heads,
-                actual: kv_shape.num_heads,
-            });
-        }
+        // Validate buffer lengths against declared shapes before indexing.
+        validate_forward_inputs(query, key, value, q_shape, kv_shape, attention_mask)?;
 
         let scale = self.config.scale();
         let mut output = vec![0.0; batch * q_len * num_heads * head_dim];
@@ -594,10 +670,11 @@ mod tests {
         let mut scores = vec![0.0; 9]; // 3x3
         apply_causal_mask(&mut scores, 3, 3);
 
-        // Upper triangle should be -inf
-        assert!(scores[1].is_finite()); // [0,1] should be masked
-        assert!(scores[2].is_infinite()); // [0,2] should be masked
-        assert!(scores[5].is_infinite()); // [1,2] should be masked
+        // Upper triangle should be -inf (causal: qi can't attend to ki > qi)
+        assert!(scores[1].is_infinite()); // [0,1] masked
+        assert!(scores[2].is_infinite()); // [0,2] masked
+        assert!(scores[5].is_infinite()); // [1,2] masked
+        assert!(scores[0].is_finite()); // [0,0] on the diagonal, kept
     }
 
     #[test]
@@ -634,6 +711,111 @@ mod tests {
         assert!((scores[5] - 1.0).abs() < 1e-5); // [1,1]
         assert!((scores[6] - 1.0).abs() < 1e-5); // [1,2]
         assert!((scores[7] - 1.0).abs() < 1e-5); // [1,3]
+    }
+
+    #[test]
+    fn test_standard_attention_short_query_buffer_errors() {
+        // A query buffer shorter than its declared shape must return Err,
+        // not panic on out-of-bounds indexing.
+        let config = AttentionConfig::new(2, 4);
+        let attention = StandardAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 4;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        // Deliberately too short.
+        let query: Vec<f32> = vec![0.1; size - 1];
+        let key: Vec<f32> = vec![0.1; size];
+        let value: Vec<f32> = vec![0.1; size];
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let result = attention.forward(&query, &key, &value, shape, shape, None);
+
+        assert!(matches!(result, Err(Error::ShapeMismatch { name: "query", .. })));
+    }
+
+    #[test]
+    fn test_standard_attention_short_kv_buffer_errors() {
+        let config = AttentionConfig::new(2, 4);
+        let attention = StandardAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 4;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = vec![0.1; size];
+        let key: Vec<f32> = vec![0.1; size - 2]; // too short
+        let value: Vec<f32> = vec![0.1; size];
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let result = attention.forward(&query, &key, &value, shape, shape, None);
+
+        assert!(matches!(result, Err(Error::ShapeMismatch { name: "key", .. })));
+    }
+
+    #[test]
+    fn test_standard_attention_short_mask_errors() {
+        let config = AttentionConfig::new(2, 4).with_causal(false);
+        let attention = StandardAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 3;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = vec![0.1; size];
+        let key = query.clone();
+        let value = query.clone();
+        let mask = vec![0.0; seq_len * seq_len - 1]; // too short
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let result = attention.forward(&query, &key, &value, shape, shape, Some(&mask));
+
+        assert!(matches!(
+            result,
+            Err(Error::ShapeMismatch { name: "attention_mask", .. })
+        ));
+    }
+
+    #[test]
+    fn test_standard_attention_valid_input_still_ok() {
+        // Ensure validation does not reject correctly-sized inputs.
+        let config = AttentionConfig::new(2, 4).with_causal(true);
+        let attention = StandardAttention::new(config);
+
+        let batch = 2;
+        let seq_len = 5;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = (0..size).map(|i| (i as f32) * 0.01).collect();
+        let key = query.clone();
+        let value = query.clone();
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let output = attention
+            .forward(&query, &key, &value, shape, shape, None)
+            .unwrap();
+
+        assert_eq!(output.output.len(), size);
+    }
+
+    #[test]
+    fn test_validate_forward_inputs_head_dim_mismatch() {
+        let q_shape = TensorShape::new(1, 4, 2, 4);
+        let kv_shape = TensorShape::new(1, 4, 2, 8); // head_dim differs
+        let q = vec![0.0; q_shape.num_elements()];
+        let kv = vec![0.0; kv_shape.num_elements()];
+
+        let result = validate_forward_inputs(&q, &kv, &kv, q_shape, kv_shape, None);
+        assert!(matches!(result, Err(Error::DimensionMismatch { .. })));
     }
 
     #[test]

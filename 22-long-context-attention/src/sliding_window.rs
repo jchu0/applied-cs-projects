@@ -1,6 +1,6 @@
 //! Sliding window attention for linear memory complexity.
 
-use crate::attention::AttentionOutput;
+use crate::attention::{validate_forward_inputs, AttentionOutput};
 use crate::config::{AttentionConfig, TensorShape};
 use crate::Result;
 
@@ -28,6 +28,8 @@ impl SlidingWindowAttention {
         kv_shape: TensorShape,
         attention_mask: Option<&[f32]>,
     ) -> Result<AttentionOutput> {
+        validate_forward_inputs(query, key, value, q_shape, kv_shape, attention_mask)?;
+
         let batch = q_shape.batch;
         let q_len = q_shape.seq_len;
         let kv_len = kv_shape.seq_len;
@@ -174,6 +176,8 @@ impl DilatedSlidingWindowAttention {
         q_shape: TensorShape,
         kv_shape: TensorShape,
     ) -> Result<AttentionOutput> {
+        validate_forward_inputs(query, key, value, q_shape, kv_shape, None)?;
+
         let batch = q_shape.batch;
         let q_len = q_shape.seq_len;
         let kv_len = kv_shape.seq_len;
@@ -322,6 +326,83 @@ mod tests {
         // Full attention would be: 8 * 16384 * 16384 * 4 = ~8GB
         // Window attention: 8 * 16384 * 1024 * 4 = ~512MB
         assert!(memory < 1_000_000_000); // Less than 1GB
+    }
+
+    #[test]
+    fn test_sliding_window_short_buffer_errors() {
+        let config = AttentionConfig::new(2, 4)
+            .with_window_size(2)
+            .with_causal(true);
+        let attention = SlidingWindowAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = vec![0.1; size];
+        let key: Vec<f32> = vec![0.1; size - 4]; // too short
+        let value: Vec<f32> = vec![0.1; size];
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let result = attention.forward(&query, &key, &value, shape, shape, None);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::ShapeMismatch { name: "key", .. })
+        ));
+    }
+
+    #[test]
+    fn test_sliding_window_valid_input_still_ok() {
+        let config = AttentionConfig::new(2, 4)
+            .with_window_size(2)
+            .with_causal(true);
+        let attention = SlidingWindowAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = (0..size).map(|i| (i as f32) * 0.1).collect();
+        let key = query.clone();
+        let value = query.clone();
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let output = attention
+            .forward(&query, &key, &value, shape, shape, None)
+            .unwrap();
+
+        assert_eq!(output.output.len(), size);
+    }
+
+    #[test]
+    fn test_dilated_sliding_window_short_buffer_errors() {
+        let config = AttentionConfig::new(2, 4)
+            .with_window_size(3)
+            .with_causal(true);
+        let attention = DilatedSlidingWindowAttention::new(config, 2);
+
+        let batch = 1;
+        let seq_len = 12;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = vec![0.1; size - 5]; // too short
+        let key: Vec<f32> = vec![0.1; size];
+        let value: Vec<f32> = vec![0.1; size];
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let result = attention.forward(&query, &key, &value, shape, shape);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::ShapeMismatch { name: "query", .. })
+        ));
     }
 
     #[test]

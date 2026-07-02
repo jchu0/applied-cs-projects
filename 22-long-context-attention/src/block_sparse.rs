@@ -1,6 +1,6 @@
 //! Block sparse attention (Longformer-style) implementation.
 
-use crate::attention::AttentionOutput;
+use crate::attention::{validate_forward_inputs, AttentionOutput};
 use crate::config::{AttentionConfig, TensorShape};
 use crate::Result;
 use rand::Rng;
@@ -94,17 +94,21 @@ impl BlockSparseAttention {
                 pattern.set(i, j, true);
             }
 
-            // Random blocks
+            // Random blocks: sample without replacement from the eligible,
+            // not-yet-attended blocks. Rejection sampling here loops forever
+            // when fewer eligible blocks exist than num_random_blocks (e.g.
+            // row 0 under causal masking, whose only eligible block is the
+            // local window itself).
             if self.config.num_random_blocks > 0 {
                 let mut rng = rand::thread_rng();
-                let mut added = 0;
-
-                while added < self.config.num_random_blocks {
-                    let j = rng.gen_range(0..num_blocks);
-                    if !pattern.get(i, j) && (!self.config.causal || j <= i) {
-                        pattern.set(i, j, true);
-                        added += 1;
-                    }
+                let mut candidates: Vec<usize> = (0..num_blocks)
+                    .filter(|&j| !pattern.get(i, j) && (!self.config.causal || j <= i))
+                    .collect();
+                let take = self.config.num_random_blocks.min(candidates.len());
+                for _ in 0..take {
+                    let idx = rng.gen_range(0..candidates.len());
+                    let j = candidates.swap_remove(idx);
+                    pattern.set(i, j, true);
                 }
             }
         }
@@ -131,6 +135,10 @@ impl BlockSparseAttention {
         _kv_shape: TensorShape,
         _attention_mask: Option<&[f32]>,
     ) -> Result<AttentionOutput> {
+        // Block sparse indexes key/value with the query sequence length, so all
+        // three buffers must match q_shape's element count.
+        validate_forward_inputs(query, key, value, q_shape, q_shape, None)?;
+
         let batch = q_shape.batch;
         let seq_len = q_shape.seq_len;
         let num_heads = q_shape.num_heads;
@@ -402,6 +410,61 @@ mod tests {
 
         let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
 
+        let output = attention
+            .forward(&query, &key, &value, shape, shape, None)
+            .unwrap();
+
+        assert_eq!(output.output.len(), size);
+    }
+
+    #[test]
+    fn test_block_sparse_short_buffer_errors() {
+        let mut config = AttentionConfig::new(2, 4).with_causal(true);
+        config.block_size = 4;
+        config.num_global_tokens = 8;
+        config.num_random_blocks = 0;
+
+        let attention = BlockSparseAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 16;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = vec![0.1; size];
+        let key: Vec<f32> = vec![0.1; size];
+        let value: Vec<f32> = vec![0.1; size - 8]; // too short
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let result = attention.forward(&query, &key, &value, shape, shape, None);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::ShapeMismatch { name: "value", .. })
+        ));
+    }
+
+    #[test]
+    fn test_block_sparse_valid_input_still_ok() {
+        let mut config = AttentionConfig::new(2, 4).with_causal(true);
+        config.block_size = 4;
+        config.num_global_tokens = 8;
+        config.num_random_blocks = 0;
+
+        let attention = BlockSparseAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 16;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = (0..size).map(|i| (i as f32) * 0.1).collect();
+        let key = query.clone();
+        let value = query.clone();
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
         let output = attention
             .forward(&query, &key, &value, shape, shape, None)
             .unwrap();

@@ -45,6 +45,13 @@ pub enum Error {
 
     #[error("Invalid attention mask")]
     InvalidMask,
+
+    #[error("Shape mismatch for {name}: buffer length {actual} does not match declared shape length {expected}")]
+    ShapeMismatch {
+        name: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 /// Result type for attention operations.

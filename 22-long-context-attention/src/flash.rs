@@ -1,6 +1,6 @@
 //! Flash attention implementation with memory-efficient tiling.
 
-use crate::attention::AttentionOutput;
+use crate::attention::{validate_forward_inputs, AttentionOutput};
 use crate::config::{AttentionConfig, TensorShape};
 use crate::Result;
 
@@ -42,8 +42,10 @@ impl FlashAttention {
         value: &[f32],
         q_shape: TensorShape,
         kv_shape: TensorShape,
-        _attention_mask: Option<&[f32]>,
+        attention_mask: Option<&[f32]>,
     ) -> Result<AttentionOutput> {
+        validate_forward_inputs(query, key, value, q_shape, kv_shape, attention_mask)?;
+
         let batch = q_shape.batch;
         let q_len = q_shape.seq_len;
         let kv_len = kv_shape.seq_len;
@@ -242,6 +244,8 @@ impl LinearAttention {
         q_shape: TensorShape,
         kv_shape: TensorShape,
     ) -> Result<AttentionOutput> {
+        validate_forward_inputs(query, key, value, q_shape, kv_shape, None)?;
+
         let batch = q_shape.batch;
         let q_len = q_shape.seq_len;
         let kv_len = kv_shape.seq_len;
@@ -793,6 +797,77 @@ mod tests {
 
         assert_eq!(flash_out.output.len(), linear_out.output.len());
         assert_eq!(flash_out.shape.seq_len, linear_out.shape.seq_len);
+    }
+
+    #[test]
+    fn test_flash_attention_short_buffer_errors() {
+        let config = AttentionConfig::new(2, 4).with_causal(true);
+        let attention = FlashAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 16;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = vec![0.01; size - 3]; // too short
+        let key: Vec<f32> = vec![0.01; size];
+        let value: Vec<f32> = vec![0.01; size];
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let result = attention.forward(&query, &key, &value, shape, shape, None);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::ShapeMismatch { name: "query", .. })
+        ));
+    }
+
+    #[test]
+    fn test_flash_attention_valid_input_still_ok() {
+        let config = AttentionConfig::new(2, 4).with_causal(true);
+        let attention = FlashAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 16;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = (0..size).map(|i| (i as f32) * 0.01).collect();
+        let key = query.clone();
+        let value = query.clone();
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let output = attention
+            .forward(&query, &key, &value, shape, shape, None)
+            .unwrap();
+
+        assert_eq!(output.output.len(), size);
+    }
+
+    #[test]
+    fn test_linear_attention_short_buffer_errors() {
+        let config = AttentionConfig::new(2, 4);
+        let attention = LinearAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = vec![0.01; size];
+        let key: Vec<f32> = vec![0.01; size];
+        let value: Vec<f32> = vec![0.01; size - 1]; // too short
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let result = attention.forward(&query, &key, &value, shape, shape);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::ShapeMismatch { name: "value", .. })
+        ));
     }
 
     #[test]

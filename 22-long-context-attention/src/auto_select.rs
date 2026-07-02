@@ -369,6 +369,32 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_forward_short_buffer_errors() {
+        // Auto-select delegates to an underlying impl; validation must still
+        // surface a clean error rather than panicking.
+        let config = AttentionConfig::new(2, 4).with_causal(true);
+        let auto = AutoSelectAttention::new(config);
+
+        let batch = 1;
+        let seq_len = 16;
+        let num_heads = 2;
+        let head_dim = 4;
+        let size = batch * seq_len * num_heads * head_dim;
+
+        let query: Vec<f32> = vec![0.01; size - 2]; // too short
+        let key: Vec<f32> = vec![0.01; size];
+        let value: Vec<f32> = vec![0.01; size];
+
+        let shape = TensorShape::new(batch, seq_len, num_heads, head_dim);
+        let result = auto.forward(&query, &key, &value, shape, shape, None);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::ShapeMismatch { name: "query", .. })
+        ));
+    }
+
+    #[test]
     fn test_gpu_thresholds() {
         let h100 = SelectionThresholds::for_gpu(GpuArchitecture::H100);
         let v100 = SelectionThresholds::for_gpu(GpuArchitecture::V100);
