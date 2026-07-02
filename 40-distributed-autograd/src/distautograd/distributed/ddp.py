@@ -394,15 +394,29 @@ class PipelineScheduler:
 
     def _wait_for_stage(self):
         """Wait for any pipeline stage to complete."""
+        from concurrent.futures import TimeoutError as FutureTimeoutError
+
         for i, future in enumerate(self._stage_futures):
             if future is not None:
                 try:
                     future.result(timeout=0.001)
                     return
-                except:
-                    pass
+                except FutureTimeoutError:
+                    # Stage not finished within the poll window; this is the
+                    # expected common case, so move on to the next stage.
+                    continue
+                except Exception as e:
+                    # A stage's AllReduce raised. Keep the scheduler resilient
+                    # by freeing this stage and returning, but do NOT hide the
+                    # failure -- log it with context so it stays diagnosable.
+                    logger.error(
+                        "Pipeline stage %d failed while waiting: %s", i, e
+                    )
+                    return
 
-        # Wait for first future
+        # No stage completed within the poll window: block on the first
+        # outstanding future. Let its exception propagate so callers see the
+        # underlying failure rather than a silent hang.
         if self._stage_futures[0] is not None:
             self._stage_futures[0].result()
 
@@ -1192,6 +1206,18 @@ class Checkpointer:
     - Automatic cleanup of old checkpoints
     - Distributed checkpoint coordination
     - Async checkpoint writing
+
+    .. warning::
+        **Security:** checkpoints are serialized with :mod:`pickle`, which
+        executes arbitrary code on load. Only ever call :meth:`load` on files
+        you produced yourself or otherwise fully trust -- a maliciously crafted
+        checkpoint can run arbitrary code in your process. Never load a
+        checkpoint received from an untrusted source. As a guard rail,
+        :meth:`load` refuses paths outside ``save_dir`` by default; pass
+        ``allow_external=True`` only when you trust the given path. This is a
+        deliberate, disclosed trade-off (matching PyTorch's historical
+        ``torch.load`` behaviour); the serialization format is intentionally
+        left unchanged.
     """
 
     def __init__(
@@ -1320,15 +1346,34 @@ class Checkpointer:
         if self.process_group:
             self.process_group.barrier()
 
-    def load(self, filepath: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def load(
+        self,
+        filepath: Optional[str] = None,
+        allow_external: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """
         Load checkpoint.
 
+        .. warning::
+            Checkpoints are deserialized with :mod:`pickle`, which executes
+            arbitrary code. Only load files you trust; never load a checkpoint
+            from an untrusted source. See the class docstring for details.
+
         Args:
-            filepath: Path to checkpoint, or None to load latest
+            filepath: Path to checkpoint, or None to load latest from
+                ``save_dir``.
+            allow_external: By default ``load`` only accepts paths inside this
+                checkpointer's ``save_dir`` (the trusted location it writes to).
+                Set ``True`` to load an explicit path elsewhere -- only do this
+                when you fully trust that file, since loading runs arbitrary
+                code.
 
         Returns:
-            State dict, or None if no checkpoint found
+            State dict, or None if no checkpoint found.
+
+        Raises:
+            ValueError: If ``filepath`` is outside ``save_dir`` and
+                ``allow_external`` is False.
         """
         if filepath is None:
             filepath = self._get_latest_checkpoint()
@@ -1338,8 +1383,25 @@ class Checkpointer:
         if not os.path.exists(filepath):
             return None
 
+        # Only files that actually exist can be unpickled, so the trusted-path
+        # guard is enforced here (a missing path returned None above and never
+        # reaches pickle.load).
+        if not allow_external:
+            save_dir = os.path.realpath(self.save_dir)
+            resolved = os.path.realpath(filepath)
+            if os.path.commonpath([save_dir, resolved]) != save_dir:
+                raise ValueError(
+                    f"Refusing to load checkpoint outside the trusted save_dir "
+                    f"({self.save_dir!r}): {filepath!r}. Checkpoints are "
+                    f"unpickled, which executes arbitrary code -- pass "
+                    f"allow_external=True only if you fully trust this file."
+                )
+
+        # NOTE: pickle.load executes arbitrary code. This is only safe because
+        # the path has been constrained to the trusted save_dir (or explicitly
+        # opted in via allow_external). See the class docstring.
         with open(filepath, 'rb') as f:
-            state = pickle.load(f)
+            state = pickle.load(f)  # nosec B301 - trusted-path only, see docstring
 
         logger.info(f"Loaded checkpoint: {filepath}")
         return state

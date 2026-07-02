@@ -134,6 +134,10 @@ See [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the full design and the semantics
 - **Real:** Bucket construction and reverse ordering, flatten/unflatten, gradient averaging by world size, the thread-pool `CommunicationScheduler` with overlap/bandwidth stats, all gradient compressors (Top-K, quantization, error feedback, PowerSGD) including encode/decode round-trips, FSDP flatten/shard/all-gather/reduce-scatter math, pipeline schedule generation, atomic checkpoint write with rotation, heartbeat staleness detection, and the adaptive cost model. These run fully in-process and are covered by the tests.
 - **Simulated / requires credentials:** The collectives themselves. AllReduce/AllGather/Broadcast/ReduceScatter return the local tensor (or copies) rather than exchanging data over a network — there is a single process. The NCCL, Gloo, and MPI backends log their operations but do not call into the real libraries; `BackendRegistry` marks NCCL and MPI as unavailable. RPC executes the target function locally instead of over the wire.
 
+## Security
+
+`Checkpointer` serializes state with Python's `pickle`, and `Checkpointer.load` therefore **executes arbitrary code on load** (the same historical trade-off as `torch.load`). Only load checkpoints you produced yourself or otherwise fully trust — never load a checkpoint from an untrusted source. As a guard rail, `load` refuses paths outside the checkpointer's `save_dir` unless you explicitly pass `allow_external=True`, which you should only do for a path you trust. The serialization format is intentionally left unchanged.
+
 ## Testing
 
 ```bash
