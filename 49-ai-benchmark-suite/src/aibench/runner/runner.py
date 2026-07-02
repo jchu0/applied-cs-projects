@@ -225,6 +225,10 @@ class CLIRunner:
         benchmark_names = []
         bench_config = BenchmarkConfig(name="cli")
 
+        if any(a in ("-h", "--help") for a in args):
+            self._print_usage()
+            return 0
+
         i = 0
         while i < len(args):
             arg = args[i]
@@ -278,6 +282,28 @@ class CLIRunner:
         print("Available benchmarks:")
         for name in registry.list_benchmarks():
             print(f"  - {name}")
+
+    def _print_usage(self) -> None:
+        """Print CLI usage."""
+        print(
+            "usage: aibench [--benchmark NAME]... [--batch-size N] [--seq-len N]\n"
+            "               [--iterations N] [--output DIR] [--compare PATH]\n"
+            "               [--list] [--quiet] [-h/--help]\n"
+            "\n"
+            "AI Benchmark Suite CLI. With no --benchmark flags, all registered\n"
+            "benchmarks are run.\n"
+            "\n"
+            "options:\n"
+            "  --benchmark NAME   run a registered benchmark (repeatable)\n"
+            "  --batch-size N     batch size for benchmark config\n"
+            "  --seq-len N        sequence length for benchmark config\n"
+            "  --iterations N     number of timed iterations\n"
+            "  --output DIR       directory for saved results\n"
+            "  --compare PATH     compare against a baseline results file\n"
+            "  --list             list available benchmarks and exit\n"
+            "  --quiet            reduce output verbosity\n"
+            "  -h, --help         show this help message and exit"
+        )
 
 
 class BenchmarkScheduler:

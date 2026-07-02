@@ -298,6 +298,50 @@ class TestWorkloadRunner:
         assert len(progress_calls) > 0
 
 
+class _WarmupFailingWorkload(Workload):
+    """Workload whose run_single fails only during warmup requests."""
+
+    def __init__(self, config, warmup_count):
+        super().__init__(config)
+        self._warmup_count = warmup_count
+
+    def setup(self):
+        pass
+
+    def run_single(self, request_id):
+        # First `warmup_count` calls correspond to warmup and must fail.
+        if request_id < self._warmup_count:
+            raise RuntimeError("warmup boom")
+        return {"latency_ms": 1.0}
+
+    def teardown(self):
+        pass
+
+
+class TestWarmupFailureLogging:
+    """Warmup failures must be logged, not silently swallowed."""
+
+    def test_warmup_failure_is_logged(self, caplog):
+        config = WorkloadConfig(
+            name="warmup_fail",
+            category=WorkloadCategory.LLM_INFERENCE,
+            num_requests=3,
+            warmup_requests=2,
+            dataset_size=5,
+        )
+        workload = _WarmupFailingWorkload(config, warmup_count=2)
+        runner = WorkloadRunner()
+
+        with caplog.at_level("WARNING", logger="aibench.experiment.experiment"):
+            summary = runner.run(workload)
+
+        # Warmup failures surfaced via logging.
+        warmup_logs = [r for r in caplog.records if "Warmup request" in r.message]
+        assert len(warmup_logs) == 2
+        # The run itself still completes (warmup failures are non-fatal).
+        assert summary.total_requests == 3
+
+
 class TestExperimentConfig:
     """Test ExperimentConfig."""
 

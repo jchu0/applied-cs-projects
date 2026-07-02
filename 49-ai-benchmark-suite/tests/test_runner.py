@@ -9,7 +9,8 @@ from aibench.core.benchmark import (
     BenchmarkConfig, BenchmarkResult, BenchmarkSuite, registry
 )
 from aibench.runner.runner import (
-    RunnerConfig, BenchmarkRunner, CLIRunner, BenchmarkScheduler, run_benchmarks
+    RunnerConfig, BenchmarkRunner, CLIRunner, BenchmarkScheduler, run_benchmarks,
+    main,
 )
 from aibench.benchmarks.workloads import MatMulBenchmark, SoftmaxBenchmark
 
@@ -375,6 +376,52 @@ class TestCLIRunner:
 
         assert result == 0
         assert cli.runner_config.verbose is False
+
+    def test_cli_help_flag(self, capsys):
+        """--help prints usage and exits 0 without running benchmarks."""
+        cli = CLIRunner()
+        result = cli.run(["--help"])
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "usage: aibench" in captured.out
+        assert "--benchmark" in captured.out
+
+    def test_cli_help_short_flag(self, capsys):
+        """-h behaves like --help."""
+        cli = CLIRunner()
+        result = cli.run(["-h"])
+
+        assert result == 0
+        assert "usage: aibench" in capsys.readouterr().out
+
+    def test_cli_help_takes_precedence(self, capsys):
+        """--help wins even when other flags are present (no benchmarks run)."""
+        cli = CLIRunner()
+        result = cli.run(["--benchmark", "matmul", "--help"])
+
+        assert result == 0
+        assert "usage: aibench" in capsys.readouterr().out
+
+
+class TestMainEntryPoint:
+    """Tests for the module-level main() console entry point."""
+
+    def test_main_help(self, monkeypatch, capsys):
+        """main() is callable as the console script and handles --help."""
+        monkeypatch.setattr("sys.argv", ["aibench", "--help"])
+        result = main()
+
+        assert result == 0
+        assert "usage: aibench" in capsys.readouterr().out
+
+    def test_main_list(self, monkeypatch, capsys):
+        """main() forwards args to the CLI runner (--list)."""
+        monkeypatch.setattr("sys.argv", ["aibench", "--list"])
+        result = main()
+
+        assert result == 0
+        assert "Available benchmarks:" in capsys.readouterr().out
 
 
 class TestBenchmarkScheduler:

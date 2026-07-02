@@ -12,12 +12,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import hashlib
 import json
+import logging
 import platform
 import statistics
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -395,12 +398,16 @@ class WorkloadRunner:
         # Setup
         workload.setup()
 
-        # Warmup
+        # Warmup: failures here are non-fatal (they don't count toward
+        # results) but are logged so real errors aren't silently hidden.
         for i in range(config.warmup_requests):
             try:
                 workload.run_single(i)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Warmup request %d for workload %r failed: %s",
+                    i, config.name, e,
+                )
 
         # Run benchmark
         start_time = time.time()
