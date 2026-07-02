@@ -1,7 +1,7 @@
 # Applied Computer Science — Projects
 
 52 from-scratch systems that implement the concepts taught in the companion book
-**[Applied Computer Science](https://jameshu.io/books/applied-cs/preface)**. Where a
+**[Applied Computer Science](https://jameshu.io/books/applied-cs)**. Where a
 book chapter says **"Build it →"**, it points here.
 
 Each project is built to real engineering standards — trait/interface-driven
