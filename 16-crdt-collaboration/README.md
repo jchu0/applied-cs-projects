@@ -11,12 +11,13 @@ A companion TypeScript client SDK implements the same CRDT model for browser edi
 - **RGA-style sequence CRDT** — character-level insert/delete/format with tombstones and a total order over `PositionId` (lamport, client, seq) for deterministic convergence (`crdt::Element`, `document::Document`).
 - **Vector clocks and causality** — `crdt::VectorClock` tracks per-client logical time and answers `happens_before`, `is_concurrent`, and `dominates` for conflict detection and GC.
 - **Additional CRDTs** — grow-only `GCounter`, positive-negative `PNCounter`, and last-writer-wins `LWWRegister` with deterministic tie-breaking.
-- **WebSocket collaboration server** — per-document sessions broadcast operations to connected clients and acknowledge senders (`server::CollaborationServer`, `server::DocumentSession`).
+- **Runnable server binary** — `crdt-server` (`src/bin/server.rs`) boots the axum HTTP API and a live WebSocket collaboration endpoint (`GET /ws/:doc_id`) with configurable bind address and storage backend.
+- **WebSocket collaboration server** — per-document sessions broadcast operations to connected clients and acknowledge senders (`server::CollaborationServer`, `server::DocumentSession`). The `/ws/:doc_id` route applies inbound CRDT ops to the shared document and fans them out to the other subscribers via a per-document `tokio::sync::broadcast` channel so replicas converge.
 - **Typed protocol** — a tagged `protocol::Message` enum covers operations, acks, sync, cursor/selection presence, join/leave, heartbeat, auth, and errors.
 - **Presence and awareness** — cursor/selection tracking and active/idle/away status per user (`presence::PresenceManager`, `presence::DocumentPresence`).
 - **Offline editing** — connection-state machine, per-document pending-operation queue, retry with TTL, serialize/restore, and conflict detection (`offline::OfflineManager`).
 - **HTTP API** — axum routes for document CRUD, content, history, snapshots, ACLs, and share links (`api::create_router`).
-- **Persistence** — an in-memory `storage::StorageManager` for live sessions and a real SQLite backend (`persistent::SqliteBackend`, rusqlite bundled) implementing the `StorageBackend` trait.
+- **Persistence** — `storage::StorageManager` runs in-memory by default or, via `StorageManager::with_backend`, delegates to a durable `StorageBackend`. The server wires in the SQLite backend (`persistent::SqliteBackend`, rusqlite bundled) when `DATABASE_PATH` is set, so document snapshots survive a restart.
 - **Performance utilities** — operation batching, tombstone garbage collection, version history, log compaction, and memory monitoring (`performance` module).
 - **TypeScript client SDK** — a browser CRDT document plus a reconnecting WebSocket client (`client-sdk/`).
 
@@ -24,23 +25,25 @@ A companion TypeScript client SDK implements the same CRDT model for browser edi
 
 ```mermaid
 flowchart TD
-    Browser(TypeScript client SDK) -->|WebSocket| Server(CollaborationServer)
-    RustClient(Rust API consumer) -->|HTTP| Api(axum HTTP API)
-    Api --> Server
-    Server --> Session(DocumentSession)
+    Browser(WebSocket client) -->|GET /ws/:doc_id| Bin(crdt-server binary)
+    RustClient(Rust API consumer) -->|HTTP /api/*| Bin
+    Bin --> Api(axum router: HTTP API + WS route)
+    Api --> Server(CollaborationServer)
+    Server --> Session(DocumentSession + broadcast)
     Session --> Engine(CRDT engine - Document and VectorClock)
     Session --> Presence(PresenceManager)
-    Server --> Storage(StorageManager in-memory)
-    Storage --> Sqlite[(SqliteBackend)]
+    Server --> Storage(StorageManager)
+    Storage -->|DATABASE_PATH set| Sqlite[(SqliteBackend)]
     Engine --> Perf(Batching, GC, Versions)
 ```
 
 | Component | Module | Responsibility |
 |-----------|--------|----------------|
 | CRDT engine | `crdt`, `document` | Sequence CRDT, vector clocks, operations, snapshots |
+| Server binary | `bin/server` | Boots the axum router (HTTP + WS), selects storage backend |
 | Collaboration server | `server` | Document sessions, broadcast, sync, client lifecycle |
 | Protocol | `protocol` | WebSocket message schema (`Message` enum) |
-| HTTP API | `api` | Document CRUD, history, snapshots, ACLs, share links |
+| HTTP API + WS | `api` | Document CRUD, history, snapshots, ACLs, share links, and the `/ws/:doc_id` collaboration endpoint |
 | Presence | `presence` | Cursor/selection/status awareness per document |
 | Offline | `offline` | Pending-operation queue, reconnection, conflict detection |
 | In-memory storage | `storage` | Snapshots, operation logs, metadata, ACL, audit types |
@@ -62,28 +65,36 @@ flowchart TD
 cargo build
 ```
 
-### Running
+### Running the server
 
-This is a library crate; there is no standalone server binary. Embed the engine in your
-own binary by constructing a `CollaborationServer` and mounting the axum router:
+The crate ships a runnable server binary, `crdt-server`, that serves the HTTP API and the
+real-time WebSocket collaboration endpoint:
 
-```rust
-use std::sync::Arc;
-use crdt_collaboration::api::{create_router, ApiState};
-use crdt_collaboration::server::{CollaborationServer, ServerConfig};
-use crdt_collaboration::storage::StorageManager;
+```bash
+# In-memory storage (ephemeral), listening on 127.0.0.1:8080
+cargo run --bin crdt-server
 
-#[tokio::main]
-async fn main() {
-    let storage = Arc::new(StorageManager::new());
-    let server = Arc::new(CollaborationServer::new(ServerConfig::default(), storage.clone()));
-    let state = Arc::new(ApiState::new(server, storage));
-    let app = create_router(state);
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
-}
+# Durable SQLite storage + auth, custom bind address
+DATABASE_PATH=docs.db API_KEYS=secret-key BIND_ADDR=0.0.0.0:8080 \
+  cargo run --bin crdt-server
 ```
+
+Configuration (all optional):
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `BIND_ADDR` | `127.0.0.1:8080` | Socket address to listen on. |
+| `DATABASE_PATH` (alias `SQLITE_PATH`) | *(unset → in-memory)* | SQLite file path. When set, documents persist across restarts. |
+| `API_KEYS` | *(unset → auth off)* | Comma-separated keys required on `/api/*` and the WS handshake. |
+
+Clients open a document session with `GET /ws/:doc_id`. When auth is enabled, the WebSocket
+handshake accepts the key via the `Authorization`/`x-api-key` headers or a `?api_key=<key>`
+query parameter (browsers cannot set headers on a WebSocket handshake). A connected client
+sends `protocol::Message::Operation` frames; the server applies each op to the shared
+document and broadcasts it to the other subscribers so all replicas converge.
+
+To embed the engine in your own binary instead, construct a `CollaborationServer`, wrap it
+in `ApiState`, and mount `api::create_router` on an axum listener (see `src/bin/server.rs`).
 
 ## Usage
 
@@ -135,15 +146,22 @@ assert!(loaded.is_some());
 
 ## What's Real vs Simulated
 
-- **Real:** The CRDT engine (insert/delete/format, tombstones, total-order convergence), vector-clock causality, G/PN counters and LWW register, per-document sessions with broadcast and acks, the axum HTTP API handlers, presence tracking, the offline pending-operation queue (queueing, retry, TTL cleanup, serialize/restore), the in-memory `StorageManager`, and the SQLite `StorageBackend` (schema, snapshots, operations, ACLs, audit). All are exercised by the test suites.
-- **Simulated / partial:** There is no shipped server binary or live WebSocket route — `server::handle_client` accepts generic stream/sink types and must be wired to a transport by the embedder. The HTTP API uses the in-memory `StorageManager`, not `SqliteBackend`. `offline::OfflineManager::sync_with_server` returns an empty response (no live transport). Share-link tokens are generated but not stored. Audit logging and version history are implemented and tested as components but are not yet invoked from the request handlers. The benchmark numbers in `docs/BLUEPRINT.md` are illustrative design targets, not measured results.
+- **Real:** The CRDT engine (insert/delete/format, tombstones, total-order convergence), vector-clock causality, G/PN counters and LWW register, the runnable `crdt-server` binary, the live `GET /ws/:doc_id` WebSocket endpoint (handshake auth, apply-and-broadcast so two clients converge), per-document sessions with broadcast and acks, the axum HTTP API handlers, presence tracking, the offline pending-operation queue (queueing, retry, TTL cleanup, serialize/restore), the in-memory `StorageManager`, and the SQLite `StorageBackend` wired through `StorageManager::with_backend` so state survives restarts (schema, snapshots with full element map, operations, ACLs, audit). All are exercised by the test suites, including a two-client convergence test and a drop-and-recover persistence test (`tests/ws_persistence_tests.rs`).
+- **Simulated / out of scope (honestly):**
+  - `offline::OfflineManager::sync_with_server` still returns an empty response — the offline manager's queueing/retry/persistence is real and tested, but full offline reconciliation against the live server is **not** implemented.
+  - The TypeScript client SDK under `client-sdk/` is a separate, unwired browser implementation; it is not built or tested by `cargo test`.
+  - Presence/cursor frames are relayed over the WS route but there is no server-authoritative presence broadcast on the new endpoint beyond join/leave.
+  - The broadcast channel is per-process; there is no horizontal scale-out (multi-node fan-out) of collaboration.
+  - Share-link tokens are generated but not stored; audit logging and version history are tested as components but not yet invoked from the request handlers. The benchmark numbers in `docs/BLUEPRINT.md` are illustrative design targets, not measured results.
 
 ## Security & limits
 
 The HTTP API (`api::create_router`) ships an opt-in hardening baseline configured via
 environment variables. All three layers are applied to the `/api/*` routes; the
-`/health` route is always left open, and the WebSocket collaboration surface lives in the
-`server` module (not this Router) and is therefore not subject to the request timeout.
+`/health` route is always left open. The `/ws/:doc_id` collaboration route is part of the
+same router but is deliberately exempt from the request-timeout and rate-limit layers (the
+socket is long-lived): it instead enforces the same `API_KEYS` check at handshake time,
+accepting the key via header or `?api_key=` query parameter.
 
 | Env var | Default | Effect |
 |---------|---------|--------|
@@ -158,9 +176,12 @@ cargo test
 ```
 
 The suites cover CRDT convergence and causality (`tests/crdt_tests.rs`,
-`tests/integration_tests.rs`), and server sessions, in-memory and SQLite storage, ACLs,
-audit logging, and the performance utilities (`tests/server_storage_tests.rs`), plus
-inline `#[cfg(test)]` modules in each source file. The HTTP API is tested with
+`tests/integration_tests.rs`); server sessions, in-memory and SQLite storage, ACLs,
+audit logging, and the performance utilities (`tests/server_storage_tests.rs`); and
+end-to-end WebSocket collaboration and SQLite persistence against a live server
+(`tests/ws_persistence_tests.rs` — two clients converging over `/ws/:doc_id`, handshake
+auth, and drop-and-recover persistence over a real SQLite file), plus inline
+`#[cfg(test)]` modules in each source file. The HTTP API is tested with
 `tower::ServiceExt::oneshot`. No external services are required. The TypeScript SDK has
 its own Jest suite under `client-sdk/tests/` (`npm test`).
 
@@ -176,13 +197,15 @@ its own Jest suite under `client-sdk/tests/` (`npm test`).
     document.rs          # Document, snapshots, metadata
     protocol.rs          # WebSocket Message enum and payloads
     server.rs            # CollaborationServer, DocumentSession, client lifecycle
-    api.rs               # axum HTTP API router and handlers
+    api.rs               # axum router: HTTP API handlers + /ws/:doc_id WebSocket endpoint
     presence.rs          # Presence/awareness tracking
     offline.rs           # Offline manager, pending queue, conflict detection
-    storage.rs           # In-memory StorageManager, ACL, audit types
+    storage.rs           # StorageManager (in-memory or backend-delegating), ACL, audit types
     persistent.rs        # SQLite StorageBackend and compaction manager
     performance.rs       # Batching, tombstone GC, version history, compaction
-  tests/                 # CRDT, integration, server/storage/performance tests
+    bin/
+      server.rs          # crdt-server binary: boots HTTP + WebSocket, selects storage
+  tests/                 # CRDT, integration, server/storage, WS + persistence tests
   client-sdk/            # TypeScript client SDK (CRDT document + WebSocket client)
   docs/BLUEPRINT.md      # Full architecture and design document
 ```

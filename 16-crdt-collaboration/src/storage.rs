@@ -1,14 +1,24 @@
 //! Storage layer for documents and operations.
+//!
+//! [`StorageManager`] is the interface consumed by the HTTP API and the
+//! collaboration server. By default it keeps everything in process memory,
+//! which is convenient for tests and ephemeral deployments. When constructed
+//! with [`StorageManager::with_backend`] it instead delegates every call to a
+//! durable [`StorageBackend`](crate::persistent::StorageBackend) (e.g. the
+//! bundled SQLite backend), so document state survives process restarts.
 
 use crate::crdt::{Operation, VectorClock};
 use crate::document::{DocumentMetadata, DocumentSnapshot};
+use crate::persistent::StorageBackend;
 use crate::{ClientId, DocumentId, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
-/// Storage manager.
-pub struct StorageManager {
+/// In-memory storage state, used when no durable backend is configured.
+#[derive(Default)]
+struct InMemoryStore {
     /// Document snapshots.
     snapshots: RwLock<HashMap<DocumentId, DocumentSnapshot>>,
     /// Operation logs.
@@ -17,25 +27,57 @@ pub struct StorageManager {
     metadata: RwLock<HashMap<DocumentId, DocumentMetadata>>,
 }
 
+/// Storage manager.
+///
+/// Either backed by process memory (default) or a durable
+/// [`StorageBackend`](crate::persistent::StorageBackend).
+pub struct StorageManager {
+    /// In-memory state (used only when `backend` is `None`).
+    mem: InMemoryStore,
+    /// Optional durable backend. When set, all operations delegate to it.
+    backend: Option<Arc<dyn StorageBackend>>,
+}
+
 impl StorageManager {
-    /// Create new storage manager.
+    /// Create a new in-memory storage manager.
     pub fn new() -> Self {
         Self {
-            snapshots: RwLock::new(HashMap::new()),
-            op_logs: RwLock::new(HashMap::new()),
-            metadata: RwLock::new(HashMap::new()),
+            mem: InMemoryStore::default(),
+            backend: None,
         }
+    }
+
+    /// Create a storage manager backed by a durable [`StorageBackend`].
+    ///
+    /// All reads and writes are delegated to `backend`, so document state
+    /// persists across process restarts (e.g. with the SQLite backend).
+    pub fn with_backend(backend: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            mem: InMemoryStore::default(),
+            backend: Some(backend),
+        }
+    }
+
+    /// Whether this manager is backed by durable storage.
+    pub fn is_persistent(&self) -> bool {
+        self.backend.is_some()
     }
 
     /// Save a document snapshot.
     pub async fn save_snapshot(&self, snapshot: &DocumentSnapshot) -> Result<()> {
-        self.snapshots.write().insert(snapshot.id, snapshot.clone());
+        if let Some(backend) = &self.backend {
+            return backend.save_snapshot(snapshot).await;
+        }
+        self.mem.snapshots.write().insert(snapshot.id, snapshot.clone());
         Ok(())
     }
 
     /// Load a document snapshot.
     pub async fn load_snapshot(&self, doc_id: &DocumentId) -> Result<Option<DocumentSnapshot>> {
-        Ok(self.snapshots.read().get(doc_id).cloned())
+        if let Some(backend) = &self.backend {
+            return backend.load_snapshot(doc_id).await;
+        }
+        Ok(self.mem.snapshots.read().get(doc_id).cloned())
     }
 
     /// Append operations to log.
@@ -45,7 +87,10 @@ impl StorageManager {
         operations: Vec<Operation>,
         vector_clock: VectorClock,
     ) -> Result<u64> {
-        let mut logs = self.op_logs.write();
+        if let Some(backend) = &self.backend {
+            return backend.append_operations(doc_id, operations, vector_clock).await;
+        }
+        let mut logs = self.mem.op_logs.write();
         let log = logs.entry(*doc_id).or_insert_with(|| OperationLog::new(*doc_id));
 
         let seq = log.append(operations, vector_clock);
@@ -58,7 +103,10 @@ impl StorageManager {
         doc_id: &DocumentId,
         since_seq: u64,
     ) -> Result<Vec<OperationEntry>> {
-        let logs = self.op_logs.read();
+        if let Some(backend) = &self.backend {
+            return backend.get_operations_since(doc_id, since_seq).await;
+        }
+        let logs = self.mem.op_logs.read();
         if let Some(log) = logs.get(doc_id) {
             Ok(log.get_since(since_seq))
         } else {
@@ -67,12 +115,18 @@ impl StorageManager {
     }
 
     /// Get operations since a vector clock.
+    ///
+    /// Only supported by the in-memory store; durable backends filter by
+    /// sequence number instead. Returns an empty vector when backed durably.
     pub async fn get_operations_after_clock(
         &self,
         doc_id: &DocumentId,
         vector_clock: &VectorClock,
     ) -> Result<Vec<Operation>> {
-        let logs = self.op_logs.read();
+        if self.backend.is_some() {
+            return Ok(vec![]);
+        }
+        let logs = self.mem.op_logs.read();
         if let Some(log) = logs.get(doc_id) {
             Ok(log.get_after_clock(vector_clock))
         } else {
@@ -82,25 +136,37 @@ impl StorageManager {
 
     /// Save document metadata.
     pub async fn save_metadata(&self, metadata: DocumentMetadata) -> Result<()> {
-        self.metadata.write().insert(metadata.id, metadata);
+        if let Some(backend) = &self.backend {
+            return backend.save_metadata(metadata).await;
+        }
+        self.mem.metadata.write().insert(metadata.id, metadata);
         Ok(())
     }
 
     /// Load document metadata.
     pub async fn load_metadata(&self, doc_id: &DocumentId) -> Result<Option<DocumentMetadata>> {
-        Ok(self.metadata.read().get(doc_id).cloned())
+        if let Some(backend) = &self.backend {
+            return backend.load_metadata(doc_id).await;
+        }
+        Ok(self.mem.metadata.read().get(doc_id).cloned())
     }
 
     /// List all documents.
     pub async fn list_documents(&self) -> Result<Vec<DocumentMetadata>> {
-        Ok(self.metadata.read().values().cloned().collect())
+        if let Some(backend) = &self.backend {
+            return backend.list_documents().await;
+        }
+        Ok(self.mem.metadata.read().values().cloned().collect())
     }
 
     /// Delete a document.
     pub async fn delete_document(&self, doc_id: &DocumentId) -> Result<()> {
-        self.snapshots.write().remove(doc_id);
-        self.op_logs.write().remove(doc_id);
-        self.metadata.write().remove(doc_id);
+        if let Some(backend) = &self.backend {
+            return backend.delete_document(doc_id).await;
+        }
+        self.mem.snapshots.write().remove(doc_id);
+        self.mem.op_logs.write().remove(doc_id);
+        self.mem.metadata.write().remove(doc_id);
         Ok(())
     }
 
@@ -110,7 +176,17 @@ impl StorageManager {
     /// Returns the number of entries removed.
     pub async fn compact(&self, doc_id: &DocumentId) -> Result<()> {
         let keep_entries = 100;
-        let mut logs = self.op_logs.write();
+        if let Some(backend) = &self.backend {
+            // For durable backends, keep the most recent `keep_entries` by seq.
+            let entries = backend.get_operations_since(doc_id, 0).await?;
+            if entries.len() > keep_entries {
+                if let Some(cutoff) = entries.get(entries.len() - keep_entries) {
+                    backend.compact(doc_id, cutoff.seq).await?;
+                }
+            }
+            return Ok(());
+        }
+        let mut logs = self.mem.op_logs.write();
         if let Some(log) = logs.get_mut(doc_id) {
             log.truncate_before(keep_entries);
         }

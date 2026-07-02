@@ -108,20 +108,24 @@ impl SqliteBackend {
                 archived INTEGER NOT NULL DEFAULT 0
             );
 
-            -- Document snapshots
+            -- Document snapshots.
+            -- No foreign key to documents: a live document session (e.g. one
+            -- opened directly over the WebSocket route) can persist its state
+            -- before, or without, an API-created metadata row.
             CREATE TABLE IF NOT EXISTS snapshots (
                 id TEXT PRIMARY KEY,
-                doc_id TEXT NOT NULL REFERENCES documents(id),
+                doc_id TEXT NOT NULL,
                 content TEXT NOT NULL,
+                elements TEXT NOT NULL DEFAULT '{}',
                 vector_clock TEXT NOT NULL,
                 timestamp INTEGER NOT NULL,
                 UNIQUE(doc_id)
             );
 
-            -- Operation log
+            -- Operation log (see note above re: no documents foreign key).
             CREATE TABLE IF NOT EXISTS operations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_id TEXT NOT NULL REFERENCES documents(id),
+                doc_id TEXT NOT NULL,
                 seq INTEGER NOT NULL,
                 operations TEXT NOT NULL,
                 vector_clock TEXT NOT NULL,
@@ -184,19 +188,30 @@ impl SqliteBackend {
 impl StorageBackend for SqliteBackend {
     async fn save_snapshot(&self, snapshot: &DocumentSnapshot) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let id = snapshot.id.to_string();
+        // A snapshot's `id` is the document id, so the primary key and the
+        // `doc_id` column are the same value (one snapshot row per document).
+        let doc_id = snapshot.id.to_string();
         let content = serde_json::to_string(&snapshot.content)
+            .map_err(|e| Error::Storage(format!("Serialization error: {}", e)))?;
+        // The full CRDT element map is what actually reconstructs the document;
+        // `content` is only a convenience cache of the rendered text. Elements
+        // are stored as a JSON array (each `Element` carries its own position
+        // id) because JSON object keys must be strings, and `PositionId` is a
+        // struct key.
+        let element_values: Vec<&crate::crdt::Element> = snapshot.elements.values().collect();
+        let elements = serde_json::to_string(&element_values)
             .map_err(|e| Error::Storage(format!("Serialization error: {}", e)))?;
         let vector_clock = serde_json::to_string(&snapshot.vector_clock)
             .map_err(|e| Error::Storage(format!("Serialization error: {}", e)))?;
 
         conn.execute(
-            "INSERT OR REPLACE INTO snapshots (id, doc_id, content, vector_clock, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO snapshots (id, doc_id, content, elements, vector_clock, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
-                snapshot.id.to_string(),
-                id,
+                doc_id,
+                doc_id,
                 content,
+                elements,
                 vector_clock,
                 snapshot.timestamp
             ],
@@ -211,26 +226,34 @@ impl StorageBackend for SqliteBackend {
         let id = doc_id.to_string();
 
         let result = conn.query_row(
-            "SELECT id, content, vector_clock, timestamp FROM snapshots WHERE doc_id = ?1",
+            "SELECT content, elements, vector_clock, timestamp FROM snapshots WHERE doc_id = ?1",
             [&id],
             |row| {
-                let content_str: String = row.get(1)?;
+                let content_str: String = row.get(0)?;
+                let elements_str: String = row.get(1)?;
                 let vc_str: String = row.get(2)?;
                 let timestamp: u64 = row.get(3)?;
-                Ok((content_str, vc_str, timestamp))
+                Ok((content_str, elements_str, vc_str, timestamp))
             },
         );
 
         match result {
-            Ok((content_str, vc_str, timestamp)) => {
+            Ok((content_str, elements_str, vc_str, timestamp)) => {
                 let content = serde_json::from_str(&content_str)
                     .map_err(|e| Error::Storage(format!("Deserialization error: {}", e)))?;
+                // Elements are stored as a JSON array; rebuild the position-keyed map.
+                let element_values: Vec<crate::crdt::Element> = serde_json::from_str(&elements_str)
+                    .map_err(|e| Error::Storage(format!("Deserialization error: {}", e)))?;
+                let elements = element_values
+                    .into_iter()
+                    .map(|e| (e.id.clone(), e))
+                    .collect();
                 let vector_clock = serde_json::from_str(&vc_str)
                     .map_err(|e| Error::Storage(format!("Deserialization error: {}", e)))?;
 
                 Ok(Some(DocumentSnapshot {
                     id: *doc_id,
-                    elements: std::collections::BTreeMap::new(),
+                    elements,
                     content,
                     vector_clock,
                     timestamp,

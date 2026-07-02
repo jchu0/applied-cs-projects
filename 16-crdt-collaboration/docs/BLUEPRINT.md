@@ -12,15 +12,17 @@ still yield the same result. Merge is therefore trivial — a replica that has s
 *set* of operations, regardless of arrival order or duplication, holds the same state as
 every other replica that has seen that set.
 
-The engine is organized as a Rust library crate, `crdt-collaboration`, plus a companion
-TypeScript client SDK (`client-sdk/`) that mirrors the CRDT model in the browser. The Rust
-side contains the sequence CRDT, the vector-clock causality machinery, a per-document
-WebSocket collaboration server, an axum HTTP API for document management, presence/awareness
-tracking, an offline editing manager, an in-memory store, and a durable SQLite backend. The
-crate is a *library*: it exposes types an embedder composes into a binary, rather than
-shipping a standalone server. That boundary is deliberate — the CRDT engine is pure and
-transport-agnostic, and everything above it (transport, storage choice, auth) is a policy the
-embedder selects.
+The engine is organized as a Rust library crate, `crdt-collaboration`, with a runnable
+server binary (`crdt-server`, `src/bin/server.rs`), plus a companion TypeScript client SDK
+(`client-sdk/`) that mirrors the CRDT model in the browser. The Rust side contains the
+sequence CRDT, the vector-clock causality machinery, a per-document WebSocket collaboration
+server, an axum HTTP API for document management, presence/awareness tracking, an offline
+editing manager, and a `StorageManager` that runs in-memory or delegates to a durable SQLite
+backend. The library still exposes composable types for embedders, but `crdt-server` boots a
+working deployment: it mounts the HTTP API and a live `GET /ws/:doc_id` WebSocket route and
+selects the SQLite backend when `DATABASE_PATH` is set. The CRDT engine remains pure and
+transport-agnostic; the binary wires it to a concrete transport, storage choice, and auth
+policy.
 
 The concepts this codebase teaches are:
 
@@ -41,18 +43,27 @@ The concepts this codebase teaches are:
 
 ### Scope and honesty
 
-The CRDT engine, the per-document session/broadcast logic, the HTTP handlers, presence,
-the offline pending-operation queue, the in-memory store, and the SQLite backend are all
-implemented and tested. Several pieces are intentionally partial and are flagged where they
-appear:
+The CRDT engine, the per-document session/broadcast logic, the HTTP handlers, the live
+WebSocket route, presence, the offline pending-operation queue, the in-memory store, and the
+SQLite backend are all implemented and tested. Several pieces are intentionally partial and
+are flagged where they appear:
 
-- There is no shipped server binary; the crate is a library.
-- `server::CollaborationServer::handle_client` is generic over its transport (a
-  tungstenite stream/sink pair) and is not bound to a live WebSocket route in this crate.
-- The HTTP API in `api.rs` is wired to the in-memory `StorageManager`, not `SqliteBackend`.
-- `offline::OfflineManager::sync_with_server` returns an empty `SyncResponse` because there
-  is no live transport bound in the crate; the surrounding queueing, retry, TTL, persistence,
-  and conflict-detection logic are real and tested.
+- The `crdt-server` binary and its `GET /ws/:doc_id` WebSocket route are real: a client
+  sends CRDT ops, the server applies them to the shared document and broadcasts to the other
+  subscribers so replicas converge (`tests/ws_persistence_tests.rs`). `server::handle_client`
+  remains as a generic tungstenite-transport variant used by the library-level tests.
+- The HTTP API is served over a `StorageManager` that persists via `SqliteBackend` when the
+  binary is run with `DATABASE_PATH`; document snapshots survive a restart. In-memory storage
+  remains the default and test fallback.
+- `offline::OfflineManager::sync_with_server` still returns an empty `SyncResponse` — full
+  offline reconciliation against the live server is **not** implemented. The surrounding
+  queueing, retry, TTL, persistence, and conflict-detection logic are real and tested; this
+  one method is the deliberate seam left unimplemented.
+- Presence/cursor frames are relayed over the WS route (join/leave plus cursor/selection
+  forwarding); there is no server-authoritative presence reconciliation on the new endpoint.
+- The per-document broadcast channel is single-process; there is no horizontal scale-out
+  (multi-node fan-out) of collaboration.
+- The TypeScript SDK is a separate, unwired browser implementation, not covered by `cargo test`.
 - Share-link tokens are generated but not persisted.
 - Audit logging and version history exist as tested components that the request handlers do
   not yet invoke.
@@ -64,15 +75,16 @@ appear:
 
 ```mermaid
 flowchart TD
-    Browser(TypeScript client SDK) -->|WebSocket frames| Server(CollaborationServer)
-    RustConsumer(Rust API consumer) -->|HTTP JSON| Api(axum router)
-    Api --> Server
+    Browser(WebSocket client) -->|GET /ws/:doc_id| Bin(crdt-server binary)
+    RustConsumer(Rust API consumer) -->|HTTP JSON| Bin
+    Bin --> Api(axum router: HTTP + WS)
+    Api --> Server(CollaborationServer)
     Server --> Session(DocumentSession)
     Session --> Doc(Document - sequence CRDT)
     Session --> Broadcast(Tokio broadcast channel)
     Server --> Presence(PresenceManager)
-    Server --> Store(StorageManager in-memory)
-    Store -.optional durable backend.-> Sqlite[(SqliteBackend)]
+    Server --> Store(StorageManager)
+    Store -.DATABASE_PATH set.-> Sqlite[(SqliteBackend)]
     Doc --> Perf(OperationBatcher, TombstoneGC, VersionHistory, LogCompactor)
     Doc --> Clock(VectorClock)
     Session -.offline client mirror.-> Offline(OfflineManager pending queue)
@@ -95,15 +107,28 @@ value.
 channel that fans operations out to every subscriber. `protocol` defines the wire schema: a
 tagged `Message` enum with operation, ack, sync, presence, control, and auth variants.
 
-**HTTP API (`api`).** An axum `Router` exposes REST endpoints for document CRUD, content,
-operation history, snapshots, ACLs, and share links. It shares the `CollaborationServer` and
-`StorageManager` through an `Arc<ApiState>` and layers CORS and HTTP tracing on top.
+**HTTP API + WebSocket (`api`).** An axum `Router` exposes REST endpoints for document CRUD,
+content, operation history, snapshots, ACLs, and share links, plus the live
+`GET /ws/:doc_id` collaboration endpoint. It shares the `CollaborationServer` and
+`StorageManager` through an `Arc<ApiState>` and layers CORS and HTTP tracing on top. The WS
+route upgrades the connection, subscribes it to the document's broadcast channel, applies
+inbound ops to the shared `Document`, re-broadcasts them to peers, and persists a snapshot on
+every op and on disconnect. It enforces the `API_KEYS` check at handshake time (header or
+`?api_key=` query param) rather than through the HTTP auth middleware, and is exempt from the
+request-timeout layer so the socket can stay open.
 
-**Storage (`storage`, `persistent`).** `StorageManager` is an in-memory store
-(`RwLock<HashMap<...>>`) used by the live server; it holds snapshots, operation logs, and
-metadata, and defines the ACL/audit/checkpoint types used across the crate. `SqliteBackend`
-is a durable implementation of the `StorageBackend` trait over rusqlite (bundled), with a
-full relational schema and its own tested CRUD path.
+**Server binary (`bin/server`).** `crdt-server` reads `BIND_ADDR`, `DATABASE_PATH`, and
+`API_KEYS` from the environment, constructs the `StorageManager` (SQLite-backed when a path
+is given, else in-memory), builds `ApiState`, and serves `create_router` with connect-info so
+the rate limiter can key on peer IP.
+
+**Storage (`storage`, `persistent`).** `StorageManager` is the interface the server and API
+consume. By default it is an in-memory store (`RwLock<HashMap<...>>`); constructed via
+`StorageManager::with_backend`, it instead delegates every call to a durable
+`StorageBackend`. `SqliteBackend` is that durable implementation over rusqlite (bundled),
+with a full relational schema. Snapshots persist the complete CRDT element map (serialized as
+a JSON array, since `PositionId` map keys are not JSON strings) so a reloaded document
+reconstructs its exact state, not just its rendered text.
 
 Cross-cutting utilities layer on top: `presence` tracks who is editing and where, `offline`
 provides a client-side pending-operation queue with reconnection and conflict detection, and
@@ -295,9 +320,19 @@ a batch of `Operation`s, and a monotonic `seq`. `SyncResponse` carries a seriali
 Supporting structs (`UserInfo`, `JoinDocument`, `ConnectionOptions`) round out the protocol;
 `ConnectionOptions::default` enables reconnection with up to 10 attempts at a 1000 ms delay.
 
-The server-side lifecycle lives in `CollaborationServer::handle_client`, which is generic over
-a tungstenite `StreamExt`/`SinkExt` pair so it can be driven by any WebSocket transport. On
-connect the server:
+Two connection lifecycles exist. The live one, used by the `crdt-server` binary, is
+`api::ws_collaboration`, reached via `GET /ws/:doc_id` using axum's own WebSocket support. It
+splits the socket, subscribes to the session broadcast, sends the initial `SyncResponse`,
+announces a `UserJoin`, then runs a `tokio::select!` over inbound frames and broadcasts.
+Inbound `Operation` frames are applied via `DocumentSession::apply_operations` (which
+broadcasts to peers), durably logged with `append_operations`, snapshotted, and acked
+straight back over the socket; a client never receives the echo of its own op. On disconnect
+it broadcasts `UserLeave` and persists a final snapshot. Handshake auth is enforced here
+before the upgrade completes.
+
+The second lifecycle, `CollaborationServer::handle_client`, is generic over a tungstenite
+`StreamExt`/`SinkExt` pair so it can be driven by any WebSocket transport, and is exercised by
+the library-level server tests. On connect the server:
 
 1. Resolves the session with `get_or_create_session`, loading a snapshot from storage if one
    exists, otherwise creating a fresh `Document`.
@@ -373,9 +408,12 @@ an in-memory test implementation, `InMemoryLocalStorage`) over the base manager,
 queue to a per-client key after each `queue_operation` when `persist_queue` is set, and
 restoring it on startup.
 
-**Partial:** `sync_with_server` currently returns an empty `SyncResponse` because there is no
-live transport bound in this crate. The queueing, retry, TTL, persistence, and
-conflict-detection logic are real and tested by the module's `#[cfg(test)]` block.
+**Partial (deliberate, out of scope):** `sync_with_server` returns an empty `SyncResponse`.
+Even though the server now exposes a live `/ws/:doc_id` route, the offline manager is a
+client-side component that is not wired to drive that socket, so full offline reconciliation
+is **not** implemented — this method is the explicit seam. The surrounding queueing, retry,
+TTL, persistence, and conflict-detection logic are real and tested by the module's
+`#[cfg(test)]` block.
 
 ### Persistence and storage (in-memory + SQLite)
 
@@ -685,6 +723,7 @@ GET    /api/documents/:id/snapshot  get_snapshot
 GET    /api/documents/:id/acl       get_acl
 PUT    /api/documents/:id/acl       update_acl
 POST   /api/documents/:id/share     create_share_link     (token generated, not persisted)
+GET    /ws/:doc_id                  ws_handler            (WebSocket upgrade; handshake auth)
 GET    /health                      health_check
 ```
 
@@ -693,9 +732,10 @@ Handlers return JSON request/response structs — `CreateDocumentRequest`/`Creat
 `OperationHistoryResponse`, `AclResponse`/`AclEntryResponse`, `UpdateAclRequest`/`AclEntryRequest`,
 `ShareLinkRequest`/`ShareLinkResponse`, and `SnapshotResponse`. The `Error` enum implements
 `IntoResponse`, mapping `DocumentNotFound` to 404, `PermissionDenied` to 403,
-`InvalidOperation` to 400, and everything else to 500. The real-time WebSocket path is handled
-separately by `CollaborationServer::handle_client`; this crate does not bind it to an axum WS
-route.
+`InvalidOperation` to 400, and everything else to 500. The real-time WebSocket path is bound
+to the same router as `GET /ws/:doc_id` (`api::ws_handler`/`ws_collaboration`) using axum's
+WebSocket support; the generic `CollaborationServer::handle_client` remains as a
+transport-agnostic variant for library embedders and tests.
 
 ### Rust engine API
 

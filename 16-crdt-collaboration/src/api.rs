@@ -10,13 +10,17 @@ use crate::storage::{DocumentAcl, Permission, StorageManager};
 use crate::{ClientId, DocumentId, Error};
 
 use axum::{
-    extract::{ConnectInfo, Path, State},
-    http::{header, Request, StatusCode},
+    extract::{
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+        ConnectInfo, Path, Query, State,
+    },
+    http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -216,6 +220,30 @@ async fn rate_limit_middleware(
     next.run(req).await
 }
 
+/// Combined state for the WebSocket collaboration endpoint.
+///
+/// The WebSocket route performs its own handshake-time auth (it cannot use the
+/// HTTP auth middleware, which would 401 before the upgrade), so it needs both
+/// the shared [`ApiState`] and the [`SecurityConfig`].
+#[derive(Clone)]
+struct WsState {
+    /// Shared API/collaboration state.
+    api: Arc<ApiState>,
+    /// Security config for handshake auth.
+    sec: Arc<SecurityConfig>,
+}
+
+/// Query parameters accepted on the WebSocket handshake.
+#[derive(Debug, Deserialize)]
+struct WsQuery {
+    /// API key (alternative to the `Authorization`/`x-api-key` headers).
+    api_key: Option<String>,
+    /// Optional display name for the joining client.
+    name: Option<String>,
+    /// Optional color for the joining client.
+    color: Option<String>,
+}
+
 /// Create the API router.
 pub fn create_router(state: Arc<ApiState>) -> Router {
     let cors = CorsLayer::new()
@@ -227,6 +255,17 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
 
     // Health/readiness stays open: no auth, no rate limit, no timeout.
     let open = Router::new().route("/health", get(health_check));
+
+    // WebSocket collaboration endpoint. It is deliberately kept out of the
+    // protected HTTP surface: the request-timeout layer would abort the
+    // long-lived socket, and the auth middleware would reject the upgrade
+    // before the handshake. Auth is instead enforced inside the handler.
+    let ws = Router::new()
+        .route("/ws/:doc_id", get(ws_handler))
+        .with_state(WsState {
+            api: state.clone(),
+            sec: sec.clone(),
+        });
 
     // Protected API surface gets all three hardening layers.
     let mut protected = Router::new()
@@ -264,9 +303,10 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .layer(middleware::from_fn_with_state(sec.clone(), auth_middleware));
 
     open.merge(protected)
+        .with_state(state)
+        .merge(ws)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }
 
 /// Error response.
@@ -482,10 +522,9 @@ async fn create_document(
     // Create document
     let document = Document::new(doc_id);
 
-    // Save initial snapshot
-    state.storage.save_snapshot(&document.snapshot()).await?;
-
-    // Create metadata
+    // Persist metadata first: durable backends (SQLite) reference the document
+    // row from the snapshots table via a foreign key, so the parent row must
+    // exist before the snapshot is written.
     let metadata = DocumentMetadata {
         id: doc_id,
         title: request.title.clone(),
@@ -496,6 +535,9 @@ async fn create_document(
         archived: false,
     };
     state.storage.save_metadata(metadata).await?;
+
+    // Save initial snapshot
+    state.storage.save_snapshot(&document.snapshot()).await?;
 
     // Create ACL
     let acl = DocumentAcl::new(doc_id, owner_id);
@@ -833,6 +875,220 @@ async fn create_share_link(
         permission: request.permission,
         expires_at: request.expires_at,
     }))
+}
+
+// === WebSocket collaboration endpoint ===
+
+/// Handle a WebSocket upgrade for real-time document collaboration.
+///
+/// Auth is enforced here (before the upgrade completes) rather than via the
+/// HTTP auth middleware: the socket is long-lived and must bypass the
+/// request-timeout layer. When auth is enabled, the key may be supplied via the
+/// `Authorization: Bearer`/`x-api-key` headers or the `?api_key=` query param
+/// (browsers cannot set headers on a WebSocket handshake).
+async fn ws_handler(
+    State(state): State<WsState>,
+    Path(doc_id): Path<DocumentId>,
+    Query(query): Query<WsQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if state.sec.auth_enabled() {
+        let presented = query
+            .api_key
+            .clone()
+            .or_else(|| api_key_from_headers(&headers));
+        let ok = presented
+            .as_deref()
+            .map(|k| state.sec.is_valid_key(k))
+            .unwrap_or(false);
+        if !ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                Json(ErrorResponse {
+                    error: "missing or invalid API key".to_string(),
+                    code: StatusCode::UNAUTHORIZED.as_u16(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let client_id = ClientId::new_v4();
+    let name = query.name.unwrap_or_else(|| "anonymous".to_string());
+    let color = query.color.unwrap_or_else(|| "#3b82f6".to_string());
+    let api = state.api.clone();
+
+    ws.on_upgrade(move |socket| ws_collaboration(socket, api, doc_id, client_id, name, color))
+}
+
+/// Extract an API key from the `Authorization: Bearer` or `x-api-key` headers.
+fn api_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get(header::AUTHORIZATION) {
+        if let Ok(s) = v.to_str() {
+            if let Some(token) = s.strip_prefix("Bearer ") {
+                return Some(token.trim().to_string());
+            }
+        }
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+}
+
+/// Drive a single collaborating client's WebSocket connection.
+///
+/// The client is subscribed to its document's broadcast channel. Incoming CRDT
+/// operations are applied to the shared document and re-broadcast to every
+/// other subscriber, so all clients converge. On disconnect, the latest state
+/// is persisted through the storage layer.
+async fn ws_collaboration(
+    socket: WebSocket,
+    state: Arc<ApiState>,
+    doc_id: DocumentId,
+    client_id: ClientId,
+    name: String,
+    color: String,
+) {
+    let session = match state.server.get_or_create_session(doc_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%doc_id, error = %e, "failed to open document session");
+            return;
+        }
+    };
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let mut broadcast_rx = session.broadcast.subscribe();
+
+    // Send the current document state so the client can render immediately.
+    let sync = crate::protocol::Message::SyncResponse(session.get_sync_response());
+    if let Ok(text) = serde_json::to_string(&sync) {
+        if ws_tx.send(WsMessage::Text(text)).await.is_err() {
+            return;
+        }
+    }
+
+    // Announce the join to peers.
+    let join = crate::protocol::Message::UserJoin(crate::protocol::UserJoin {
+        doc_id,
+        user: crate::protocol::UserInfo {
+            client_id,
+            name,
+            color,
+            avatar_url: None,
+        },
+    });
+    let _ = session.broadcast.send(join);
+
+    loop {
+        tokio::select! {
+            incoming = ws_rx.next() => {
+                match incoming {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        if let Ok(msg) = serde_json::from_str::<crate::protocol::Message>(&text) {
+                            // Direct replies (acks, sync responses) go straight
+                            // back over this socket; broadcasts fan out to peers.
+                            for reply in handle_ws_message(&state, &session, client_id, msg).await {
+                                if let Ok(text) = serde_json::to_string(&reply) {
+                                    if ws_tx.send(WsMessage::Text(text)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    _ => {}
+                }
+            }
+            broadcast = broadcast_rx.recv() => {
+                match broadcast {
+                    Ok(msg) => {
+                        // Never echo a client's own operation back to it.
+                        if let crate::protocol::Message::Operation(ref op) = msg {
+                            if op.client_id == client_id {
+                                continue;
+                            }
+                        }
+                        if let Ok(text) = serde_json::to_string(&msg) {
+                            if ws_tx.send(WsMessage::Text(text)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    // Lagged behind the broadcast buffer; keep going with newer messages.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+
+    // Announce departure and persist the latest state.
+    let _ = session.broadcast.send(crate::protocol::Message::UserLeave(
+        crate::protocol::UserLeave { doc_id, client_id },
+    ));
+    let snapshot = { session.document.read().snapshot() };
+    if let Err(e) = state.storage.save_snapshot(&snapshot).await {
+        tracing::warn!(%doc_id, error = %e, "failed to persist snapshot on disconnect");
+    }
+}
+
+/// Apply an inbound collaboration message from a WebSocket client.
+///
+/// Returns any messages that should be sent directly back to this client
+/// (acknowledgements, sync responses). Peer-facing effects (applying and
+/// re-broadcasting operations) happen as a side effect on the session.
+async fn handle_ws_message(
+    state: &Arc<ApiState>,
+    session: &crate::server::DocumentSession,
+    client_id: ClientId,
+    message: crate::protocol::Message,
+) -> Vec<crate::protocol::Message> {
+    use crate::protocol::Message;
+    match message {
+        Message::Operation(op_msg) => {
+            let vector_clock = op_msg.vector_clock.clone();
+            let operations = op_msg.operations.clone();
+            // `apply_operations` applies to the shared document and broadcasts
+            // the op to every subscriber (see server::DocumentSession).
+            match session.apply_operations(client_id, op_msg.operations) {
+                Ok(seq) => {
+                    // Durably log the applied operations so history survives
+                    // beyond the in-process broadcast.
+                    let _ = state
+                        .storage
+                        .append_operations(&session.doc_id, operations, vector_clock)
+                        .await;
+                    // Persist a fresh snapshot so a restart recovers the edit.
+                    let snapshot = { session.document.read().snapshot() };
+                    let _ = state.storage.save_snapshot(&snapshot).await;
+
+                    vec![Message::OperationAck(crate::protocol::OperationAck {
+                        doc_id: session.doc_id,
+                        seq,
+                        server_timestamp: current_timestamp(),
+                    })]
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "rejected invalid operation");
+                    vec![]
+                }
+            }
+        }
+        Message::CursorUpdate(_) | Message::SelectionUpdate(_) => {
+            // Presence relay: forward to peers without touching document state.
+            let _ = session.broadcast.send(message);
+            vec![]
+        }
+        Message::SyncRequest(_) => {
+            vec![Message::SyncResponse(session.get_sync_response())]
+        }
+        _ => vec![],
+    }
 }
 
 /// Get current timestamp in milliseconds.
