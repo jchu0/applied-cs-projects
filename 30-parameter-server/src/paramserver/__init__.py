@@ -16,8 +16,21 @@ from paramserver.schemas import (
 )
 from paramserver.server.parameter_server import ParameterServer
 from paramserver.server.cluster import ParameterServerCluster
-from paramserver.server.sharding import ShardingStrategy, UniformSharding
-from paramserver.worker.worker import Worker
+from paramserver.server.sharding import (
+    ShardingStrategy,
+    UniformSharding,
+    RoundRobinSharding,
+    SizeBalancedSharding,
+)
+from paramserver.worker.worker import (
+    Worker,
+    MockGradientComputer,
+    DataBatchGenerator,
+)
+from paramserver.transport import (
+    serve_parameter_server,
+    RemoteParameterServer,
+)
 from paramserver.optimizer.base import UpdateEngine
 from paramserver.optimizer.sgd import SGDEngine
 from paramserver.optimizer.adam import AdamEngine
@@ -25,8 +38,13 @@ from paramserver.optimizer.lars import LARSEngine
 from paramserver.optimizer.schedulers import (
     LRScheduler,
     StepLR,
+    MultiStepLR,
+    ExponentialLR,
     CosineAnnealingLR,
     WarmupLR,
+    CosineWarmupLR,
+    PolynomialLR,
+    OneCycleLR,
 )
 from paramserver.consistency.base import ConsistencyModel
 from paramserver.consistency.hogwild import HogwildConsistency
@@ -67,8 +85,15 @@ __all__ = [
     "ParameterServerCluster",
     "ShardingStrategy",
     "UniformSharding",
+    "RoundRobinSharding",
+    "SizeBalancedSharding",
     # Worker
     "Worker",
+    "MockGradientComputer",
+    "DataBatchGenerator",
+    # Transport
+    "serve_parameter_server",
+    "RemoteParameterServer",
     # Optimizer
     "UpdateEngine",
     "SGDEngine",
@@ -77,8 +102,13 @@ __all__ = [
     # Schedulers
     "LRScheduler",
     "StepLR",
+    "MultiStepLR",
+    "ExponentialLR",
     "CosineAnnealingLR",
     "WarmupLR",
+    "CosineWarmupLR",
+    "PolynomialLR",
+    "OneCycleLR",
     # Consistency
     "ConsistencyModel",
     "HogwildConsistency",

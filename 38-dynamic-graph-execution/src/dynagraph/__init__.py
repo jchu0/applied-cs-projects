@@ -19,6 +19,8 @@ from .autograd import (
     backward,
     grad,
     GradientTape,
+    jacobian,
+    hessian,
     jit_trace,
     trace_graph,
 )
@@ -58,6 +60,8 @@ __all__ = [
     "backward",
     "grad",
     "GradientTape",
+    "jacobian",
+    "hessian",
     "jit_trace",
     "trace_graph",
     # Executor

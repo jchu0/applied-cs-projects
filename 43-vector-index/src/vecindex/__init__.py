@@ -25,6 +25,8 @@ from .quantize import (
     compute_recall,
 )
 from .search import (
+    SearchParams,
+    RangeSearcher,
     BatchSearcher,
     HybridSearcher,
     RerankSearcher,
@@ -69,6 +71,8 @@ __all__ = [
     "BinaryQuantizer",
     "compute_recall",
     # Search
+    "SearchParams",
+    "RangeSearcher",
     "BatchSearcher",
     "HybridSearcher",
     "RerankSearcher",
