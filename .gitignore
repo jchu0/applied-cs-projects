@@ -1,6 +1,9 @@
 # Build / dependency artifacts
 target/
 **/target/
+# Cargo.lock: these crates are libraries/teaching projects — not committed
+# (repo-wide convention). Deployable binaries would normally commit it.
+Cargo.lock
 __pycache__/
 *.py[cod]
 .venv/
