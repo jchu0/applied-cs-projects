@@ -528,3 +528,91 @@ class TestGJKEPA:
 
         # Currently a placeholder that returns None
         assert contact is None
+
+
+class TestUnsupportedPairWarning:
+    """Tests for the explicit (documented) behavior on unsupported geom pairs.
+
+    Full GJK/EPA is out of scope; instead the narrow phase logs a one-time
+    warning per unsupported pair type so the no-contact behavior is not silent.
+    """
+
+    def test_box_box_returns_none(self, narrow_phase):
+        """Box-box is unsupported and produces no contact."""
+        box1 = Geom(GeomType.BOX, np.array([0.5, 0.5, 0.5]))
+        box2 = Geom(GeomType.BOX, np.array([0.5, 0.5, 0.5]))
+        pos1 = np.array([0.0, 0.0, 0.0])
+        pos2 = np.array([0.2, 0.0, 0.0])  # deeply overlapping
+        quat = np.array([1.0, 0.0, 0.0, 0.0])
+
+        contact = narrow_phase.check_collision(box1, pos1, quat, box2, pos2, quat)
+        assert contact is None
+
+    def test_capsule_box_returns_none(self, narrow_phase):
+        """Capsule-box is unsupported and produces no contact."""
+        capsule = Geom(GeomType.CAPSULE, np.array([0.5, 1.0]))
+        box = Geom(GeomType.BOX, np.array([0.5, 0.5, 0.5]))
+        pos = np.array([0.0, 0.0, 0.0])
+        quat = np.array([1.0, 0.0, 0.0, 0.0])
+
+        contact = narrow_phase.check_collision(capsule, pos, quat, box, pos, quat)
+        assert contact is None
+
+    def test_box_box_warns_once(self, narrow_phase, caplog):
+        """Box-box collision logs exactly one warning, not one per call."""
+        import logging
+
+        box1 = Geom(GeomType.BOX, np.array([0.5, 0.5, 0.5]))
+        box2 = Geom(GeomType.BOX, np.array([0.5, 0.5, 0.5]))
+        pos1 = np.array([0.0, 0.0, 0.0])
+        pos2 = np.array([0.2, 0.0, 0.0])
+        quat = np.array([1.0, 0.0, 0.0, 0.0])
+
+        with caplog.at_level(logging.WARNING, logger="physicsrl.collision.detection"):
+            for _ in range(5):
+                narrow_phase.check_collision(box1, pos1, quat, box2, pos2, quat)
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "not supported" in r.message
+        ]
+        assert len(warnings) == 1
+        assert "box" in warnings[0].getMessage()
+
+    def test_unsupported_pair_symmetric_warns_once(self, narrow_phase, caplog):
+        """(capsule, box) and (box, capsule) are treated as the same pair."""
+        import logging
+
+        capsule = Geom(GeomType.CAPSULE, np.array([0.5, 1.0]))
+        box = Geom(GeomType.BOX, np.array([0.5, 0.5, 0.5]))
+        pos = np.array([0.0, 0.0, 0.0])
+        quat = np.array([1.0, 0.0, 0.0, 0.0])
+
+        with caplog.at_level(logging.WARNING, logger="physicsrl.collision.detection"):
+            narrow_phase.check_collision(capsule, pos, quat, box, pos, quat)
+            narrow_phase.check_collision(box, pos, quat, capsule, pos, quat)
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "not supported" in r.message
+        ]
+        assert len(warnings) == 1
+
+    def test_distinct_unsupported_pairs_warn_separately(self, narrow_phase, caplog):
+        """Different unsupported pair types each get their own warning."""
+        import logging
+
+        box = Geom(GeomType.BOX, np.array([0.5, 0.5, 0.5]))
+        capsule = Geom(GeomType.CAPSULE, np.array([0.5, 1.0]))
+        pos = np.array([0.0, 0.0, 0.0])
+        quat = np.array([1.0, 0.0, 0.0, 0.0])
+
+        with caplog.at_level(logging.WARNING, logger="physicsrl.collision.detection"):
+            narrow_phase.check_collision(box, pos, quat, box, pos, quat)          # box-box
+            narrow_phase.check_collision(capsule, pos, quat, box, pos, quat)      # capsule-box
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "not supported" in r.message
+        ]
+        assert len(warnings) == 2

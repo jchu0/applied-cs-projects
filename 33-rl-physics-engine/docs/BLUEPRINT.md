@@ -34,7 +34,7 @@ backend, JIT, or automatic differentiation. General convex-convex collision (GJK
 as a placeholder, the velocity-product (Coriolis) term in dynamics is dropped, and the
 constraint solver uses a diagonal inverse-mass approximation. These simplifications are called
 out explicitly in the relevant sections rather than hidden. What *is* implemented is fully
-tested by a 143-test suite.
+tested by a 155-test suite.
 
 ## Architecture
 
@@ -348,9 +348,15 @@ unimplemented GJK/EPA path:
 So box-box, capsule-box, sphere-cylinder, and any mesh pair currently produce no contacts; the
 table is the authoritative list of what the narrow phase resolves.
 
-**Known simplification.** `_gjk_epa`, the fallback for arbitrary convex pairs (e.g.
-box-box, capsule-box), is a placeholder returning `None`. Only the pairs enumerated above
-generate contacts.
+**Known limitation (not a silent no-op).** `_gjk_epa`, the fallback for arbitrary convex pairs
+(e.g. box-box, capsule-box), is a placeholder returning `None`, and only the pairs enumerated
+above generate contacts. To keep this from being a silent physics-correctness surprise, the
+dispatch fall-through calls `NarrowPhase._warn_unsupported_pair`, which logs a `WARNING` (via
+the `physicsrl.collision.detection` logger) the first time each unsupported pair type is seen.
+The warning is emitted once per pair type — the set of already-warned pairs is tracked on the
+`NarrowPhase` instance, and pairs are keyed symmetrically so `(box, capsule)` and
+`(capsule, box)` count as one. This makes the missing contacts visible in logs without spamming
+one message per simulation step.
 
 `CollisionSystem.detect_contacts` runs the broad phase, builds a geom-index→(body, local-geom)
 map, runs the narrow phase on each candidate pair, and stamps the resulting contacts with their
@@ -470,14 +476,22 @@ def step(self, action):
     return obs, reward, terminated, truncated, info
 ```
 
-`reset(seed)` rebuilds the state, optionally seeds NumPy, and applies domain randomization:
-per-body mass scaling (and matching inertia scaling) within `mass_range`, and per-geom friction
-scaling within `friction_range`. The default reward penalizes control effort; subclasses
-override `_compute_reward`/`_check_termination`.
+Each `PhysicsEnvironment` owns a private `numpy.random.Generator` (`self.rng`, built from
+`np.random.default_rng(seed)` at construction). All environment randomness — domain
+randomization and reset seeding — is routed through this generator rather than the
+process-global NumPy RNG. Consequently seeding one environment never perturbs another, and a
+rollout is reproducible regardless of what other environments (or the surrounding process) do
+with `numpy.random`. `reset(seed)` rebuilds the state and, when a seed is given, reseeds *only*
+this environment's generator (`self.rng = np.random.default_rng(seed)`) before applying domain
+randomization: per-body mass scaling (and matching inertia scaling) within `mass_range`, and
+per-geom friction scaling within `friction_range`. The default reward penalizes control effort;
+subclasses override `_compute_reward`/`_check_termination`.
 
 `BatchedEnvironment` holds `num_envs` independent `PhysicsEnvironment` copies and steps them in
 a Python loop, stacking observations/rewards and auto-resetting any environment that terminates
-or truncates. It is a convenience wrapper for vectorized rollouts, not a parallelized or
+or truncates. Its `__init__(model, num_envs, seed=None)` derives a distinct per-env seed
+(`seed + i`) so each sub-environment starts with its own independent generator even before the
+first `reset`. It is a convenience wrapper for vectorized rollouts, not a parallelized or
 SIMD-batched simulator — each sub-environment is stepped sequentially.
 
 Three example tasks ship as subclasses: `InvertedPendulumEnv` (reward `cos(angle)` minus
@@ -723,7 +737,7 @@ choices that bound cost in practice:
 
 ## Testing Strategy
 
-The suite has **143 tests** across four files, all runnable with `pytest tests/ -v` and
+The suite has **155 tests** across five files, all runnable with `pytest tests/ -v` and
 requiring no external services. A rich `conftest.py` supplies fixtures for inertias, geoms,
 bodies, and complete models (single free body, falling sphere over ground, pendulum, two-sphere,
 cart-pole, simple hinge), plus integrator instances and assertion helpers.
@@ -735,14 +749,15 @@ computation for sphere/box/capsule, body defaults and zero-mass ground bodies, a
 hinge & slide → 1 / 1, fixed → 0 / 0). Model-level tests verify `nbody`, `nq`/`nv`, and `nu`
 counters update correctly and gravity defaults to `[0, 0, -9.81]`.
 
-**`test_collision.py` (33 tests).** Broad-phase AABB overlap (overlapping, disjoint, touching,
+**`test_collision.py` (38 tests).** Broad-phase AABB overlap (overlapping, disjoint, touching,
 single-axis), overlapping-pair discovery on the two-sphere model, and every analytic narrow
 test: sphere-sphere (hit, miss, touching, normal direction), sphere-box, sphere-plane
 (including penetration depth), capsule-plane, capsule-capsule, box-plane, and the
 closest-points-between-segments helper. Dispatch tests confirm commutativity
 (`sphere-plane == plane-sphere`, `sphere-box == box-sphere`), contact material combination
 (min friction, max restitution), end-to-end `CollisionSystem.detect_contacts`, and that the
-unimplemented GJK/EPA path returns `None`.
+unimplemented GJK/EPA path returns `None` — and that unsupported pairs (box-box, capsule-box)
+emit exactly one `WARNING` per pair type, symmetric orderings sharing a single warning.
 
 **`test_dynamics.py` (30 tests).** Forward kinematics for free and hinge joints (including
 quaternion-norm preservation); the compute pass — free-fall acceleration ≈ gravity, zero-torque
@@ -758,6 +773,13 @@ advances time, and shows the expected gravity effect; the semi-implicit integrat
 energy property and RK4's higher-order accuracy are checked against finer references;
 quaternion normalization after stepping; hinge and slide joint-limit enforcement; and actuator
 behavior — forces applied, control clipping, and gear-ratio scaling.
+
+**`test_environment.py` (7 tests).** Reproducibility of the Gym-style wrapper: identical seeds
+produce identical trajectories; different seeds produce different domain-randomization draws;
+seeding/sampling a third environment does not perturb a separately seeded environment;
+`reset(seed=)` leaves the process-global NumPy RNG untouched; each environment exposes a private
+`numpy.random.Generator`; and `BatchedEnvironment` builds reproducible, mutually independent
+sub-environments.
 
 Together these cover unit correctness of the math primitives, per-component behavior of
 dynamics/collision/solver/integration, and integration-level scenarios (free fall, pendulum,

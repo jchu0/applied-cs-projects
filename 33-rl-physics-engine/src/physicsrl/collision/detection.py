@@ -1,5 +1,6 @@
 """Collision detection with broad and narrow phases."""
 
+import logging
 import numpy as np
 from typing import List, Tuple, Optional
 
@@ -7,6 +8,8 @@ from ..core.bodies import (
     Model, State, Geom, Contact, GeomType,
     quat_rotate, quat_mul
 )
+
+logger = logging.getLogger(__name__)
 
 
 class BroadPhase:
@@ -66,6 +69,11 @@ class BroadPhase:
 class NarrowPhase:
     """Narrow-phase collision detection for exact contact computation."""
 
+    def __init__(self):
+        # Track which unsupported geom-type pairs we've already warned about so
+        # each pair type is reported once rather than every simulation step.
+        self._warned_unsupported = set()
+
     def check_collision(self, geom1: Geom, pos1: np.ndarray, quat1: np.ndarray,
                         geom2: Geom, pos2: np.ndarray, quat2: np.ndarray) -> Optional[Contact]:
         """
@@ -120,8 +128,31 @@ class NarrowPhase:
             return contact
 
         else:
-            # Use GJK/EPA for general case
+            # Unsupported geom-type pair (e.g. box-box, capsule-box, any mesh
+            # pair). Full GJK/EPA general-convex collision is not implemented,
+            # so no contact is generated for these pairs. Rather than silently
+            # returning None (a physics-correctness surprise), warn once per
+            # unsupported pair type so the gap is visible in logs.
+            self._warn_unsupported_pair(geom1.geom_type, geom2.geom_type)
             return self._gjk_epa(geom1, pos1, quat1, geom2, pos2, quat2)
+
+    def _warn_unsupported_pair(self, type1: GeomType, type2: GeomType) -> None:
+        """Log a one-time warning for an unsupported collision pair type.
+
+        The unsupported-pair set is symmetric, so ``(box, capsule)`` and
+        ``(capsule, box)`` are treated as the same pair and warned about once.
+        """
+        key = frozenset((type1, type2)) if type1 != type2 else (type1,)
+        if key in self._warned_unsupported:
+            return
+        self._warned_unsupported.add(key)
+        logger.warning(
+            "Collision between geom types %s and %s is not supported "
+            "(general convex GJK/EPA is not implemented); no contact will be "
+            "generated for this pair. See docs/BLUEPRINT.md for the list of "
+            "supported pairs.",
+            type1.value, type2.value,
+        )
 
     def _sphere_sphere(self, geom1: Geom, pos1: np.ndarray,
                        geom2: Geom, pos2: np.ndarray) -> Optional[Contact]:

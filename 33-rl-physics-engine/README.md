@@ -28,7 +28,9 @@ locally with no external physics or autodiff dependency.
 - **Gym-style environments** — `reset`/`step` returning the 5-tuple
   `(obs, reward, terminated, truncated, info)`, with domain randomization
   (`PhysicsEnvironment`), batched rollouts (`BatchedEnvironment`), and ready-made
-  `InvertedPendulumEnv`, `CartPoleEnv`, and `HopperEnv` tasks.
+  `InvertedPendulumEnv`, `CartPoleEnv`, and `HopperEnv` tasks. Each environment owns a
+  private `numpy.random.Generator`; `reset(seed=)` reseeds only that environment, so seeding
+  one env never perturbs another and rollouts are reproducible.
 
 ## Architecture
 
@@ -131,9 +133,12 @@ for _ in range(200):
   (with commutative dispatch); the projected Gauss-Seidel contact solver with Baumgarte
   stabilization, restitution, friction clamping, and warm-start; Euler / semi-implicit / RK4
   integration; and the Gym-style environment, batching, and example tasks. All of this is
-  exercised by the 143-test suite.
+  exercised by the 155-test suite.
 - **Simplified / not implemented:** GJK/EPA general-convex collision (`_gjk_epa`) is a
-  placeholder returning `None`; the Coriolis/centrifugal velocity-product term is zeroed; the
+  placeholder returning `None`, so unsupported geom pairs (box-box, capsule-box, sphere-cylinder,
+  any mesh pair) generate no contacts. This is a **known limitation, not a silent no-op**: the
+  narrow phase logs a one-time `WARNING` per unsupported pair type the first time it is
+  encountered. The Coriolis/centrifugal velocity-product term is zeroed; the
   constraint solver uses a diagonal inverse-mass approximation rather than the full mass
   matrix. There is **no** differentiable physics, GPU acceleration, Numba JIT, or `numpy-quaternion`
   dependency — the engine is pure NumPy and CPU-only.
@@ -144,10 +149,11 @@ for _ in range(200):
 pytest tests/ -v
 ```
 
-The suite has 143 tests across four files: `test_bodies.py` (data structures, inertia, DOF
+The suite has 155 tests across five files: `test_bodies.py` (data structures, inertia, DOF
 bookkeeping), `test_collision.py` (broad/narrow phase, dispatch commutativity, contact
-properties), `test_dynamics.py` (forward dynamics and kinematics), and `test_integration.py`
-(the three integrators and full stepping). No external services are required.
+properties, unsupported-pair warnings), `test_dynamics.py` (forward dynamics and kinematics),
+`test_integration.py` (the three integrators and full stepping), and `test_environment.py`
+(RNG reproducibility and isolation). No external services are required.
 
 ## Project Structure
 
@@ -162,7 +168,7 @@ properties), `test_dynamics.py` (forward dynamics and kinematics), and `test_int
     solver/constraints.py     # ConstraintSolver (projected Gauss-Seidel)
     integration/integrator.py # Integrator (Euler / semi-implicit / RK4)
     environment/gym_env.py     # PhysicsEnvironment, BatchedEnvironment, example tasks
-  tests/                       # 143 tests + shared fixtures (conftest.py)
+  tests/                       # 155 tests + shared fixtures (conftest.py)
   docs/BLUEPRINT.md            # Full architecture and design
 ```
 

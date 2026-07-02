@@ -12,7 +12,7 @@ class PhysicsEnvironment:
     Gym-compatible environment wrapper for physics simulation.
     """
 
-    def __init__(self, model: Model):
+    def __init__(self, model: Model, seed: Optional[int] = None):
         self.model = model
         self.integrator = Integrator(model)
         self.state = State.create(model)
@@ -31,10 +31,21 @@ class PhysicsEnvironment:
         self.mass_range = (0.9, 1.1)
         self.friction_range = (0.8, 1.2)
 
+        # Per-environment RNG. All environment randomness (domain
+        # randomization, reset seeding) is routed through this Generator so
+        # that seeding one environment never perturbs another and results are
+        # reproducible independent of the process-global NumPy RNG.
+        self.rng = np.random.default_rng(seed)
+
     def reset(self, seed: Optional[int] = None) -> np.ndarray:
-        """Reset environment to initial state."""
+        """Reset environment to initial state.
+
+        If ``seed`` is given, this environment's own RNG is reseeded (the
+        process-global NumPy RNG is left untouched, so other environments are
+        unaffected).
+        """
         if seed is not None:
-            np.random.seed(seed)
+            self.rng = np.random.default_rng(seed)
 
         self.state = State.create(self.model)
         self._step_count = 0
@@ -113,14 +124,14 @@ class PhysicsEnvironment:
         """Apply domain randomization for sim2real."""
         if self.randomize_mass:
             for body in self.model.bodies:
-                factor = np.random.uniform(*self.mass_range)
+                factor = self.rng.uniform(*self.mass_range)
                 body.inertia.mass *= factor
                 body.inertia.inertia *= factor
 
         if self.randomize_friction:
             for body in self.model.bodies:
                 for geom in body.geoms:
-                    geom.friction *= np.random.uniform(*self.friction_range)
+                    geom.friction *= self.rng.uniform(*self.friction_range)
 
     @property
     def observation_space_shape(self) -> Tuple[int, ...]:
@@ -138,12 +149,19 @@ class BatchedEnvironment:
     Batched environment for parallel simulation.
     """
 
-    def __init__(self, model: Model, num_envs: int):
+    def __init__(self, model: Model, num_envs: int, seed: Optional[int] = None):
         self.num_envs = num_envs
         self.model = model
 
-        # Create independent environment copies
-        self.envs = [PhysicsEnvironment(model) for _ in range(num_envs)]
+        # Create independent environment copies, each with its own RNG so a
+        # reset on one env cannot perturb the others.
+        if seed is not None:
+            env_seeds = [seed + i for i in range(num_envs)]
+        else:
+            env_seeds = [None] * num_envs
+        self.envs = [
+            PhysicsEnvironment(model, seed=env_seeds[i]) for i in range(num_envs)
+        ]
 
         # Observation and action dimensions
         self.observation_dim = self.envs[0].observation_dim
