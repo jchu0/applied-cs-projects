@@ -26,7 +26,7 @@ from .batching import (
     ShortestJobFirstPolicy,
 )
 from .sampling import TokenSampler
-from .scheduler import InferenceScheduler
+from .scheduler import InferenceScheduler, TransformerModel
 from .speculative import (
     SpeculativeDecoder,
     TreeSpeculativeDecoder,
@@ -60,6 +60,7 @@ __all__ = [
     "TokenSampler",
     # Scheduler
     "InferenceScheduler",
+    "TransformerModel",
     # Speculative
     "SpeculativeDecoder",
     "TreeSpeculativeDecoder",

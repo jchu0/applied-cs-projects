@@ -609,10 +609,11 @@ from autoregressive_inference import (
     KVCacheConfig, KVCacheBlock, PagedKVCacheManager, SlidingWindowCache,
     # batching
     ContinuousBatcher, BatchedInputs,
+    SchedulingPolicy, FIFOPolicy, PriorityPolicy, ShortestJobFirstPolicy,
     # sampling
     TokenSampler,
     # scheduler
-    InferenceScheduler,
+    InferenceScheduler, TransformerModel,
     # speculative
     SpeculativeDecoder, TreeSpeculativeDecoder, SpeculativeStats,
     DraftModel, TargetModel,
