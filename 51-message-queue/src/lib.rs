@@ -23,6 +23,9 @@ pub mod segment;
 pub mod offset;
 pub mod replication;
 pub mod transaction;
+pub mod protocol;
+pub mod server;
+pub mod client;
 
 pub use message::{Message, MessageBatch, MessageId, Headers, MessageBuilder};
 pub use storage::{Storage, StorageConfig};
@@ -40,6 +43,9 @@ pub use error::{Error, Result};
 pub use compression::Compression;
 pub use replication::{ReplicationManager, ReplicaSet, ReplicationConfig, Acks};
 pub use transaction::{TransactionCoordinator, ProducerState, TransactionState};
+pub use protocol::{Request, Response, ErrorKind, WireMessage, PROTOCOL_VERSION, DEFAULT_MAX_FRAME_BYTES};
+pub use server::{serve, serve_with_listener, ServerOptions};
+pub use client::MqClient;
 
 /// Message queue version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

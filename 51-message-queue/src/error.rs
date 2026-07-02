@@ -148,6 +148,23 @@ pub enum Error {
     /// Insufficient replicas
     #[error("Insufficient replicas in ISR: {available} < {required}")]
     InsufficientReplicas { available: usize, required: usize },
+
+    /// Protocol error (malformed frame, unexpected message, oversized frame, etc.)
+    #[error("Protocol error: {0}")]
+    Protocol(String),
+
+    /// Authentication failed or required
+    #[error("Authentication failed: {0}")]
+    Auth(String),
+
+    /// The peer returned a typed error response
+    #[error("Server error ({kind}): {message}")]
+    Server {
+        /// Machine-readable error kind reported by the server.
+        kind: String,
+        /// Human-readable detail.
+        message: String,
+    },
 }
 
 impl Error {

@@ -29,11 +29,16 @@ partition rebalancing, transactional/idempotent producer support, and pluggable 
   applied per message batch (`compression.rs`).
 - **Broker** — `Broker` ties the topic manager and group manager together with produce/fetch
   and metrics (`broker.rs`).
+- **Network layer** — a length-prefixed binary wire protocol (`protocol.rs`), a tokio TCP
+  server that wraps the broker (`server.rs`, `serve`), and an async `MqClient` (`client.rs`),
+  so the queue is connectable over the network with optional token auth.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
+    CLIENT[MqClient] -->|TCP wire protocol| SERVER[serve / TCP server]
+    SERVER --> BROKER
     PROD[Producer / ProducerBuilder] --> PART[Partitioner]
     PART --> BROKER[Broker]
     BROKER --> TM[TopicManager]
@@ -62,6 +67,7 @@ flowchart TD
 | Transactions | `transaction.rs` | Idempotent/transactional producer state |
 | Replication | `replication.rs` | ISR, leader election, ack levels (standalone) |
 | Broker | `broker.rs` | Orchestration and metrics |
+| Network | `protocol.rs`, `server.rs`, `client.rs` | Wire protocol, TCP server, async client |
 
 ## Quick Start
 
@@ -79,11 +85,31 @@ cargo build --release   # LTO + codegen-units=1 optimized profile
 ### Running
 
 ```bash
-cargo run --bin mq-server   # in-process broker (no network listener)
+cargo run --bin mq-server   # boots the broker and serves the wire protocol over TCP
 ```
 
 The server reads `MQ_BROKER_ID`, `MQ_DATA_DIR`, `MQ_LOG_DIR`, `MQ_HOST`, and `MQ_PORT` from
-the environment.
+the environment (defaults: `127.0.0.1:9092`). If `MQ_AUTH_TOKEN` is set, every client must
+authenticate with that shared token before issuing requests; if it is unset, no auth is
+required (convenient for local use). `Ctrl-C` triggers a clean shutdown.
+
+### Wire protocol
+
+Clients speak a length-prefixed binary protocol over TCP:
+
+```text
++-------------------+-----------------------------+
+| u32 length (BE)   | body (bincode-serialized)   |
++-------------------+-----------------------------+
+```
+
+Each frame's `length` prefix is the byte length of the body; requests and responses share the
+same framing. Bodies are `Request`/`Response` enums serialized with `bincode`. Frames larger
+than a configurable cap (16 MiB by default) are rejected before allocation. Supported requests:
+`Ping`, `CreateTopic`, `ListTopics`, `Produce`, `Fetch`, `CommitOffset`, `FetchOffset`, and
+`Auth`; failures come back as a typed `Response::Error { kind, message }`. Consumer-group
+offsets committed via the wire protocol are persisted server-side with the crate's file-backed
+`OffsetStore`.
 
 ## Usage
 
@@ -118,6 +144,34 @@ let msg = MessageBuilder::new("payload")
     .build();
 ```
 
+### Remote client
+
+With `mq-server` running, connect over the network with `MqClient` (async, tokio):
+
+```rust
+use message_queue::{MqClient, WireMessage};
+
+#[tokio::main]
+async fn main() -> message_queue::Result<()> {
+    // Pass Some(token) if the server was started with MQ_AUTH_TOKEN.
+    let mut client = MqClient::connect("127.0.0.1:9092", None).await?;
+    client.ping().await?;
+
+    client.create_topic("orders", Some(1)).await?;
+    let (partition, offset) = client.produce("orders", b"hello".to_vec()).await?;
+    println!("wrote to partition {partition} at offset {offset}");
+
+    let messages = client.fetch("orders", partition, 0, 10, 0).await?;
+    assert_eq!(messages[0].payload, b"hello");
+
+    // Consumer-group offset tracking
+    client.commit_offset("group-a", "orders", partition, offset + 1).await?;
+    assert_eq!(client.fetch_offset("group-a", "orders", partition).await?, Some(offset + 1));
+    let _ = WireMessage::new(b"payload".to_vec()); // full message with key/headers
+    Ok(())
+}
+```
+
 ## What's Real vs Simulated
 
 - **Real:** The on-disk segmented log with CRC-checked records, offset/time indexes, topic and
@@ -125,12 +179,15 @@ let msg = MessageBuilder::new("payload")
   consumer-group join/sync/heartbeat state machine with range assignment, persisted offset
   commits and lag tracking, the transaction/idempotence state machine with sequence dedup, the
   four compression codecs, retention, and crash recovery (segments and offsets are reloaded on
-  open). These are exercised by 284 tests.
-- **Simulated / requires credentials:** The system runs **in-process only**. `mq-server` boots
-  a `Broker` but opens no network socket, so there is no wire protocol or remote client. The
-  `replication` module (ISR membership, leader election, ack levels) is implemented as a
-  standalone in-process component and is **not wired into** the broker or server — there is no
-  multi-node clustering or cross-node coordination.
+  open). **The TCP wire protocol is real too:** `mq-server` opens a socket, and `MqClient`
+  connects over the network to produce, fetch, create/list topics, commit/fetch consumer-group
+  offsets, and (optionally) authenticate — all exercised end-to-end over real sockets. These
+  are covered by 301 tests.
+- **Simulated / requires credentials:** The server is **single-node**. The `replication`
+  module (ISR membership, leader election, ack levels) is implemented as a standalone in-process
+  component and is **not wired into** the broker, server, or write path — there is no multi-node
+  clustering or cross-node coordination. The wire protocol is a purpose-built binary framing,
+  not the Kafka wire format, so existing Kafka clients cannot connect.
 
 ## Testing
 
@@ -139,10 +196,13 @@ cargo test
 cargo bench   # Criterion throughput benchmarks (release profile)
 ```
 
-The suite is 284 tests: 75 integration tests in `tests/integration_tests.rs` plus 209 unit
-tests across the source modules. They cover serialization round-trips, CRC corruption
-detection, segment roll/retention, index lookups, partitioning, producer/consumer flows,
-group rebalancing, offset persistence, and transaction state transitions. No external services
+The suite is 301 tests: 214 unit tests across the source modules (including protocol/server
+tests), 75 integration tests in `tests/integration_tests.rs`, and 12 end-to-end network tests
+in `tests/network_tests.rs`. They cover serialization round-trips, CRC corruption detection,
+segment roll/retention, index lookups, partitioning, producer/consumer flows, group
+rebalancing, offset persistence, transaction state transitions, and — over real TCP sockets on
+an ephemeral port — the wire protocol (produce/fetch round-trips, ordering, topic listing,
+offset commit/fetch, oversized-frame rejection, and the auth handshake). No external services
 are required.
 
 ## Project Structure
@@ -166,8 +226,12 @@ are required.
     compression.rs    # Compression codecs
     config.rs         # Broker/topic/producer/consumer config
     error.rs          # Typed error hierarchy
-    bin/server.rs     # In-process server binary
-  tests/integration_tests.rs   # 75 integration tests
+    protocol.rs       # Wire protocol: Request/Response, WireMessage, framing
+    server.rs         # Tokio TCP server (serve) wrapping the Broker
+    client.rs         # MqClient async network client
+    bin/server.rs     # mq-server binary (serves the wire protocol)
+  tests/integration_tests.rs   # 75 in-process integration tests
+  tests/network_tests.rs       # 12 end-to-end wire-protocol tests
   benches/throughput.rs        # Criterion benchmarks
   docs/BLUEPRINT.md            # Full architecture and design
 ```

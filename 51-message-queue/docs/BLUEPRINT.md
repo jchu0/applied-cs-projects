@@ -6,9 +6,10 @@ This project is a persistent, Kafka-style message queue implemented from scratch
 It models the core of a distributed log system: durable, append-only, offset-addressed
 partitions grouped under named topics, with a batched producer path, an acknowledging
 consumer path, a consumer-group rebalancing protocol, persisted offset commits, an
-idempotent/transactional producer state machine, and pluggable per-batch compression. All of
-this runs **in-process** — there is no network listener or wire protocol — which keeps the
-focus squarely on the storage and coordination logic rather than on socket plumbing.
+idempotent/transactional producer state machine, and pluggable per-batch compression. On top
+of that storage and coordination core sits a real network layer: `mq-server` opens a TCP
+socket and speaks a length-prefixed binary wire protocol, and `MqClient` connects remotely to
+produce, fetch, manage topics, and track consumer-group offsets. The system is single-node.
 
 The concepts this codebase teaches are the ones that make a commit log work in practice:
 
@@ -33,11 +34,13 @@ The concepts this codebase teaches are the ones that make a commit log work in p
 
 Scope is deliberately bounded. The `replication` module implements ISR membership, high
 watermark computation, leader election, and ack levels, but it is a standalone in-process
-component — it is **not** wired into the `Broker` or the server binary, and there is no
-multi-node clustering. The system is exercised by 284 tests (75 integration tests plus 209
-unit tests) covering serialization, CRC corruption detection, segment roll and retention,
-index lookup, partitioning, producer/consumer flows, group rebalancing, offset persistence,
-and transaction state transitions.
+component — it is **not** wired into the `Broker`, the server, or the write path, and there is
+no multi-node clustering. The network layer is single-node and its framing is purpose-built,
+not the Kafka wire format. The system is exercised by 301 tests (209 unit tests, 75 in-process
+integration tests, and 12 end-to-end network tests over real sockets) covering serialization,
+CRC corruption detection, segment roll and retention, index lookup, partitioning,
+producer/consumer flows, group rebalancing, offset persistence, transaction state transitions,
+and the full request/response wire protocol including the auth handshake.
 
 ### Design goals and non-goals
 
@@ -60,11 +63,14 @@ faithful model of Kafka's data model and vocabulary. Several concrete goals shap
   `auto.offset.reset`, `session.timeout`, retention by time and size) so that the mental model
   transfers directly.
 
-The explicit non-goals are the parts a production broker would need but this project omits: a
-network protocol and remote clients, multi-node replication actually wired into the write path,
-log compaction (the `CleanupPolicy::Compact` variant exists in config but the delete policy is
-what runs), and a background scheduler for retention and ISR maintenance (those are methods the
-caller invokes, not timers).
+The explicit non-goals are the parts a production broker would need but this project omits:
+multi-node replication actually wired into the write path (the `replication` module is
+standalone), Kafka wire-format compatibility (the network protocol is a purpose-built binary
+framing, so off-the-shelf Kafka clients cannot connect), log compaction (the
+`CleanupPolicy::Compact` variant exists in config but the delete policy is what runs), and a
+background scheduler for retention and ISR maintenance (those are methods the caller invokes,
+not timers). The single-node wire protocol and remote client — previously a non-goal — are now
+implemented (`protocol.rs`, `server.rs`, `client.rs`).
 
 ## Architecture
 
@@ -120,9 +126,15 @@ seek, pause, and resume. `ConsumerGroup`/`GroupManager` implement the group prot
 holds in-memory positions, high watermarks, and lag.
 
 **Orchestration.** `Broker` ties `TopicManager` and `GroupManager` together, honoring
-`auto_create_topics`, and records metrics through `BrokerMetrics`. The `mq-server` binary
-constructs a `Broker` from environment variables and starts it, then idles — it opens no
-socket.
+`auto_create_topics`, and records metrics through `BrokerMetrics`.
+
+**Network layer.** `protocol.rs` defines the `Request`/`Response` enums, the `WireMessage`
+record, and the length-prefixed framing. `server.rs` exposes `serve(broker, addr, opts)`: a
+tokio TCP listener that accepts connections, reads framed requests, dispatches them against the
+shared `Arc<Broker>`, and writes framed responses, with an optional token auth handshake and an
+oversized-frame guard. `client.rs` provides `MqClient`, an async client mirroring the protocol.
+The `mq-server` binary constructs a `Broker` from environment variables, starts it, and calls
+`serve` on `MQ_HOST:MQ_PORT`.
 
 | Component | Module | Responsibility |
 |-----------|--------|----------------|
@@ -139,6 +151,9 @@ socket.
 | Compression | `compression.rs` | None/Gzip/Lz4/Snappy codecs |
 | Replication | `replication.rs` | ISR, high watermark, leader election, ack levels (standalone) |
 | Broker | `broker.rs` | Orchestration, produce/fetch entry points, metrics |
+| Wire protocol | `protocol.rs` | `Request`/`Response` enums, `WireMessage`, length-prefixed framing |
+| Server | `server.rs` | Tokio TCP server (`serve`), auth handshake, frame-size guard |
+| Client | `client.rs` | `MqClient` async network client |
 | Config | `config.rs` | Broker/topic/producer/consumer configuration and enums |
 | Errors | `error.rs` | Typed error hierarchy with retriable/fatal classification |
 
@@ -436,6 +451,42 @@ lag; `maybe_shrink_isr`/`maybe_expand_isr` enforce lag-time and lag-message boun
 `elect_leader` promotes a preferred or first ISR member and bumps the leader epoch.
 `ReplicationManager` maps `(topic, partition)` to replica sets and answers leadership queries.
 Nothing in `broker.rs` or the server binary constructs these types.
+
+### Wire protocol and network layer (`protocol.rs`, `server.rs`, `client.rs`)
+
+The network layer wraps the broker without changing its semantics. Frames are
+`u32` big-endian length prefixes followed by a `bincode`-serialized body:
+
+```text
++-------------------+-----------------------------+
+| u32 length (BE)   | body (bincode-serialized)   |
++-------------------+-----------------------------+
+```
+
+`protocol.rs` defines `Request` (`Auth`, `Ping`, `CreateTopic`, `ListTopics`, `Produce`,
+`Fetch`, `CommitOffset`, `FetchOffset`) and `Response` (`AuthOk`, `Pong`, `TopicCreated`,
+`Topics`, `Produced`, `Fetched`, `OffsetCommitted`, `FetchedOffset`, and a typed
+`Error { kind, message }` where `kind` is a wire-stable `ErrorKind`). Messages travel as
+`WireMessage`, a flat serde record that converts to/from the internal `Message` so the protocol
+stays decoupled from `Bytes`/`MessageId`/`Headers`. `Response::from_error` maps a broker `Error`
+to the closest `ErrorKind`.
+
+`server.rs` exposes `serve(broker, addr, opts)` (and `serve_with_listener` for tests binding
+`127.0.0.1:0`). Each accepted connection runs its own tokio task: an optional auth handshake
+(when `MQ_AUTH_TOKEN` is set, the first frame must be a matching `Auth`, compared in constant
+time), then a request loop. Broker calls are synchronous and operate on in-memory/local-file
+state, so they are invoked directly from the async task rather than through `spawn_blocking`.
+A per-frame size cap (`DEFAULT_MAX_FRAME_BYTES`, 16 MiB) rejects oversized length prefixes
+before allocation, and a malformed or undecodable frame closes or errors only that connection —
+the accept loop keeps running. Consumer-group offsets committed over the wire are persisted
+server-side through the crate's file-backed `OffsetStore`, keyed by group under
+`data_dir/consumer-offsets`, because the broker deliberately exposes no offset commit/fetch API.
+
+`client.rs` provides `MqClient::connect(addr, token)`, which performs the handshake and offers
+one async method per request (`ping`, `create_topic`, `list_topics`, `produce`,
+`produce_message`, `fetch`, `commit_offset`, `fetch_offset`). It is single-connection and issues
+one request at a time, keeping request/response framing unambiguous; server-side errors surface
+as `Error::Server { kind, message }`.
 
 ## Data Structures
 
@@ -793,9 +844,11 @@ Defaults that shape resource use: 1 GB segments, 7-day retention, 16 KB producer
 
 ## Testing Strategy
 
-Correctness is verified by 284 tests — 209 unit tests colocated with their modules plus 75
-integration tests in `tests/integration_tests.rs`. No external services are required; all
-persistence tests use `tempfile::TempDir` scratch directories.
+Correctness is verified by 301 tests — 214 unit tests colocated with their modules, 75
+integration tests in `tests/integration_tests.rs`, and 12 end-to-end network tests in
+`tests/network_tests.rs`. No external services are required; all persistence tests use
+`tempfile::TempDir` scratch directories, and the network tests bind a real listener on an
+ephemeral port (`127.0.0.1:0`).
 
 - **Serialization and framing.** Round-trip tests for `Message` and `MessageBatch` (with and
   without keys, with and without compression) confirm byte-exact reconstruction, and a
@@ -831,6 +884,12 @@ persistence tests use `tempfile::TempDir` scratch directories.
   errors), topic create/delete/describe, produce/fetch, offsets, metrics, auto-create toggling,
   and group listing. The integration suite drives full produce→fetch→commit→recover cycles
   across the assembled components.
+- **Wire protocol (network).** `tests/network_tests.rs` boots a broker, serves it on an
+  ephemeral port, and drives `MqClient` over a real socket: connect + ping, produce→fetch
+  payload round-trip, multi-message ordering and offset assignment, create/list topics,
+  commit→fetch consumer-group offsets, key/header round-trips, typed error on a missing topic,
+  oversized-frame rejection (listener survives), malformed-frame handling (connection stays
+  open), and the auth handshake (wrong token and missing token rejected, correct token works).
 
 The integration suite (`tests/integration_tests.rs`) is organized by subsystem — message,
 compression, storage, topic, topic-manager, producer, consumer, consumer-group, broker, offset,
